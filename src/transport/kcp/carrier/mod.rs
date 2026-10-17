@@ -5,81 +5,245 @@
 //! that is a UDP socket ([`udp`]); the raw-packet carriers ([`icmp`], [`faketcp`]) ride
 //! the same KCP stack over a different datagram carrier.
 //!
-//! The carrier is selected from `[tunnel] transport` ([`Carrier::from_transport`]) and
-//! threaded through [`super::KcpParams`]. For now the socket type is always a
-//! [`tokio::net::UdpSocket`]; [`open`] creates it for the UDP carrier and returns
-//! [`io::ErrorKind::Unsupported`] for the raw-packet carriers, whose real socket/demux
-//! logic the icmp and faketcp units fill in.
+//! The carrier is selected from `[tunnel] transport` ([`Carrier::from_tunnel`]) and
+//! threaded through [`super::KcpParams`]. A [`CarrierSocket`] is what the KCP driver and
+//! demultiplexer send through and receive from: it sends one already-sealed packet to a
+//! peer and receives `(sealed packet, peer)`, hiding whether the bytes rode a UDP
+//! datagram, an ICMP echo or a crafted TCP segment. The raw carriers de-frame down to the
+//! sealed packet before returning it, so [`super`]'s protection, conversation demux and
+//! FEC logic are identical for every carrier.
 
 use std::io;
 use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use crate::config::TransportKind;
+use crate::config::TunnelConfig;
+use crate::crypto::Psk;
 
 pub(super) mod faketcp;
 pub(super) mod icmp;
 pub(super) mod udp;
 
-/// Which datagram carrier the KCP stack rides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Token context for the per-tunnel ICMP tag (first 4 bytes of the subkey).
+const ICMP_TAG_CONTEXT: &str = "kariz 2026-10 icmp tag v1";
+/// Token context for the fake-TCP dialer source port (stable across reconnects).
+const FAKETCP_PORT_CONTEXT: &str = "kariz 2026-10 faketcp port v1";
+
+/// Which datagram carrier the KCP stack rides, with the per-tunnel parameters it needs.
+#[derive(Debug, Clone, Default)]
 pub enum Carrier {
     /// Plain UDP datagrams (`transport = "kcp"` and `transport = "udp"`).
     #[default]
     Udp,
     /// ICMP echo request/reply (`transport = "icmp"`), Linux + root.
-    Icmp,
+    Icmp(IcmpParams),
     /// Raw-socket fake TCP (`transport = "faketcp"`), Linux + root.
-    Faketcp,
+    Faketcp(FaketcpParams),
+}
+
+/// Per-tunnel parameters of the ICMP carrier.
+#[derive(Debug, Clone)]
+pub struct IcmpParams {
+    /// The 4-byte tag every echo of this tunnel carries, so a host can hold several icmp
+    /// tunnels and so stray pings are dropped before the cipher.
+    pub tag: [u8; 4],
+    /// Install/remove the iptables rules (suppress kernel auto-replies, accept our echoes).
+    pub manage_firewall: bool,
+}
+
+/// Per-tunnel parameters of the fake-TCP carrier.
+#[derive(Debug, Clone)]
+pub struct FaketcpParams {
+    /// The dialer's source port, derived from the token so it is stable across reconnects
+    /// (one firewall rule per tunnel). The listener uses its own listen port instead.
+    pub source_port: u16,
+    /// The TCP flag pattern this end's segments carry.
+    pub flags: faketcp::FlagPattern,
+    /// Override the auto-detected egress interface (empty: auto).
+    pub interface: String,
+    /// Override the auto-detected next-hop MAC (only used by an L2 send path).
+    pub gateway_mac: Option<[u8; 6]>,
+    /// Install/remove the RST-drop and NOTRACK iptables rules.
+    pub manage_firewall: bool,
 }
 
 impl Carrier {
-    /// The carrier a transport uses. Only the KCP-based transports reach here; any other
-    /// maps to [`Carrier::Udp`] as a harmless default (it is never used for them).
-    pub fn from_transport(kind: TransportKind) -> Self {
-        match kind {
-            TransportKind::Faketcp => Self::Faketcp,
-            TransportKind::Icmp => Self::Icmp,
+    /// The carrier a tunnel uses, with its token-derived parameters. Only the KCP-based
+    /// transports reach a non-UDP carrier; any other maps to [`Carrier::Udp`] (never used
+    /// for them).
+    pub fn from_tunnel(tunnel: &TunnelConfig) -> Self {
+        use crate::config::TransportKind::{Faketcp, Icmp};
+        match tunnel.transport {
+            Icmp => {
+                let psk = Psk::new(&tunnel.token);
+                let key = psk.subkey(ICMP_TAG_CONTEXT);
+                let cfg = tunnel.icmp.clone().unwrap_or_default();
+                Self::Icmp(IcmpParams {
+                    tag: [key[0], key[1], key[2], key[3]],
+                    manage_firewall: cfg.manage_firewall,
+                })
+            }
+            Faketcp => {
+                let psk = Psk::new(&tunnel.token);
+                let cfg = tunnel.faketcp.clone().unwrap_or_default();
+                Self::Faketcp(FaketcpParams {
+                    source_port: faketcp::source_port(&psk.subkey(FAKETCP_PORT_CONTEXT)),
+                    flags: faketcp::FlagPattern::parse(&cfg.flags),
+                    interface: cfg.interface,
+                    gateway_mac: parse_mac(&cfg.gateway_mac),
+                    manage_firewall: cfg.manage_firewall,
+                })
+            }
             // `kcp`, `udp`, and anything non-KCP (never routed through a carrier).
             _ => Self::Udp,
         }
     }
 }
 
-/// Opens the carrier's datagram socket.
-///
-/// `addr` is the bind address: the listen address on the accepting side, or an unspecified
-/// local address on the dialing side (the caller then connects it to the peer).
-pub(super) fn open(
-    carrier: Carrier,
+/// Parses `aa:bb:cc:dd:ee:ff` into six bytes; `None` for an empty or malformed string
+/// (config validation has already rejected a malformed non-empty one).
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for byte in &mut out {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// The socket a KCP dialer or listener sends sealed packets through and receives them
+/// from. Each carrier does its own framing: the UDP carrier is a thin wrapper over
+/// [`tokio::net::UdpSocket`]; the raw carriers wrap each sealed packet in an ICMP echo or
+/// a TCP segment on send, and strip that framing (and drop foreign packets) on receive, so
+/// [`super`] always sees a plain sealed packet and a peer.
+pub(super) enum CarrierSocket {
+    Udp(UdpSocket),
+    #[cfg(all(feature = "rawlink", target_os = "linux"))]
+    Icmp(icmp::IcmpSocket),
+    #[cfg(all(feature = "rawlink", target_os = "linux"))]
+    Faketcp(faketcp::FaketcpSocket),
+}
+
+impl CarrierSocket {
+    /// Sends one sealed packet to the connected peer (dialer side), dropping it on a full
+    /// buffer as a congested link would.
+    pub(super) fn try_send(&self, packet: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.try_send(packet),
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Icmp(s) => s.try_send(packet),
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Faketcp(s) => s.try_send(packet),
+        }
+    }
+
+    /// Sends one sealed packet to `peer` (listener side, one socket for every peer).
+    pub(super) fn try_send_to(&self, packet: &[u8], peer: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.try_send_to(packet, peer),
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Icmp(s) => s.try_send_to(packet, peer),
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Faketcp(s) => s.try_send_to(packet, peer),
+        }
+    }
+
+    /// Receives one sealed packet from the connected peer (dialer side).
+    pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.recv(buf).await,
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Icmp(s) => s.recv(buf).await,
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Faketcp(s) => s.recv(buf).await,
+        }
+    }
+
+    /// Receives one sealed packet and the peer it came from (listener side).
+    pub(super) async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Udp(s) => s.recv_from(buf).await,
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Icmp(s) => s.recv_from(buf).await,
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Faketcp(s) => s.recv_from(buf).await,
+        }
+    }
+
+    /// The local address a listener bound to.
+    pub(super) fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Udp(s) => s.local_addr(),
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Icmp(s) => Ok(s.local_addr()),
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            Self::Faketcp(s) => Ok(s.local_addr()),
+        }
+    }
+}
+
+/// Opens the carrier's socket for a dialer, connected to `peer`.
+pub(super) fn open_dialer(
+    carrier: &Carrier,
+    peer: SocketAddr,
+    buffer: usize,
+    dscp: Option<u8>,
+) -> io::Result<CarrierSocket> {
+    match carrier {
+        Carrier::Udp => Ok(CarrierSocket::Udp(udp::open_connected(peer, buffer, dscp)?)),
+        Carrier::Icmp(params) => icmp::open_dialer(params, peer, buffer, dscp),
+        Carrier::Faketcp(params) => faketcp::open_dialer(params, peer, buffer, dscp),
+    }
+}
+
+/// Opens the carrier's socket for a listener bound to `local`.
+pub(super) fn open_listener(
+    carrier: &Carrier,
+    local: SocketAddr,
+    buffer: usize,
+    dscp: Option<u8>,
+) -> io::Result<CarrierSocket> {
+    match carrier {
+        Carrier::Udp => Ok(CarrierSocket::Udp(udp::open(local, buffer, dscp)?)),
+        Carrier::Icmp(params) => icmp::open_listener(params, local, buffer, dscp),
+        Carrier::Faketcp(params) => faketcp::open_listener(params, local, buffer, dscp),
+    }
+}
+
+/// A plain UDP socket, for the kcp unit tests that build sockets directly.
+#[cfg(test)]
+pub(super) fn udp_socket(
     addr: SocketAddr,
     buffer: usize,
     dscp: Option<u8>,
 ) -> io::Result<UdpSocket> {
-    match carrier {
-        Carrier::Udp => udp::open(addr, buffer, dscp),
-        Carrier::Icmp => icmp::open(addr, buffer, dscp),
-        Carrier::Faketcp => faketcp::open(addr, buffer, dscp),
-    }
+    udp::open(addr, buffer, dscp)
 }
 
-/// What the KCP driver and demultiplexer need from a carrier: send a sealed packet to a
-/// peer, and receive `(bytes, peer)`. The UDP carrier is a thin wrapper over
-/// [`tokio::net::UdpSocket`]; the icmp and faketcp units implement this for their raw
-/// sockets (the dialer's per-connection sender and the listener's shared demultiplexer
-/// keyed by `(peer, conv)`) and migrate the driver in [`super`] onto it.
-///
-/// It is defined now so the seam is named and documented; the current driver still calls
-/// [`tokio::net::UdpSocket`] directly through the UDP carrier.
-pub trait PacketCarrier: Send + Sync + 'static {
-    /// Sends one already-sealed packet to `peer` (or to the connected peer when `peer` is
-    /// `None`).
-    fn send_to(&self, packet: &[u8], peer: Option<SocketAddr>) -> io::Result<()>;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Receives one packet into `buf`, returning its length and the peer it came from.
-    fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> impl std::future::Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+    #[test]
+    fn mac_parsing_round_trips_and_rejects() {
+        assert_eq!(parse_mac(""), None);
+        assert_eq!(
+            parse_mac("aa:bb:cc:dd:ee:ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        assert_eq!(
+            parse_mac("00:11:22:33:44:55"),
+            Some([0, 17, 34, 51, 68, 85])
+        );
+        assert_eq!(parse_mac("aa:bb:cc:dd:ee"), None, "too few octets");
+        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff:00"), None, "too many octets");
+        assert_eq!(parse_mac("zz:bb:cc:dd:ee:ff"), None, "not hex");
+    }
 }

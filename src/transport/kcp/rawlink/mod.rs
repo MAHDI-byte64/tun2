@@ -6,4 +6,8 @@
 
 pub mod firewall;
 
-pub use firewall::{FirewallRules, Rule};
+pub use firewall::{unique_suffix, FirewallRules, Rule};
+
+/// Egress-path lookup for the fake-TCP carrier (Linux only).
+#[cfg(all(feature = "rawlink", target_os = "linux"))]
+pub(crate) mod netinfo;

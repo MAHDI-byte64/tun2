@@ -33,6 +33,11 @@ bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
 httparse = "1.10"
+# transport = "faketcp" / "icmp": build and parse IP/TCP/ICMP (etherparse) and the raw
+# sockets / getifaddrs (nix). Both pinned to an MSRV-1.80-safe line: etherparse 0.17 has
+# no declared MSRV (the 1.83 bump is in 0.18); nix 0.29 declares rust-version 1.69.
+etherparse = { version = "0.17", optional = true }
+nix = { version = "0.29", default-features = false, features = ["net", "socket"], optional = true }
 kcp = { version = "0.6.0", optional = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 # Pinned exactly: src/allocator.rs names an option by its index in this version.
@@ -62,9 +67,10 @@ quic = ["dep:quinn", "dep:quinn-proto", "dep:rcgen"]
 # transport = "kcp", with FEC.
 kcp = ["dep:kcp", "dep:reed-solomon-simd"]
 # The raw-packet KCP carriers transport = "faketcp" / "icmp" (Linux, root), and their
-# shared RAII iptables helper. Implies kcp (they are KCP carriers). The raw-socket packet
-# parsing deps (etherparse, nix) are added by the faketcp/icmp units, not the scaffold.
-rawlink = ["kcp"]
+# shared RAII iptables helper. Implies kcp (they are KCP carriers). etherparse builds and
+# parses the IP/TCP/ICMP framing; nix opens the AF_PACKET socket and reads the interface
+# addresses. The raw-socket code is gated on target_os = "linux" inside the feature.
+rawlink = ["kcp", "dep:etherparse", "dep:nix"]
 # The managed-helper transports transport = "naive" / "xhttp" / "reality". The helper
 # supervisor and its deps are added by the helpers unit; the scaffold ships only the
 # module skeleton.

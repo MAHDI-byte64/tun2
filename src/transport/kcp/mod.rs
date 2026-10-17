@@ -27,11 +27,12 @@ pub mod protect;
 pub mod rawlink;
 
 pub use carrier::Carrier;
+use carrier::CarrierSocket;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +42,7 @@ use std::time::Duration;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kcp::Kcp;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(test)]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
@@ -131,7 +133,7 @@ impl KcpParams {
         Self {
             config,
             key: Psk::new(&tunnel.token).subkey(KEY_CONTEXT),
-            carrier: Carrier::from_transport(tunnel.transport),
+            carrier: Carrier::from_tunnel(tunnel),
         }
     }
 }
@@ -159,7 +161,7 @@ struct ConnSettings {
 /// The UDP-carrier socket helper, kept for the kcp unit tests that build sockets directly.
 #[cfg(test)]
 fn udp_socket(addr: SocketAddr, buffer: usize, dscp: Option<u8>) -> io::Result<UdpSocket> {
-    carrier::open(Carrier::Udp, addr, buffer, dscp)
+    carrier::udp_socket(addr, buffer, dscp)
 }
 
 impl ConnSettings {
@@ -175,7 +177,7 @@ impl ConnSettings {
             datagrams: params.config.datagrams,
             protection: Arc::new(Protection::new(&params.key)),
             fec: params.config.fec(),
-            carrier: params.carrier,
+            carrier: params.carrier.clone(),
         }
     }
 }
@@ -183,7 +185,7 @@ impl ConnSettings {
 /// Seals packets and sends them without waiting: a full socket buffer drops the packet,
 /// as a congested link would, and KCP sends it again.
 struct Sender {
-    socket: Arc<UdpSocket>,
+    socket: Arc<CarrierSocket>,
     /// `None`: the socket is connected.
     peer: Option<SocketAddr>,
     conv: u32,
@@ -199,7 +201,7 @@ struct Sender {
 
 impl Sender {
     fn new(
-        socket: Arc<UdpSocket>,
+        socket: Arc<CarrierSocket>,
         peer: Option<SocketAddr>,
         conv: u32,
         settings: &ConnSettings,
@@ -699,7 +701,7 @@ enum Inbound {
     Listener(mpsc::Receiver<Bytes>),
     /// The dialer's own socket.
     Dialer {
-        socket: Arc<UdpSocket>,
+        socket: Arc<CarrierSocket>,
         protection: Arc<Protection>,
         buf: Vec<u8>,
     },
@@ -845,7 +847,7 @@ type ConnKey = (SocketAddr, u32);
 impl Driver {
     fn start(
         conv: u32,
-        socket: Arc<UdpSocket>,
+        socket: Arc<CarrierSocket>,
         peer: Option<SocketAddr>,
         inbound: Inbound,
         settings: &ConnSettings,
@@ -1214,18 +1216,12 @@ impl KcpDialer {
             .await?
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "remote did not resolve"))?;
-        let local = match peer {
-            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-        };
-        let socket = carrier::open(
-            self.settings.carrier,
-            local,
+        let socket = Arc::new(carrier::open_dialer(
+            &self.settings.carrier,
+            peer,
             self.settings.socket_buffer,
             self.settings.dscp,
-        )?;
-        socket.connect(peer).await?;
-        let socket = Arc::new(socket);
+        )?);
         let conv = Nonces::new()?.next_u32();
         let inbound = Inbound::Dialer {
             socket: socket.clone(),
@@ -1258,8 +1254,8 @@ impl KcpListener {
             io::Error::new(io::ErrorKind::NotFound, "listen address did not resolve")
         })?;
         let settings = ConnSettings::new(params, tuning);
-        let socket = Arc::new(carrier::open(
-            settings.carrier,
+        let socket = Arc::new(carrier::open_listener(
+            &settings.carrier,
             addr,
             settings.socket_buffer,
             settings.dscp,
@@ -1289,7 +1285,7 @@ impl KcpListener {
 }
 
 async fn demultiplex(
-    socket: Arc<UdpSocket>,
+    socket: Arc<CarrierSocket>,
     settings: ConnSettings,
     accepted: mpsc::Sender<(KcpStream, SocketAddr)>,
 ) {

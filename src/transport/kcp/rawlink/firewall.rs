@@ -11,8 +11,17 @@
 //! warning and does nothing: the carrier still works, less cleanly, rather than failing.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, warn};
+
+/// A process-unique number for firewall tags, so two rule sets that would otherwise share
+/// a tag (several dialer sockets on one token-derived port, two listeners, ...) each own
+/// their own rule: one being dropped never removes another's.
+pub fn unique_suffix() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One iptables rule: a table, a chain and the match/target arguments.
 #[derive(Debug, Clone)]
