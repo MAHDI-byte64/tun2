@@ -25,6 +25,11 @@ jobs:
       - run: cargo clippy --lib --bins --no-default-features -- -D warnings
       - run: cargo clippy --lib --bins --no-default-features --features quic -- -D warnings
       - run: cargo clippy --lib --bins --no-default-features --features kcp -- -D warnings
+      # The raw-packet, helper and l3 features, on their own (they build everywhere; the
+      # root-only parts need a privileged runner, see the `rawlink` job below).
+      - run: cargo clippy --lib --bins --no-default-features --features rawlink -- -D warnings
+      - run: cargo clippy --lib --bins --no-default-features --features helpers -- -D warnings
+      - run: cargo clippy --lib --bins --no-default-features --features l3 -- -D warnings
       # The web panel (panel/); without its web app built, the binary embeds a placeholder
       # page, which is all a lint needs.
       - run: cargo clippy -p kariz-panel --all-targets -- -D warnings
@@ -256,6 +261,20 @@ jobs:
       - run: shellcheck tests/gre_ns.sh
       - run: cargo build -p kariz -p kariz-panel
       - run: sudo bash tests/gre_ns.sh target/debug/kariz-panel target/debug/kariz
+
+  # The raw-packet carriers (faketcp, icmp) and the l3 / GRE direct tunnel need root
+  # (CAP_NET_RAW / CAP_NET_ADMIN), iptables and /dev/net/tun, so like the `gre` job they run
+  # under sudo. The RAII-firewall unit tests and the e2e scaffolds in tunnel_rawlink / l3
+  # (which the faketcp, icmp and l3 units fill in) force a failure rather than skip here.
+  rawlink:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo -E env "PATH=$PATH" KARIZ_REQUIRE_IPTABLES=1 KARIZ_REQUIRE_RAWLINK=1 cargo test --features rawlink --lib -- rawlink
+      - run: sudo -E env "PATH=$PATH" KARIZ_REQUIRE_RAWLINK=1 cargo test --features rawlink --test tunnel_rawlink -- --nocapture
+      - run: sudo -E env "PATH=$PATH" KARIZ_REQUIRE_L3=1 cargo test --features l3 --test l3 -- --nocapture
 
   # The panel the way a person uses it: Playwright drives a real browser against a real panel
   # and a real agent (tunnels run as child processes, so no systemd is needed here). It covers

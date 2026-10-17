@@ -322,6 +322,31 @@ impl Setup {
         }
     }
 
+    /// `wsmux` / `wssmux`: `ws` / `wss` with mux forced on.
+    const fn wsmux(mode: &'static str) -> Self {
+        Self {
+            transport: "wsmux",
+            ..Self::ws(mode)
+        }
+    }
+
+    const fn wssmux(mode: &'static str) -> Self {
+        Self {
+            transport: "wssmux",
+            ..Self::wss(mode)
+        }
+    }
+
+    /// `stealth`: an encrypted TCP stream (the record-padding layer is added later; here it
+    /// behaves as encrypted TCP). Mux optional, on by default.
+    const fn stealth(mode: &'static str) -> Self {
+        Self {
+            transport: "stealth",
+            mux: true,
+            ..Self::tcp(mode)
+        }
+    }
+
     /// QUIC: its own streams, datagrams and TLS. A short keepalive, since a QUIC peer
     /// that dies is only noticed by its silence (idle timeout = keepalive).
     const fn quic(mode: &'static str) -> Self {
@@ -392,7 +417,7 @@ impl Setup {
                 options += "early_data = true\n";
             }
         }
-        if self.transport == "wss" {
+        if self.transport == "wss" || self.transport == "wssmux" {
             let cert = test_cert();
             options += &if listening {
                 format!(
@@ -932,6 +957,13 @@ tunnel_tests! {
     kcp_reverse_fec: Setup::kcp("reverse").fec(10, 3);
     auto_reverse: Setup::tcp("reverse").transport("auto").mux();
     auto_direct: Setup::tcp("direct").transport("auto").mux();
+    stealth_reverse: Setup::stealth("reverse");
+    stealth_direct: Setup::stealth("direct");
+    stealth_reverse_no_mux_chacha: Setup::stealth("reverse").no_mux().encryption("chacha20-poly1305");
+    wsmux_reverse: Setup::wsmux("reverse");
+    wsmux_direct: Setup::wsmux("direct");
+    wssmux_reverse: Setup::wssmux("reverse");
+    wssmux_direct: Setup::wssmux("direct");
 }
 
 /// A `wss` dialer that pins another certificate refuses the listener, so nothing passes.
@@ -1413,6 +1445,9 @@ async fn the_target_sees_the_users_address_in_a_proxy_header() {
         (Setup::tcp("direct").transport("tcpmux").mux(), "v2"),
         (Setup::tcp("reverse").transport("tcpmux").mux(), "v1"),
         (Setup::quic("direct"), "v2"),
+        (Setup::stealth("direct"), "v2"),
+        (Setup::wsmux("reverse"), "v1"),
+        (Setup::wssmux("direct"), "v2"),
     ] {
         let tunnel = start(setup.proxy_protocol(version), TOKEN, TOKEN, target).await;
         for _ in 0..3 {
