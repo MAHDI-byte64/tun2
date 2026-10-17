@@ -31,7 +31,7 @@ configs, a token, a systemd service, a check that it connected) and undoes it al
 fails:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh)
 ```
 
 In the menu choose **3** (Install the web panel here) and open the link it prints. Then read
@@ -43,7 +43,7 @@ the panel writes.
 ## 1. Install
 
 Download the static Linux binary for your CPU (`x86_64`, `aarch64` or `armv7`; `uname -m`
-tells) from [Releases](https://github.com/Erfan-XRay/Kariz/releases), or build it with Rust 1.80 or
+tells) from [Releases](https://github.com/MAHDI-byte64/tun2/releases), or build it with Rust 1.80 or
 newer:
 
 ```bash

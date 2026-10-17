@@ -28,7 +28,7 @@ flowchart LR
 پنل را با اسکریپت مدیر روی یک سرور نصب کنید، سرورهای دیگر را به آن وصل کنید و تانل‌ها را در مرورگر بسازید. پنل همهٔ مرحله‌های پایین را روی هر دو سرور خودش انجام می‌دهد (کانفیگ‌ها، توکن، سرویس systemd و بررسی این‌که تانل وصل شده) و اگر مرحله‌ای خراب شود همه را به حالت قبل برمی‌گرداند:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh)
 ```
 
 در منو **۳** (نصب پنل وب) را انتخاب کنید و لینکی را که چاپ می‌شود باز کنید. بعد [کار با پنل](using-the-panel.md) را بخوانید؛ منو هم در [اسکریپت مدیر](manager.md) توضیح داده شده است.
@@ -37,7 +37,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/script
 
 ## ۱. نصب
 
-فایل اجرایی استاتیک لینوکس را برای CPU خودتان از [Releases](https://github.com/Erfan-XRay/Kariz/releases) بگیرید (`x86_64`، `aarch64` یا `armv7`؛ دستور `uname -m` نشانتان می‌دهد کدام)، یا با Rust نسخهٔ ۱٫۸۰ یا جدیدتر خودتان بسازید:
+فایل اجرایی استاتیک لینوکس را برای CPU خودتان از [Releases](https://github.com/MAHDI-byte64/tun2/releases) بگیرید (`x86_64`، `aarch64` یا `armv7`؛ دستور `uname -m` نشانتان می‌دهد کدام)، یا با Rust نسخهٔ ۱٫۸۰ یا جدیدتر خودتان بسازید:
 
 ```bash
 cargo build --release

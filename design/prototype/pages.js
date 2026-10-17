@@ -683,8 +683,8 @@
     let join = code();
     const cmd = () =>
       dir === "agent"
-        ? `bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh) \\\n    --agent ${join}`
-        : `bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh) \\\n    --agent ${join} --agent-listen 3999`;
+        ? `bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh) \\\n    --agent ${join}`
+        : `bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh) \\\n    --agent ${join} --agent-listen 3999`;
     dialog(
       t("add.title"),
       `<div class="field"><label for="add-name">${t("add.name")}</label><input class="text mono" id="add-name" placeholder="istanbul-1" dir="ltr"><span class="help">${t("add.nameHelp")}</span></div>

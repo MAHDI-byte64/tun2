@@ -12,7 +12,7 @@ server and the panel running; from then on you work in the browser.
 As root, on each server:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh)
 ```
 
 The first time on a server it installs the Kariz core by itself, then asks what else this
@@ -116,7 +116,7 @@ To fetch it by hand:
 
 ```bash
 curl -fsSL -o /usr/local/bin/kariz-manager \
-    https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh
+    https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh
 chmod +x /usr/local/bin/kariz-manager
 ```
 

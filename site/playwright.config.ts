@@ -11,7 +11,7 @@ export default defineConfig({
   reporter: [["list"]],
   webServer: {
     command: "npx astro preview --port 4321",
-    url: "http://localhost:4321/Kariz/",
+    url: "http://localhost:4321/tun2/",
     reuseExistingServer: true,
     timeout: 60_000,
   },

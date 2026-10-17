@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sign;
 
-pub const DEFAULT_API: &str = "https://api.github.com/repos/Erfan-XRay/Kariz";
+pub const DEFAULT_API: &str = "https://api.github.com/repos/MAHDI-byte64/tun2";
 /// The biggest archive the panel will take (the releases are about 5 MB).
 const MAX_ARCHIVE: u64 = 200 * 1024 * 1024;
 const MAX_SMALL: u64 = 64 * 1024;

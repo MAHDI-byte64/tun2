@@ -4,7 +4,7 @@ For Kariz **v2.7.0**; what changed in each version is in the [changelog](../CHAN
 [Getting started](getting-started.md) and come back to the reference pages when you need a specific
 setting. The same pages are a website, with search,
 animated diagrams and a live demo of the panel, in English and Persian:
-<https://erfan-xray.github.io/Kariz/> (built from these files; see [`site/`](../site/README.md)).
+<https://mahdi-byte64.github.io/tun2/> (built from these files; see [`site/`](../site/README.md)).
 
 | Page | What it covers |
 |---|---|

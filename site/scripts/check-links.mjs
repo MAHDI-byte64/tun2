@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const site = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(site, "dist");
-const BASE = "/Kariz";
+const BASE = "/tun2";
 if (!fs.existsSync(dist)) {
   console.error("error: dist/ is missing: run `npm run build` first");
   process.exit(1);

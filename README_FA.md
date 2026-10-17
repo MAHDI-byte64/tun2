@@ -3,17 +3,17 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Erfan-XRay/Kariz/actions/workflows/ci.yml"><img src="https://github.com/Erfan-XRay/Kariz/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/Erfan-XRay/Kariz/releases"><img src="https://img.shields.io/github/v/release/Erfan-XRay/Kariz?label=version&color=34d0c3" alt="آخرین نسخه"></a>
+  <a href="https://github.com/MAHDI-byte64/tun2/actions/workflows/ci.yml"><img src="https://github.com/MAHDI-byte64/tun2/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/MAHDI-byte64/tun2/releases"><img src="https://img.shields.io/github/v/release/MAHDI-byte64/tun2?label=version&color=34d0c3" alt="آخرین نسخه"></a>
   <img src="https://img.shields.io/badge/rust-1.80%2B-e9c46a?logo=rust" alt="Rust 1.80+">
   <img src="https://img.shields.io/badge/platform-linux-12365e?logo=linux&logoColor=white" alt="Linux">
 </p>
 
 <p align="center">
   <a href="README.md">English</a> · <b>فارسی</b> ·
-  <a href="https://erfan-xray.github.io/Kariz/fa/">وب‌سایت</a> ·
-  <a href="https://erfan-xray.github.io/Kariz/fa/docs/">مستندات</a> ·
-  <a href="https://erfan-xray.github.io/Kariz/fa/try/">دموی زنده</a> ·
+  <a href="https://mahdi-byte64.github.io/tun2/fa/">وب‌سایت</a> ·
+  <a href="https://mahdi-byte64.github.io/tun2/fa/docs/">مستندات</a> ·
+  <a href="https://mahdi-byte64.github.io/tun2/fa/try/">دموی زنده</a> ·
   <a href="docs/fa/CHANGELOG.md">تغییرات</a>
 </p>
 
@@ -58,14 +58,14 @@ flowchart LR
 </div>
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh)
 ```
 
 <div dir="rtl">
 
 اسکریپت CPU سرور را تشخیص می‌دهد (x86_64، aarch64 یا armv7)، آخرین نسخه را می‌گیرد، امضایش را می‌سنجد و یک منو باز می‌کند. **نصب پنل وب** را انتخاب کنید تا نشانی پنل و یک لینک ورود یک‌بارمصرف چاپ شود. از آن به بعد کار در مرورگر است: سرورهای دیگرتان را اضافه کنید (هر کدام یک دستور را با کدی که پنل می‌دهد اجرا می‌کند) و با ویزارد بین هر دو سرور تانل بسازید.
 
-می‌خواهید اول ببینید؟ [دموی زنده](https://erfan-xray.github.io/Kariz/fa/try/) پنل واقعی را با داده‌های نمونه اجرا می‌کند.
+می‌خواهید اول ببینید؟ [دموی زنده](https://mahdi-byte64.github.io/tun2/fa/try/) پنل واقعی را با داده‌های نمونه اجرا می‌کند.
 
 ## چه چیزی دارد
 
@@ -73,7 +73,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/script
 - **هر دو جهت.** خروجی می‌تواند به ورودی وصل شود (`reverse`) یا برعکس (`direct`)، با اتصال دوبارهٔ خودکار.
 - **TCP و UDP.** WireGuard، DNS و بازی از آن رد می‌شوند. روی `kcp` و `quic` بستهٔ گم‌شده چیز دیگری را معطل نمی‌کند و برای بازی FEC و تکثیر اختیاری بسته هم هست.
 - **پنلی که اشتباهش را خودش جمع می‌کند.** ویزارد تانل اول هر دو سرور را می‌سنجد و اگر جایی خطا شود هر دو را به حالت قبل برمی‌گرداند. نقشهٔ زنده، نمودار، لاگ، تست سرعت، پشتیبان‌گیری، شبکهٔ خصوصی و به‌روزرسانی هم همان‌جاست.
-- **اعلان در تلگرام.** رباتِ خودتان وقتی سروری آفلاین یا تانلی قطع شود (و وقتی برگردد) خبر می‌دهد و به `/status` با وضعیت همهٔ سرورها و تانل‌ها جواب می‌دهد. جایی که تلگرام بسته است از پروکسی یا از یک تانل رد می‌شود. [راه‌اندازی](https://erfan-xray.github.io/Kariz/fa/docs/telegram/).
+- **اعلان در تلگرام.** رباتِ خودتان وقتی سروری آفلاین یا تانلی قطع شود (و وقتی برگردد) خبر می‌دهد و به `/status` با وضعیت همهٔ سرورها و تانل‌ها جواب می‌دهد. جایی که تلگرام بسته است از پروکسی یا از یک تانل رد می‌شود. [راه‌اندازی](https://mahdi-byte64.github.io/tun2/fa/docs/telegram/).
 - **انتشار امضاشده.** اسکریپت نصب، پنل و agentها پیش از اجرای هر چیزی از یک نسخه، امضایش را بررسی می‌کنند.
 
 ## مستندات
@@ -82,14 +82,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/script
 
 | | |
 |---|---|
-| [شروع کار](https://erfan-xray.github.io/Kariz/fa/docs/getting-started/) | نصب، اولین تانل، systemd |
-| [کار با پنل](https://erfan-xray.github.io/Kariz/fa/docs/using-the-panel/) · [تور راهنما](https://erfan-xray.github.io/Kariz/fa/docs/tour/) · [ویدیوی آموزشی](https://erfan-xray.github.io/Kariz/fa/docs/video/) | پنل، صفحه به صفحه، و در دو دقیقه ویدیو |
-| [اسکریپت مدیر](https://erfan-xray.github.io/Kariz/fa/docs/manager/) | نصب، به‌روزرسانی، منو |
-| [ترنسپورت‌ها](https://erfan-xray.github.io/Kariz/fa/docs/transports/) · [کدام یکی؟](https://erfan-xray.github.io/Kariz/fa/docs/how-it-works/) | انتخاب و تنظیم |
-| [مرجع پیکربندی](https://erfan-xray.github.io/Kariz/fa/docs/configuration/) | همهٔ تنظیم‌ها با مقدار پیش‌فرض و محدوده |
-| [UDP و بازی](https://erfan-xray.github.io/Kariz/fa/docs/udp-and-games/) · [CDN](https://erfan-xray.github.io/Kariz/fa/docs/cdn/) | راه‌اندازی‌های خاص |
-| [عیب‌یابی](https://erfan-xray.github.io/Kariz/fa/docs/troubleshooting/) · [امنیت](https://erfan-xray.github.io/Kariz/fa/docs/security/) | وقتی چیزی درست کار نمی‌کند |
-| [تغییرات](https://erfan-xray.github.io/Kariz/fa/docs/changelog/) | هر نسخه چه چیزی عوض شد |
+| [شروع کار](https://mahdi-byte64.github.io/tun2/fa/docs/getting-started/) | نصب، اولین تانل، systemd |
+| [کار با پنل](https://mahdi-byte64.github.io/tun2/fa/docs/using-the-panel/) · [تور راهنما](https://mahdi-byte64.github.io/tun2/fa/docs/tour/) · [ویدیوی آموزشی](https://mahdi-byte64.github.io/tun2/fa/docs/video/) | پنل، صفحه به صفحه، و در دو دقیقه ویدیو |
+| [اسکریپت مدیر](https://mahdi-byte64.github.io/tun2/fa/docs/manager/) | نصب، به‌روزرسانی، منو |
+| [ترنسپورت‌ها](https://mahdi-byte64.github.io/tun2/fa/docs/transports/) · [کدام یکی؟](https://mahdi-byte64.github.io/tun2/fa/docs/how-it-works/) | انتخاب و تنظیم |
+| [مرجع پیکربندی](https://mahdi-byte64.github.io/tun2/fa/docs/configuration/) | همهٔ تنظیم‌ها با مقدار پیش‌فرض و محدوده |
+| [UDP و بازی](https://mahdi-byte64.github.io/tun2/fa/docs/udp-and-games/) · [CDN](https://mahdi-byte64.github.io/tun2/fa/docs/cdn/) | راه‌اندازی‌های خاص |
+| [عیب‌یابی](https://mahdi-byte64.github.io/tun2/fa/docs/troubleshooting/) · [امنیت](https://mahdi-byte64.github.io/tun2/fa/docs/security/) | وقتی چیزی درست کار نمی‌کند |
+| [تغییرات](https://mahdi-byte64.github.io/tun2/fa/docs/changelog/) | هر نسخه چه چیزی عوض شد |
 
 همین صفحه‌ها فایل‌های Markdown پوشهٔ [`docs/fa/`](docs/fa/README.md) هستند (نسخهٔ انگلیسی: [`docs/`](docs/README.md)).
 

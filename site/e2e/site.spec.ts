@@ -2,7 +2,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
-const B = "/Kariz";
+const B = "/tun2";
 const PAGES = [
   "/",
   "/docs/",

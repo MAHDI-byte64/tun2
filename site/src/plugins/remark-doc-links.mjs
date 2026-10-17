@@ -46,7 +46,7 @@ export function remarkDocLinks({ base, repo }) {
       if (route) return route + hash;
       const kind = image ? "raw" : /\.[a-z0-9]+$/i.test(file) ? "blob" : "tree";
       return image
-        ? `https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/${file}`
+        ? `https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/${file}`
         : `${repo}/${kind}/main/${file.replace(/\/$/, "")}${hash}`;
     };
     walk(tree);

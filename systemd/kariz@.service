@@ -1,6 +1,6 @@
 [Unit]
 Description=Kariz tunnel %i
-Documentation=https://github.com/Erfan-XRay/Kariz
+Documentation=https://github.com/MAHDI-byte64/tun2
 After=network-online.target
 Wants=network-online.target
 

@@ -11,7 +11,7 @@
 با دسترسی root، روی هر سرور:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh)
 ```
 
 بار اول روی یک سرور، خودش هستهٔ کاریز را نصب می‌کند و بعد می‌پرسد این سرور برای چه کاری است: فقط هسته (تانل‌ها از پنلی روی سرور دیگر ساخته می‌شوند)، پنل وب هم همین‌جا، یا اتصال به پنلی که از قبل هست. از آن به بعد هر بار منویی باز می‌شود که بالایش نام سرور و آدرس‌های IPv4 و IPv6 آن است و زیرش آنچه اینجا اجرا می‌شود: هسته، پنل وب و agent، هر کدام با یک نقطهٔ سبز وقتی در حال اجرا هستند.
@@ -84,7 +84,7 @@ kariz-manager status                                # what runs here and this se
 
 ```bash
 curl -fsSL -o /usr/local/bin/kariz-manager \
-    https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh
+    https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh
 chmod +x /usr/local/bin/kariz-manager
 ```
 

@@ -10,7 +10,7 @@ a walk through the screens in the order you need them.
 On the server that will run the panel, as root:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh) install
+bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh) install
 kariz-manager panel install
 ```
 

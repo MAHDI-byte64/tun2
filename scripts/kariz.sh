@@ -4,7 +4,7 @@
 # in the web panel (docs/panel.md), never here.
 #
 # One line, as root:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh)
 #
 # Without arguments it opens a menu. The same actions as commands (see `help`):
 #   kariz-manager install [--version vX.Y.Z] [--binary PATH]
@@ -20,7 +20,7 @@
 # If GitHub limits your downloads, set GITHUB_TOKEN to a personal access token: it lifts the limit.
 set -euo pipefail
 
-REPO="Erfan-XRay/Kariz"
+REPO="MAHDI-byte64/tun2"
 BIN=/usr/local/bin/kariz
 MANAGER=/usr/local/bin/kariz-manager
 CONF_DIR=/etc/kariz
@@ -412,7 +412,7 @@ arch() {
 # The key releases are signed with. Only the release workflow has the
 # private half. It is checked with openssl (1.1.1 or later, or 3).
 RELEASE_KEY_PEM='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAWGxcNhmewk/DsktXLy2UgJ5ZOLS0fktw7D2/obNvjTs=
+MCowBQYDK2VwAyEAbJ1ZKvKHAFSS1iv5+SRjDyFucqS/PHPWPzzpBoZM3qo=
 -----END PUBLIC KEY-----'
 # A user can pin a key of their own (a fork, or a test): KARIZ_RELEASE_KEY_PEM.
 RELEASE_KEY_PEM=${KARIZ_RELEASE_KEY_PEM:-$RELEASE_KEY_PEM}
@@ -503,7 +503,7 @@ install_unit() {
     cat >"$UNIT" <<'EOF'
 [Unit]
 Description=Kariz tunnel %i
-Documentation=https://github.com/Erfan-XRay/Kariz
+Documentation=https://github.com/MAHDI-byte64/tun2
 After=network-online.target
 Wants=network-online.target
 
@@ -525,7 +525,7 @@ install_panel_units() {
     cat >"$PANEL_UNIT" <<'EOF'
 [Unit]
 Description=Kariz web panel
-Documentation=https://github.com/Erfan-XRay/Kariz
+Documentation=https://github.com/MAHDI-byte64/tun2
 After=network-online.target
 Wants=network-online.target
 
@@ -542,7 +542,7 @@ EOF
     cat >"$AGENT_UNIT" <<'EOF'
 [Unit]
 Description=Kariz agent (connects this server to a Kariz panel)
-Documentation=https://github.com/Erfan-XRay/Kariz
+Documentation=https://github.com/MAHDI-byte64/tun2
 After=network-online.target
 Wants=network-online.target
 

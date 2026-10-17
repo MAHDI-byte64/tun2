@@ -20,7 +20,7 @@ use kariz::config::{mode_name, role_name, Config, LogColor};
 
 /// Who made it; shown in the banner.
 const AUTHOR: &str = "ErfanXRay";
-const REPOSITORY: &str = "github.com/Erfan-XRay/Kariz";
+const REPOSITORY: &str = "github.com/MAHDI-byte64/tun2";
 
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const BOLD: &str = "\x1b[1m";

@@ -3,9 +3,9 @@
 This page walks through the panel in the order you need it, from a new server to a tunnel you
 can trust. You do not need any other tutorial: everything about servers and tunnels is done here,
 in the browser. Try the same screens first, with sample data and nothing to install, in the
-[live demo](https://erfan-xray.github.io/Kariz/try/), take the
-[guided tour](https://erfan-xray.github.io/Kariz/docs/tour/), which opens each screen as it explains it, or
-watch the [video tutorial](https://erfan-xray.github.io/Kariz/docs/video/) (about two minutes, from a bare server to a running tunnel).
+[live demo](https://mahdi-byte64.github.io/tun2/try/), take the
+[guided tour](https://mahdi-byte64.github.io/tun2/docs/tour/), which opens each screen as it explains it, or
+watch the [video tutorial](https://mahdi-byte64.github.io/tun2/docs/video/) (about two minutes, from a bare server to a running tunnel).
 
 ## 1. Sign in
 
@@ -47,7 +47,7 @@ The wizard picks the port for you: 3080 for the first tunnel on a server, then 3
 first one that none of that server's tunnels holds. You can type another.
 
 Not sure what to pick? The default (reverse, `tcpmux`, `balanced`) is right for most paths; the
-[transport chooser](https://erfan-xray.github.io/Kariz/docs/how-it-works/) answers in four questions.
+[transport chooser](https://mahdi-byte64.github.io/tun2/docs/how-it-works/) answers in four questions.
 
 **If anything fails, both servers are put back as they were**, and the wizard tells you which
 step failed and why. You cannot end with half a tunnel.

@@ -9,7 +9,7 @@
 روی سروری که پنل را اجرا می‌کند، با دسترسی root:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh) install
+bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh) install
 kariz-manager panel install
 ```
 

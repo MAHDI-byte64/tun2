@@ -3,7 +3,7 @@
 export type Lang = "en" | "fa";
 export const LANGS: Lang[] = ["en", "fa"];
 export const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
-export const REPO = "https://github.com/Erfan-XRay/Kariz";
+export const REPO = "https://github.com/MAHDI-byte64/tun2";
 declare const __KARIZ_VERSION__: string;
 export const VERSION: string = __KARIZ_VERSION__;
 

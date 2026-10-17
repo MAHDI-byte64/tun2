@@ -378,7 +378,7 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
             <span className="label" style={{ marginTop: "var(--sp-3)" }}>
               {t("fix.runFresh")}
             </span>
-            <CodeBlock text={`bash <(curl -fsSL https://raw.githubusercontent.com/Erfan-XRay/Kariz/main/scripts/kariz.sh) --agent ${code}`} />
+            <CodeBlock text={`bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh) --agent ${code}`} />
             {transport !== "auto" && <span className="help">{t("add.via", { t: t(`add.x.${transport}`) })}</span>}
             <span className="countdown">{back ? "" : t("add.valid", { m: digitsOf(mmss) })}</span>
           </div>
