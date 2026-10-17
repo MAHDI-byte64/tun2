@@ -156,12 +156,16 @@ impl Copies {
 /// (`FIN` or shutdown) so the peer ends its side too. `duplicate`: the flow's packet
 /// duplication, as both sides know it from the open request. `counters.read` counts the
 /// bytes of packets from the local side, `counters.written` those delivered to it.
+/// `datagram_only`: for the `udp` transport, a mux packet that cannot ride the unreliable
+/// datagram path is dropped rather than queued on the reliable stream, so forwarding never
+/// retransmits (bare UDP semantics). Only the `Channel::Stream` (mux) path honours it.
 pub async fn relay<Src, Snk>(
     channel: Channel,
     mut source: Src,
     sink: Snk,
     idle: Duration,
     duplicate: Option<Duplicate>,
+    datagram_only: bool,
     counters: Counters<'_>,
 ) -> io::Result<()>
 where
@@ -211,13 +215,19 @@ where
                     tally.add(packet.len());
                     let Some(duplicate) = duplicate else {
                         // A full session queue drops the packet (counted by the session).
-                        stream.send_datagram(packet);
+                        // With `datagram_only`, a packet that would fall back to the
+                        // reliable stream is dropped instead, as a bare UDP datagram is.
+                        if !datagram_only || stream.sends_unreliably(packet.len()) {
+                            stream.send_datagram(packet);
+                        }
                         continue;
                     };
                     let packet = numbering.number(&packet);
                     // Copies only where the packet may be lost.
                     let unreliable = stream.sends_unreliably(packet.len());
-                    stream.send_datagram(packet.clone());
+                    if unreliable || !datagram_only {
+                        stream.send_datagram(packet.clone());
+                    }
                     if unreliable {
                         copies.add(&packet, duplicate, &stream);
                     }
@@ -545,12 +555,15 @@ impl Flows {
 
 /// Entry side: serves one UDP forward rule on `socket`. `open` opens a tunnel path for a
 /// new flow (the open request is the caller's, and carries `duplicate`). A flow holds a
-/// slot of `per_ip` while it lives. Runs until the socket fails.
+/// slot of `per_ip` while it lives. `datagram_only`: the `udp` transport forwards without
+/// a reliable fallback (see [`relay`]). Runs until the socket fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve<O, F>(
     socket: UdpSocket,
     udp: UdpTuning,
     target: String,
     duplicate: Option<Duplicate>,
+    datagram_only: bool,
     stats: Arc<ForwardStats>,
     per_ip: Option<Arc<PerIp>>,
     open: O,
@@ -582,7 +595,7 @@ where
                 // The flow just ended; start a new one.
                 Err(PushError::Closed(p)) => {
                     if let Some(slot) = slot_for(table, client, per_ip.as_ref(), &stats) {
-                        let rule = (&udp, target.as_str(), duplicate, &stats);
+                        let rule = (&udp, target.as_str(), duplicate, datagram_only, &stats);
                         start_flow(table, client, p, slot, &socket, rule, &flows, &open);
                     }
                     continue;
@@ -604,7 +617,7 @@ where
         let Some(slot) = slot_for(table, client, per_ip.as_ref(), &stats) else {
             continue;
         };
-        let rule = (&udp, target.as_str(), duplicate, &stats);
+        let rule = (&udp, target.as_str(), duplicate, datagram_only, &stats);
         start_flow(table, client, packet, slot, &socket, rule, &flows, &open);
     }
 }
@@ -634,7 +647,7 @@ fn slot_for(
 }
 
 /// Starts a flow for `client` with `packet` as its first packet. `rule`: the rule's
-/// tuning, target, duplication and counters.
+/// tuning, target, duplication, `datagram_only` (see [`relay`]) and counters.
 #[allow(clippy::too_many_arguments)]
 fn start_flow<O, F>(
     table: &mut Flows,
@@ -642,14 +655,20 @@ fn start_flow<O, F>(
     packet: Bytes,
     slot: Option<Slot>,
     socket: &Arc<UdpSocket>,
-    rule: (&UdpTuning, &str, Option<Duplicate>, &Arc<ForwardStats>),
+    rule: (
+        &UdpTuning,
+        &str,
+        Option<Duplicate>,
+        bool,
+        &Arc<ForwardStats>,
+    ),
     flows: &Arc<Mutex<Flows>>,
     open: &Arc<O>,
 ) where
     O: Fn() -> F + Send + Sync + 'static,
     F: Future<Output = io::Result<Channel>> + Send + 'static,
 {
-    let (udp, target, duplicate, stats) = rule;
+    let (udp, target, duplicate, datagram_only, stats) = rule;
     if matches!(table.map.get(&client), Some(FlowState::Active { .. })) {
         table.active -= 1;
     }
@@ -678,7 +697,7 @@ fn start_flow<O, F>(
                 written: &stats.traffic.down,
             };
             let sink = ReplyTo { socket, client };
-            relay(channel, rx, sink, idle, duplicate, counters).await
+            relay(channel, rx, sink, idle, duplicate, datagram_only, counters).await
         }
         .await;
         let open_failed = match &result {
@@ -762,6 +781,7 @@ mod tests {
             tuning(max_flows),
             "target".into(),
             None,
+            false,
             stats.clone(),
             per_ip,
             opener,

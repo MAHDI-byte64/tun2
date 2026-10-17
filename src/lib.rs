@@ -16,6 +16,7 @@ mod auto;
 mod channel;
 mod entry;
 mod exit;
+mod fallback;
 #[cfg(feature = "l3")]
 pub mod l3;
 mod limit;

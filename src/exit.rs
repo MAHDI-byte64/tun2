@@ -17,6 +17,7 @@ use crate::auto::{self, Dial};
 use crate::channel::{self, Channel, Link};
 use crate::config::{Config, Mode, TransportKind, Tuning};
 use crate::crypto::{Crypto, ReplayFilter};
+use crate::fallback;
 use crate::mux::{MuxSession, SessionConfig, Side};
 use crate::proto::{
     self, Open, KIND_PROBE, KIND_SPEEDTEST, KIND_UDP, STATUS_DIAL_FAILED, STATUS_OK,
@@ -49,6 +50,8 @@ struct Exit {
     tuning: Tuning,
     /// Slots for speed test streams; `None` when `tunnel.speedtest` is off.
     speedtest: Option<Arc<Semaphore>>,
+    /// The udp transport forwards on the unreliable path only (see [`udp::relay`]).
+    datagram_only: bool,
     stats: Arc<Stats>,
 }
 
@@ -75,110 +78,87 @@ impl Exit {
 pub async fn run(config: Config) -> Result<()> {
     let tuning = config.tuning();
     let mux = config.mux();
-    let transport = Settings::new(&config.tunnel, config.kcp());
-    let exit = Arc::new(Exit {
-        crypto: Crypto::new(&config.tunnel.token, config.tunnel.encryption)
-            .with_mux(mux.enabled)
-            .with_stealth(transport.stealth.as_ref().map(|s| s.shaping())),
-        tuning: tuning.clone(),
-        speedtest: config
-            .tunnel
-            .speedtest
-            .then(|| Arc::new(Semaphore::new(SPEEDTEST_STREAMS))),
-        stats: Stats::new(&config),
-    });
+    let base = Settings::new(&config.tunnel, config.kcp());
     let sessions = SessionConfig::new(&mux);
+    let stats = Stats::new(&config);
+    let speedtest = config
+        .tunnel
+        .speedtest
+        .then(|| Arc::new(Semaphore::new(SPEEDTEST_STREAMS)));
     let mut tasks = JoinSet::new();
 
-    // `kariz status` reads the counters through this (Unix only).
+    // `kariz status` reads the counters through this (Unix only). It uses the shared stats,
+    // so it outlives any transport the fallback chain rotates through.
     #[cfg(unix)]
     if let Some(socket) = config.control_socket() {
-        let serve =
-            crate::control::serve(socket, None::<crate::control::NoOpen>, exit.stats.clone());
+        let serve = crate::control::serve(socket, None::<crate::control::NoOpen>, stats.clone());
         tasks.spawn(serve);
     }
 
-    if transport.kind == TransportKind::Quic {
-        run_quic(&config, &exit, &sessions, &mut tasks).await?;
+    // Bring the tunnel up: one transport, or a fallback chain that rotates through its
+    // candidates, each with its own `Exit` (its own crypto) over the shared stats.
+    if config.tunnel.fallback_transports.is_empty() {
+        let exit = Arc::new(Exit {
+            crypto: fallback::crypto_for(&config, mux.enabled, &base),
+            tuning: tuning.clone(),
+            speedtest,
+            datagram_only: config.tunnel.transport == TransportKind::Udp,
+            stats,
+        });
+        build_exit(&config, &base, &exit, &sessions, &tuning, &mux, &mut tasks).await?;
     } else {
-        match config.mode {
-            Mode::Reverse if mux.enabled => {
-                let remote = config.tunnel.remote.as_deref().expect("validated");
-                info!(
-                    remote,
-                    connections = mux.connections,
-                    "exit: reverse mode with mux, keeping sessions to the entry side"
-                );
-                let dialer = Arc::new(if config.tunnel.transport == TransportKind::Auto {
-                    Dial::auto(&transport, &config.tunnel.token, remote, &tuning)?
-                } else {
-                    Dial::one(&transport, remote, &tuning)?
-                });
-                for _ in 0..mux.connections {
-                    let (exit, dialer) = (exit.clone(), dialer.clone());
-                    let connect = {
-                        let (exit, sessions) = (exit.clone(), sessions.clone());
-                        move || {
-                            let (exit, dialer, sessions) =
-                                (exit.clone(), dialer.clone(), sessions.clone());
-                            async move {
-                                let wait = exit.tuning.dial_timeout + exit.tuning.handshake_timeout;
-                                let (link, via) = dialer.connect(&exit.crypto, wait).await?;
-                                let session = MuxSession::over(link, Side::Server, sessions);
-                                if let Some(via) = via {
-                                    session.set_transport(via);
-                                }
-                                Ok(Session::Kmux(session))
-                            }
-                        }
-                    };
-                    let (lifetime, link) = (mux.max_lifetime, exit.stats.peer.clone());
-                    tasks.spawn(async move {
-                        let on_session = move |s| {
-                            tokio::spawn(run_session(exit.clone(), s));
-                        };
-                        maintain("the entry side", link, connect, lifetime, on_session).await;
-                        Ok(())
-                    });
-                }
-            }
-            Mode::Reverse => {
-                let remote = config.tunnel.remote.as_deref().expect("validated");
-                info!(
-                    remote,
-                    pool = config.tunnel.pool,
-                    "exit: reverse mode, connecting to the entry side"
-                );
-                let dialer = Arc::new(Dialer::new(&transport, remote, &tuning)?);
-                for _ in 0..config.tunnel.pool {
-                    tasks.spawn(pool_worker(exit.clone(), dialer.clone()));
-                }
-            }
-            Mode::Direct => {
-                let addr = config.tunnel.listen.as_deref().expect("validated");
-                let listeners = if config.tunnel.transport == TransportKind::Auto {
-                    auto::bind_all(&transport, &config.tunnel.token, addr, &tuning).await?
-                } else {
-                    vec![(
-                        "",
-                        Listener::bind(&transport, addr, &tuning)
-                            .await
-                            .with_context(|| {
-                                format!("failed to listen for tunnel connections on {addr}")
-                            })?,
-                    )]
-                };
-                info!(
-                    addr = %listeners[0].1.local_addr()?,
-                    mux = mux.enabled,
-                    "exit: direct mode, waiting for the entry side"
-                );
-                let sessions = mux.enabled.then_some(sessions);
-                for (via, listener) in listeners {
-                    tasks.spawn(accept_direct(exit.clone(), listener, sessions.clone(), via));
-                }
-            }
-        }
+        let acceptor = config.is_acceptor();
+        let candidates = fallback::candidates(&config);
+        let dwell = Duration::from_secs(config.tunnel.fallback_dwell_secs);
+        let (config, base, sessions, tuning, mux) = (
+            config.clone(),
+            base.clone(),
+            sessions.clone(),
+            tuning.clone(),
+            mux.clone(),
+        );
+        tasks.spawn(async move {
+            let peer = stats.peer.clone();
+            let chain_stats = stats.clone();
+            fallback::run_chain(
+                acceptor,
+                "exit",
+                candidates,
+                dwell,
+                mux.enabled,
+                peer,
+                chain_stats,
+                move |kind| {
+                    let (config, base, sessions, tuning, mux, stats, speedtest) = (
+                        config.clone(),
+                        base.clone(),
+                        sessions.clone(),
+                        tuning.clone(),
+                        mux.clone(),
+                        stats.clone(),
+                        speedtest.clone(),
+                    );
+                    async move {
+                        let settings = fallback::settings_for(&base, &config.tunnel, kind);
+                        let exit = Arc::new(Exit {
+                            crypto: fallback::crypto_for(&config, mux.enabled, &settings),
+                            tuning: tuning.clone(),
+                            speedtest,
+                            // The udp transport cannot be a fallback candidate.
+                            datagram_only: false,
+                            stats,
+                        });
+                        let mut set = JoinSet::new();
+                        build_exit(
+                            &config, &settings, &exit, &sessions, &tuning, &mux, &mut set,
+                        )
+                        .await?;
+                        Ok(set)
+                    }
+                },
+            )
+            .await
+        });
     }
 
     match tasks.join_next().await {
@@ -186,6 +166,104 @@ pub async fn run(config: Config) -> Result<()> {
         Some(Err(e)) => Err(e.into()),
         None => Ok(()),
     }
+}
+
+/// Builds the exit machinery for `transport` and spawns it into `tasks`: the QUIC
+/// acceptor/dialer, the mux session loop (either mode), the non-mux reverse pool, or the
+/// direct accept loop. Called once for a single transport, and once per candidate by the
+/// fallback chain (with the candidate's own `transport` and `exit`, and its own `tasks`).
+async fn build_exit(
+    config: &Config,
+    transport: &Settings,
+    exit: &Arc<Exit>,
+    sessions: &SessionConfig,
+    tuning: &Tuning,
+    mux: &crate::config::MuxSettings,
+    tasks: &mut JoinSet<Result<()>>,
+) -> Result<()> {
+    if transport.kind == TransportKind::Quic {
+        run_quic(config, exit, sessions, tasks).await?;
+        return Ok(());
+    }
+    match config.mode {
+        Mode::Reverse if mux.enabled => {
+            let remote = config.tunnel.remote.as_deref().expect("validated");
+            info!(
+                remote,
+                connections = mux.connections,
+                "exit: reverse mode with mux, keeping sessions to the entry side"
+            );
+            let dialer = Arc::new(if config.tunnel.transport == TransportKind::Auto {
+                Dial::auto(transport, &config.tunnel.token, remote, tuning)?
+            } else {
+                Dial::one(transport, remote, tuning)?
+            });
+            for _ in 0..mux.connections {
+                let (exit, dialer) = (exit.clone(), dialer.clone());
+                let connect = {
+                    let (exit, sessions) = (exit.clone(), sessions.clone());
+                    move || {
+                        let (exit, dialer, sessions) =
+                            (exit.clone(), dialer.clone(), sessions.clone());
+                        async move {
+                            let wait = exit.tuning.dial_timeout + exit.tuning.handshake_timeout;
+                            let (link, via) = dialer.connect(&exit.crypto, wait).await?;
+                            let session = MuxSession::over(link, Side::Server, sessions);
+                            if let Some(via) = via {
+                                session.set_transport(via);
+                            }
+                            Ok(Session::Kmux(session))
+                        }
+                    }
+                };
+                let (lifetime, link) = (mux.max_lifetime, exit.stats.peer.clone());
+                tasks.spawn(async move {
+                    let on_session = move |s| {
+                        tokio::spawn(run_session(exit.clone(), s));
+                    };
+                    maintain("the entry side", link, connect, lifetime, on_session).await;
+                    Ok(())
+                });
+            }
+        }
+        Mode::Reverse => {
+            let remote = config.tunnel.remote.as_deref().expect("validated");
+            info!(
+                remote,
+                pool = config.tunnel.pool,
+                "exit: reverse mode, connecting to the entry side"
+            );
+            let dialer = Arc::new(Dialer::new(transport, remote, tuning)?);
+            for _ in 0..config.tunnel.pool {
+                tasks.spawn(pool_worker(exit.clone(), dialer.clone()));
+            }
+        }
+        Mode::Direct => {
+            let addr = config.tunnel.listen.as_deref().expect("validated");
+            let listeners = if config.tunnel.transport == TransportKind::Auto {
+                auto::bind_all(transport, &config.tunnel.token, addr, tuning).await?
+            } else {
+                vec![(
+                    "",
+                    Listener::bind(transport, addr, tuning)
+                        .await
+                        .with_context(|| {
+                            format!("failed to listen for tunnel connections on {addr}")
+                        })?,
+                )]
+            };
+            info!(
+                addr = %listeners[0].1.local_addr()?,
+                mux = mux.enabled,
+                "exit: direct mode, waiting for the entry side"
+            );
+            let sessions = mux.enabled.then(|| sessions.clone());
+            for (via, listener) in listeners {
+                tasks.spawn(accept_direct(exit.clone(), listener, sessions.clone(), via));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Config validation rejects `transport = "quic"` in a build without it.
@@ -547,6 +625,7 @@ async fn relay_udp(exit: &Exit, tunnel: Channel, socket: tokio::net::UdpSocket, 
         sink,
         idle,
         duplicate,
+        exit.datagram_only,
         exit.target_counters(),
     )
     .await
@@ -564,6 +643,7 @@ pub(crate) fn serve_for_test(config: &Config, session: Arc<Session>) {
         crypto: Crypto::new(&config.tunnel.token, config.tunnel.encryption),
         tuning: config.tuning(),
         speedtest: None,
+        datagram_only: config.tunnel.transport == TransportKind::Udp,
         stats: Stats::new(config),
     });
     tokio::spawn(run_session(exit, session));

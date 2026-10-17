@@ -18,6 +18,7 @@ use crate::auto::{self, Dial};
 use crate::channel::{self, Channel, Link};
 use crate::config::{Config, Forward, Mode, TransportKind, Tuning};
 use crate::crypto::{Crypto, ReplayFilter};
+use crate::fallback;
 use crate::limit::PerIp;
 use crate::mux::{MuxSession, SessionConfig, Side};
 use crate::proto::{self, Open, STATUS_DIAL_FAILED, STATUS_OK};
@@ -51,7 +52,9 @@ const FULL_WARN_INTERVAL: Duration = Duration::from_secs(30);
 struct Entry {
     crypto: Crypto,
     tuning: Tuning,
-    source: Source,
+    /// The current tunnel source. It is swapped by the transport fallback chain as it
+    /// rotates through its candidates; without fallback it is set once and never changes.
+    source: std::sync::RwLock<Arc<Source>>,
     stats: Arc<Stats>,
     /// `tuning.max_conns_per_ip`, shared by all forward rules.
     per_ip: Option<Arc<PerIp>>,
@@ -59,6 +62,8 @@ struct Entry {
 }
 
 enum Source {
+    /// No transport is up yet (the fallback chain has not brought one up).
+    Pending,
     /// Direct mode: dial the exit side for every user connection.
     Direct(Dialer),
     /// Reverse mode: take an idle channel the exit side opened in advance.
@@ -70,16 +75,174 @@ enum Source {
 pub async fn run(config: Config) -> Result<()> {
     let tuning = config.tuning();
     let mux = config.mux();
-    let transport = Settings::new(&config.tunnel, config.kcp());
+    let base = Settings::new(&config.tunnel, config.kcp());
     let crypto = Crypto::new(&config.tunnel.token, config.tunnel.encryption)
         .with_mux(mux.enabled)
-        .with_stealth(transport.stealth.as_ref().map(|s| s.shaping()));
+        .with_stealth(base.stealth.as_ref().map(|s| s.shaping()));
     let sessions = SessionConfig::new(&mux);
     let stats = Stats::new(&config);
     let mut tasks = JoinSet::new();
 
+    let per_ip = tuning.max_conns_per_ip.map(PerIp::new);
+    let entry = Arc::new(Entry {
+        crypto: crypto.clone(),
+        tuning: tuning.clone(),
+        source: std::sync::RwLock::new(Arc::new(Source::Pending)),
+        stats: stats.clone(),
+        per_ip,
+        last_full_warning: std::sync::Mutex::default(),
+    });
+
+    // Bring the tunnel source up. Without a fallback chain it is one transport, built here;
+    // with one, a background task rotates through the candidates and swaps the source as a
+    // candidate comes up or stays down (see `crate::fallback`), while the forward loops
+    // below keep the user-facing ports across the rotation.
+    if config.tunnel.fallback_transports.is_empty() {
+        let source = build_source(
+            &config, &base, &crypto, &sessions, &stats, &tuning, &mux, &mut tasks,
+        )
+        .await?;
+        entry.set_source(source);
+    } else {
+        let acceptor = config.is_acceptor();
+        let candidates = fallback::candidates(&config);
+        let dwell = Duration::from_secs(config.tunnel.fallback_dwell_secs);
+        let (config, base, sessions, stats, tuning, mux, entry) = (
+            config.clone(),
+            base.clone(),
+            sessions.clone(),
+            stats.clone(),
+            tuning.clone(),
+            mux.clone(),
+            entry.clone(),
+        );
+        tasks.spawn(async move {
+            let peer = stats.peer.clone();
+            let chain_stats = stats.clone();
+            fallback::run_chain(
+                acceptor,
+                "entry",
+                candidates,
+                dwell,
+                mux.enabled,
+                peer,
+                chain_stats,
+                move |kind| {
+                    let (config, base, sessions, stats, tuning, mux, entry) = (
+                        config.clone(),
+                        base.clone(),
+                        sessions.clone(),
+                        stats.clone(),
+                        tuning.clone(),
+                        mux.clone(),
+                        entry.clone(),
+                    );
+                    async move {
+                        let settings = fallback::settings_for(&base, &config.tunnel, kind);
+                        let crypto = fallback::crypto_for(&config, mux.enabled, &settings);
+                        let mut set = JoinSet::new();
+                        let source = build_source(
+                            &config, &settings, &crypto, &sessions, &stats, &tuning, &mux, &mut set,
+                        )
+                        .await?;
+                        entry.set_source(source);
+                        Ok(set)
+                    }
+                },
+            )
+            .await
+        });
+    }
+
+    // `kariz status` reads the counters and `kariz speedtest` reaches the live sessions
+    // through this (Unix only).
+    #[cfg(unix)]
+    if let Some(socket) = config.control_socket() {
+        let entry = entry.clone();
+        let open = move |open: Bytes| {
+            let entry = entry.clone();
+            async move { entry.open_channel(&open).await }
+        };
+        tasks.spawn(crate::control::serve(socket, Some(open), stats.clone()));
+    }
+
+    for (forward, counters) in config.forward.iter().zip(&stats.forwards) {
+        if forward.protocol.has_tcp() {
+            let listener = TcpListener::bind(&forward.listen)
+                .await
+                .with_context(|| format!("failed to listen on forward port {}", forward.listen))?;
+            let (entry, forward, counters) = (entry.clone(), forward.clone(), counters.clone());
+            tasks.spawn(accept_users(entry, listener, forward, counters));
+        }
+        if forward.protocol.has_udp() {
+            let socket = udp::bind(&forward.listen, &entry.tuning.udp)
+                .await
+                .with_context(|| format!("failed to bind UDP forward port {}", forward.listen))?;
+            let open = encode_open(Open::udp(forward.target.clone(), forward.duplication()));
+            let opener = {
+                let entry = entry.clone();
+                move || {
+                    let (entry, open) = (entry.clone(), open.clone());
+                    async move { entry.open_channel(&open).await }
+                }
+            };
+            let (udp_tuning, target) = (entry.tuning.udp.clone(), forward.target.clone());
+            let (listen, duplicate) = (forward.listen.clone(), forward.duplication());
+            let (counters, per_ip) = (counters.clone(), entry.per_ip.clone());
+            // The udp transport forwards on the unreliable path only (no retransmit); it
+            // cannot share a fallback chain, so the active transport is always udp here.
+            let datagram_only = config.tunnel.transport == TransportKind::Udp;
+            tasks.spawn(async move {
+                udp::serve(
+                    socket,
+                    udp_tuning,
+                    target,
+                    duplicate,
+                    datagram_only,
+                    counters,
+                    per_ip,
+                    opener,
+                )
+                .await
+                .with_context(|| format!("UDP forward port {listen} failed"))
+            });
+        }
+        info!(
+            listen = %forward.listen,
+            target = %forward.target,
+            protocol = forward.protocol.name(),
+            proxy_protocol = forward.proxy_protocol.map_or("off", |v| v.name()),
+            "forward ready"
+        );
+    }
+
+    tasks.spawn(health(entry.clone(), probe_targets(&config.forward)));
+
+    // Accept loops only return on fatal errors.
+    match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
+/// Builds the tunnel source for `transport` and spawns its maintenance into `tasks`: the
+/// QUIC pool, the mux session pool (either mode), the per-connection dialer or the reverse
+/// pool of links. Called once for a single transport, and once per candidate by the
+/// fallback chain (with the candidate's own `transport` and `crypto`, and its own `tasks`).
+#[allow(clippy::too_many_arguments)]
+async fn build_source(
+    config: &Config,
+    transport: &Settings,
+    crypto: &Crypto,
+    sessions: &SessionConfig,
+    stats: &Arc<Stats>,
+    tuning: &Tuning,
+    mux: &crate::config::MuxSettings,
+    tasks: &mut JoinSet<Result<()>>,
+) -> Result<Source> {
     let source = if transport.kind == TransportKind::Quic {
-        Source::Mux(quic_pool(&config, &crypto, &sessions, &stats, &mut tasks).await?)
+        Source::Mux(quic_pool(config, crypto, sessions, stats, tasks).await?)
     } else {
         match config.mode {
             Mode::Direct if mux.enabled => {
@@ -90,9 +253,9 @@ pub async fn run(config: Config) -> Result<()> {
                     "entry: direct mode with mux, keeping sessions to the exit side"
                 );
                 let dialer = Arc::new(if config.tunnel.transport == TransportKind::Auto {
-                    Dial::auto(&transport, &config.tunnel.token, remote, &tuning)?
+                    Dial::auto(transport, &config.tunnel.token, remote, tuning)?
                 } else {
-                    Dial::one(&transport, remote, &tuning)?
+                    Dial::one(transport, remote, tuning)?
                 });
                 let pool = Arc::new(SessionPool::default());
                 for _ in 0..mux.connections {
@@ -131,7 +294,7 @@ pub async fn run(config: Config) -> Result<()> {
                 // Nothing keeps a connection open here, so without this the tunnel would
                 // not say whether the exit side is reachable until someone used it (and a
                 // panel creating the tunnel would wait for a "connected" that never comes).
-                let probe = Dialer::new(&transport, remote, &tuning)?;
+                let probe = Dialer::new(transport, remote, tuning)?;
                 let (crypto, link) = (crypto.clone(), stats.peer.clone());
                 let wait = tuning.dial_timeout + tuning.handshake_timeout;
                 tasks.spawn(async move {
@@ -144,16 +307,16 @@ pub async fn run(config: Config) -> Result<()> {
                         sleep(PROBE_EVERY).await;
                     }
                 });
-                Source::Direct(Dialer::new(&transport, remote, &tuning)?)
+                Source::Direct(Dialer::new(transport, remote, tuning)?)
             }
             Mode::Reverse => {
                 let addr = config.tunnel.listen.as_deref().expect("validated");
                 let listeners = if config.tunnel.transport == TransportKind::Auto {
-                    auto::bind_all(&transport, &config.tunnel.token, addr, &tuning).await?
+                    auto::bind_all(transport, &config.tunnel.token, addr, tuning).await?
                 } else {
                     vec![(
                         "",
-                        Listener::bind(&transport, addr, &tuning)
+                        Listener::bind(transport, addr, tuning)
                             .await
                             .with_context(|| {
                                 format!("failed to listen for tunnel connections on {addr}")
@@ -169,6 +332,7 @@ pub async fn run(config: Config) -> Result<()> {
                 if mux.enabled {
                     let pool = Arc::new(SessionPool::default());
                     let (p, link_stats) = (pool.clone(), stats.peer.clone());
+                    let sessions = sessions.clone();
                     let on_link =
                         Arc::new(move |link: Link, peer: SocketAddr, via: &'static str| {
                             let session = MuxSession::over(link, Side::Client, sessions.clone());
@@ -211,77 +375,7 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }
     };
-
-    let per_ip = tuning.max_conns_per_ip.map(PerIp::new);
-    let entry = Arc::new(Entry {
-        crypto,
-        tuning,
-        source,
-        stats: stats.clone(),
-        per_ip,
-        last_full_warning: std::sync::Mutex::default(),
-    });
-
-    // `kariz status` reads the counters and `kariz speedtest` reaches the live sessions
-    // through this (Unix only).
-    #[cfg(unix)]
-    if let Some(socket) = config.control_socket() {
-        let entry = entry.clone();
-        let open = move |open: Bytes| {
-            let entry = entry.clone();
-            async move { entry.open_channel(&open).await }
-        };
-        tasks.spawn(crate::control::serve(socket, Some(open), stats.clone()));
-    }
-
-    for (forward, counters) in config.forward.iter().zip(&stats.forwards) {
-        if forward.protocol.has_tcp() {
-            let listener = TcpListener::bind(&forward.listen)
-                .await
-                .with_context(|| format!("failed to listen on forward port {}", forward.listen))?;
-            let (entry, forward, counters) = (entry.clone(), forward.clone(), counters.clone());
-            tasks.spawn(accept_users(entry, listener, forward, counters));
-        }
-        if forward.protocol.has_udp() {
-            let socket = udp::bind(&forward.listen, &entry.tuning.udp)
-                .await
-                .with_context(|| format!("failed to bind UDP forward port {}", forward.listen))?;
-            let open = encode_open(Open::udp(forward.target.clone(), forward.duplication()));
-            let opener = {
-                let entry = entry.clone();
-                move || {
-                    let (entry, open) = (entry.clone(), open.clone());
-                    async move { entry.open_channel(&open).await }
-                }
-            };
-            let (udp_tuning, target) = (entry.tuning.udp.clone(), forward.target.clone());
-            let (listen, duplicate) = (forward.listen.clone(), forward.duplication());
-            let (counters, per_ip) = (counters.clone(), entry.per_ip.clone());
-            tasks.spawn(async move {
-                udp::serve(
-                    socket, udp_tuning, target, duplicate, counters, per_ip, opener,
-                )
-                .await
-                .with_context(|| format!("UDP forward port {listen} failed"))
-            });
-        }
-        info!(
-            listen = %forward.listen,
-            target = %forward.target,
-            protocol = forward.protocol.name(),
-            proxy_protocol = forward.proxy_protocol.map_or("off", |v| v.name()),
-            "forward ready"
-        );
-    }
-
-    tasks.spawn(health(entry.clone(), probe_targets(&config.forward)));
-
-    // Accept loops only return on fatal errors.
-    match tasks.join_next().await {
-        Some(Ok(result)) => result,
-        Some(Err(e)) => Err(e.into()),
-        None => Ok(()),
-    }
+    Ok(source)
 }
 
 /// QUIC, either mode: the pool of QUIC sessions to the exit side. Direct mode keeps
@@ -499,6 +593,21 @@ async fn handle_user(
 }
 
 impl Entry {
+    /// The current tunnel source (cheap: an `Arc` clone), which the fallback chain may
+    /// swap under it.
+    fn source(&self) -> Arc<Source> {
+        self.source
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Makes `source` the live tunnel source (the fallback chain calls this when a
+    /// candidate comes up).
+    fn set_source(&self, source: Source) {
+        *self.source.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(source);
+    }
+
     /// Gets a channel to the exit side and has the exit connect it to the target
     /// described by the encoded `open` request.
     async fn open_channel(&self, open: &Bytes) -> io::Result<Channel> {
@@ -514,7 +623,13 @@ impl Entry {
         deadline: Instant,
         retry: bool,
     ) -> io::Result<Channel> {
-        match &self.source {
+        let source = self.source();
+        match &*source {
+            // The fallback chain has not brought a transport up yet.
+            Source::Pending => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no tunnel transport is up yet",
+            )),
             Source::Direct(dialer) => {
                 let link = timeout_at(deadline, self.open_direct(dialer, open)).await;
                 link.map_err(|_| exit_late())?.map(Channel::Link)
@@ -749,7 +864,7 @@ mod tests {
         Entry {
             crypto: Crypto::new(TOKEN, config.tunnel.encryption),
             tuning: config.tuning(),
-            source: Source::Mux(pool),
+            source: std::sync::RwLock::new(Arc::new(Source::Mux(pool))),
             stats: Stats::new(&config),
             per_ip: None,
             last_full_warning: std::sync::Mutex::default(),
@@ -825,7 +940,7 @@ mod tests {
         let entry = Entry {
             crypto: Crypto::new(TOKEN, config.tunnel.encryption),
             tuning: config.tuning(),
-            source: Source::Mux(Arc::new(SessionPool::default())),
+            source: std::sync::RwLock::new(Arc::new(Source::Mux(Arc::new(SessionPool::default())))),
             stats: Stats::new(&config),
             per_ip: None,
             last_full_warning: std::sync::Mutex::default(),

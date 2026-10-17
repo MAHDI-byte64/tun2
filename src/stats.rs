@@ -212,6 +212,21 @@ impl Peer {
         *lock(&self.last_error) = Some((Instant::now(), error.to_string()));
     }
 
+    /// Whether the control channel is up now: a live session with mux, or the last attempt
+    /// having worked without it. The transport fallback chain polls this to tell a
+    /// candidate that connected from one that is still trying.
+    pub fn connected(&self, mux: bool) -> bool {
+        if mux {
+            let mut live = lock(&self.live);
+            live.retain(|(_, s)| s.upgrade().is_some_and(|s| !s.is_closed()));
+            !live.is_empty()
+        } else {
+            let last_ok = *lock(&self.last_ok);
+            let last_error = lock(&self.last_error);
+            last_ok.is_some_and(|ok| last_error.as_ref().map_or(true, |(e, _)| ok > *e))
+        }
+    }
+
     fn snapshot(&self, mux: bool) -> PeerStatus {
         let now = Instant::now();
         let mut live = lock(&self.live);
@@ -383,6 +398,9 @@ pub struct Stats {
     role: &'static str,
     mode: &'static str,
     transport: &'static str,
+    /// The transport actually running now, set by the fallback chain while it rotates
+    /// through its candidates; `None` leaves [`Self::transport`] (the configured one).
+    active_transport: Mutex<Option<&'static str>>,
     profile: &'static str,
     mux: bool,
     pub peer: Arc<Peer>,
@@ -395,6 +413,13 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// Records the transport the fallback chain is running now (its canonical
+    /// [`crate::config::TransportKind::name`]), which `status` reports instead of the
+    /// configured one. `None` clears it.
+    pub fn set_active_transport(&self, name: Option<&'static str>) {
+        *lock(&self.active_transport) = name;
+    }
+
     pub fn new(config: &Config) -> Arc<Self> {
         let mux = config.mux();
         let wanted = if mux.enabled && !config.is_acceptor() {
@@ -407,6 +432,7 @@ impl Stats {
             role: role_name(config.role),
             mode: mode_name(config.mode),
             transport: config.tunnel.transport.name(),
+            active_transport: Mutex::new(None),
             profile: config.profile.name(),
             mux: mux.enabled,
             peer: Arc::new(Peer {
@@ -476,7 +502,9 @@ impl Stats {
             kariz: env!("CARGO_PKG_VERSION").to_string(),
             role: self.role.to_string(),
             mode: self.mode.to_string(),
-            transport: self.transport.to_string(),
+            transport: lock(&self.active_transport)
+                .unwrap_or(self.transport)
+                .to_string(),
             profile: self.profile.to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
             peer: self.peer.snapshot(self.mux),

@@ -149,6 +149,8 @@ struct Setup {
     timeouts_secs: u64,
     /// The forward rule's `proxy_protocol` (`v1`, `v2`); empty leaves it out.
     proxy_protocol: &'static str,
+    /// The forward rule's `protocol`; the `udp` transport forwards UDP only.
+    forward_protocol: &'static str,
 }
 
 impl Setup {
@@ -178,6 +180,7 @@ impl Setup {
             max_conns_per_ip: 0,
             timeouts_secs: 0,
             proxy_protocol: "",
+            forward_protocol: "tcp+udp",
         }
     }
 
@@ -365,6 +368,18 @@ impl Setup {
             transport: "kcp",
             mux: true,
             keepalive_secs: 5,
+            ..Self::tcp(mode)
+        }
+    }
+
+    /// The `udp` transport: the tunnel rides plain UDP (KCP carrier), forwards UDP only on
+    /// the unreliable datagram path, mux forced on, FEC off. Short keepalive like KCP.
+    const fn udp(mode: &'static str) -> Self {
+        Self {
+            transport: "udp",
+            mux: true,
+            keepalive_secs: 5,
+            forward_protocol: "udp",
             ..Self::tcp(mode)
         }
     }
@@ -655,6 +670,7 @@ async fn start_via(
         "" => String::new(),
         v => format!("proxy_protocol = \"{v}\""),
     };
+    let forward_protocol = setup.forward_protocol;
     let profile = |setup: Setup| match setup.profile {
         "" => String::new(),
         p => format!("profile = \"{p}\""),
@@ -668,7 +684,7 @@ async fn start_via(
         [[forward]]
         listen = "127.0.0.1:{user_port}"
         target = "127.0.0.1:{target_port}"
-        protocol = "tcp+udp"
+        protocol = "{forward_protocol}"
         {duplicate}
         {proxy_protocol}
         [tunnel]
@@ -964,6 +980,119 @@ tunnel_tests! {
     wsmux_direct: Setup::wsmux("direct");
     wssmux_reverse: Setup::wssmux("reverse");
     wssmux_direct: Setup::wssmux("direct");
+}
+
+/// Sends `payload` and waits for the answer, resending every 500 ms until one comes or
+/// `budget` runs out: a real UDP client retransmits, and the `udp` transport forwards on
+/// the unreliable path only, so the first datagrams of a flow may be lost before the path
+/// is up.
+async fn udp_roundtrip_retry(
+    sock: &UdpSocket,
+    payload: &[u8],
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if let Some(got) = udp_roundtrip(sock, payload, Duration::from_millis(500)).await {
+            return Some(got);
+        }
+    }
+    None
+}
+
+/// The `udp` transport forwards UDP services only, on the unreliable datagram path. The
+/// payloads stay within one datagram (the path does not fragment, and there is no reliable
+/// fallback), and the client retransmits as a real UDP client would.
+async fn check_udp_transport(setup: Setup) {
+    let target = echo_server().await;
+    let tunnel = start(setup, TOKEN, TOKEN, target).await;
+    let mut handles = Vec::new();
+    for client in 0..4u8 {
+        let port = tunnel.user_port;
+        handles.push(tokio::spawn(async move {
+            let sock = udp_client(port).await;
+            for (i, len) in [1usize, 64, 512, 1000, 1].into_iter().enumerate() {
+                let mut payload = pattern(len);
+                payload[0] = client;
+                if len > 1 {
+                    payload[1] = i as u8;
+                }
+                let got = udp_roundtrip_retry(&sock, &payload, Duration::from_secs(15))
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("udp transport client {client}: no answer for {len} bytes")
+                    });
+                assert!(
+                    got == payload,
+                    "udp transport client {client}: {len}-byte packet corrupted"
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_transport_reverse() {
+    check_udp_transport(Setup::udp("reverse")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_transport_direct() {
+    check_udp_transport(Setup::udp("direct")).await;
+}
+
+/// A fallback chain `[tcpmux, kcp]` on both ends converges on the working fallback when the
+/// primary cannot come up: a blocker holds the primary's TCP port, so the acceptor's
+/// tcpmux listener fails to bind and the dialer's tcpmux attempts stall, and both sides
+/// rotate to the kcp (UDP) candidate and carry traffic. An empty chain is unchanged
+/// behaviour (every other test here runs with no chain).
+#[tokio::test(flavor = "multi_thread")]
+async fn fallback_converges_past_a_blocked_primary() {
+    let target = echo_server().await;
+    let tunnel_port = free_port();
+    let user_port = free_port();
+    // Hold the primary's TCP port so tcpmux can never bind or complete a handshake there;
+    // the kcp candidate rides UDP on the same port and is free to come up.
+    let blocker = std::net::TcpListener::bind(("127.0.0.1", tunnel_port)).unwrap();
+
+    let chain = "transport = \"tcpmux\"\n\
+                 fallback_transports = [\"kcp\"]\n\
+                 fallback_dwell_secs = 10\n\
+                 [tunnel.mux]\n\
+                 enabled = true\n";
+    let tuning =
+        "[tuning]\nkeepalive_secs = 5\ndial_timeout_secs = 2\nhandshake_timeout_secs = 2\n";
+    let entry = format!(
+        "role = \"entry\"\nmode = \"reverse\"\n\
+         [[forward]]\nlisten = \"127.0.0.1:{user_port}\"\ntarget = \"127.0.0.1:{target}\"\nprotocol = \"tcp\"\n\
+         [tunnel]\nlisten = \"127.0.0.1:{tunnel_port}\"\ntoken = \"{TOKEN}\"\n{chain}{tuning}"
+    );
+    let exit = format!(
+        "role = \"exit\"\nmode = \"reverse\"\n\
+         [tunnel]\nremote = \"127.0.0.1:{tunnel_port}\"\ntoken = \"{TOKEN}\"\n{chain}{tuning}"
+    );
+    let _entry = Side::start(&entry);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _exit = Side::start(&exit);
+
+    let payload = pattern(4096);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "fallback never converged on the working transport"
+        );
+        if let Ok(got) = echo_roundtrip(user_port, &payload).await {
+            if got == payload {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    drop(blocker);
 }
 
 /// A `wss` dialer that pins another certificate refuses the listener, so nothing passes.

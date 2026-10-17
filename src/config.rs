@@ -130,8 +130,25 @@ impl TransportKind {
         matches!(self, Self::Wss | Self::Wssmux)
     }
 
-    /// Transports whose mux cannot be turned off (the always-mux twins and the managed
-    /// helpers, which run their own handshake and mux inside the helper stream).
+    /// Transports with no transport-level crypto of their own, for which the tunnel's own
+    /// encryption is mandatory (it is never left to the user). `quic` is not here: it
+    /// always encrypts with TLS 1.3 and requires `encryption = "auto"` separately.
+    fn forces_encryption(self) -> bool {
+        matches!(
+            self,
+            Self::Stealth
+                | Self::Udp
+                | Self::Faketcp
+                | Self::Icmp
+                | Self::Naive
+                | Self::Xhttp
+                | Self::Reality
+        )
+    }
+
+    /// Transports whose mux cannot be turned off (the always-mux twins, the managed
+    /// helpers, which run their own handshake and mux inside the helper stream, and `udp`,
+    /// which forwards datagrams on the mux datagram path).
     fn forces_mux(self) -> bool {
         matches!(
             self,
@@ -139,6 +156,7 @@ impl TransportKind {
                 | Self::Auto
                 | Self::Wsmux
                 | Self::Wssmux
+                | Self::Udp
                 | Self::Naive
                 | Self::Xhttp
                 | Self::Reality
@@ -1522,11 +1540,17 @@ impl Config {
 
     /// `[tunnel.kcp]` with the profile's defaults filled in: the gaming profile turns FEC
     /// on (10 data + 3 parity packets per group) unless the table sets `fec_data` or
-    /// `fec_parity`, or an MTU too large for FEC.
+    /// `fec_parity`, or an MTU too large for FEC. The `udp` transport keeps FEC off by
+    /// default whatever the profile (its forwarded datagrams ride the bare unreliable
+    /// path); a user who wants it can still set `[tunnel.kcp] fec_data`/`fec_parity`.
     pub fn kcp(&self) -> KcpConfig {
         let mut k = self.tunnel.kcp.clone().unwrap_or_default();
         let unset = k.fec_data.is_none() && k.fec_parity.is_none();
-        if self.profile == Profile::Gaming && unset && k.mtu <= KCP_MTU_FEC {
+        if self.profile == Profile::Gaming
+            && self.tunnel.transport != TransportKind::Udp
+            && unset
+            && k.mtu <= KCP_MTU_FEC
+        {
             (k.fec_data, k.fec_parity) = (Some(10), Some(3));
         }
         k
@@ -1697,7 +1721,10 @@ impl Config {
     }
 
     fn validate_tls(&self) -> Result<()> {
-        let tls = match (&self.tunnel.tls, self.tunnel.transport.is_wss()) {
+        // `wss`/`wssmux` as the primary or as a fallback candidate uses the table.
+        let wss = self.tunnel.transport.is_wss()
+            || self.tunnel.fallback_transports.iter().any(|k| k.is_wss());
+        let tls = match (&self.tunnel.tls, wss) {
             (Some(_), false) => {
                 bail!("[tunnel.tls] is only used with transport = \"wss\" or \"wssmux\"")
             }
@@ -1819,6 +1846,14 @@ impl Config {
         // so the tunnel's own encryption is mandatory.
         if self.tunnel.encryption == Encryption::None {
             bail!("transport = \"udp\" requires encryption; set tunnel.encryption");
+        }
+        // Forwarded datagrams ride the unreliable mux datagram path, which needs the KCP
+        // datagram side; it is on by default and the udp transport cannot turn it off.
+        if self.tunnel.kcp.as_ref().is_some_and(|k| !k.datagrams) {
+            bail!(
+                "transport = \"udp\" forwards on the datagram path; [tunnel.kcp] datagrams \
+                 cannot be false"
+            );
         }
         // The udp transport carries forwarded datagrams on the unreliable path; there is no
         // stream to run a TCP forward or a PROXY header over.
@@ -1945,12 +1980,20 @@ impl Config {
         if self.tunnel.transport == TransportKind::Auto {
             bail!("tunnel.fallback_transports is not allowed with transport = \"auto\"");
         }
+        // The udp transport forwards UDP only, on the unreliable path, so it cannot share a
+        // fallback chain with transports that carry TCP or forward reliably.
+        if self.tunnel.transport == TransportKind::Udp {
+            bail!("tunnel.fallback_transports is not allowed with transport = \"udp\"");
+        }
         if self.tunnel.fallback_dwell_secs < FALLBACK_MIN_DWELL_SECS {
             bail!("tunnel.fallback_dwell_secs must be at least {FALLBACK_MIN_DWELL_SECS}");
         }
         for (i, kind) in list.iter().enumerate() {
             if *kind == TransportKind::Auto {
                 bail!("tunnel.fallback_transports cannot contain \"auto\"");
+            }
+            if *kind == TransportKind::Udp {
+                bail!("tunnel.fallback_transports cannot contain \"udp\"");
             }
             if *kind == self.tunnel.transport {
                 bail!(
@@ -1964,6 +2007,35 @@ impl Config {
                     "tunnel.fallback_transports has a duplicate: \"{}\"",
                     kind.name()
                 );
+            }
+            // Every candidate is held to the same rules as a primary. The per-transport
+            // validators only check the configured transport, so a candidate's mandatory
+            // encryption and TLS table are enforced here.
+            if kind.forces_encryption() && self.tunnel.encryption == Encryption::None {
+                bail!(
+                    "tunnel.fallback_transports has \"{}\", which requires encryption; set \
+                     tunnel.encryption",
+                    kind.name()
+                );
+            }
+            if kind.is_helper() {
+                bail!(
+                    "tunnel.fallback_transports cannot contain the managed helper transport \
+                     \"{}\"",
+                    kind.name()
+                );
+            }
+            if kind.is_wss() && self.is_acceptor() {
+                let tls = self.tunnel.tls.as_ref();
+                if tls.and_then(|t| t.cert.as_deref()).is_none()
+                    || tls.and_then(|t| t.key.as_deref()).is_none()
+                {
+                    bail!(
+                        "tunnel.fallback_transports has \"{}\", which needs [tunnel.tls] cert \
+                         and key on the listening side",
+                        kind.name()
+                    );
+                }
             }
         }
         Ok(())
@@ -3203,6 +3275,74 @@ keepalive_secs = 1
             "fallback_transports = [\"ws\", \"tcp\"]",
         ))
         .is_ok());
+        // The udp transport cannot be in a chain, as primary or candidate.
+        let err = parse_err(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"udp\"]",
+        ));
+        assert!(err.contains("udp"), "{err}");
+        // A candidate that mandates encryption is held to it, not just the primary.
+        let err = parse_err(&with_transport(
+            "entry",
+            "tcpmux",
+            "encryption = \"none\"\nfallback_transports = [\"stealth\"]",
+        ));
+        assert!(err.contains("encryption"), "{err}");
+        // Managed helpers cannot be chain candidates.
+        let err = parse_err(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"naive\"]",
+        ));
+        assert!(err.contains("naive"), "{err}");
+        // A wss candidate needs the TLS table on the listening side (a direct exit listens).
+        let acceptor = format!(
+            "role = \"exit\"\nmode = \"direct\"\n\
+             [tunnel]\ntransport = \"tcpmux\"\nlisten = \"0.0.0.0:443\"\ntoken = \"{TOKEN}\"\n\
+             fallback_transports = [\"wss\"]\n"
+        );
+        let err = parse_err(&acceptor);
+        assert!(err.contains("tls") || err.contains("wss"), "{err}");
+        // With the certificate present it parses, and the table is accepted for the
+        // candidate although the primary is not wss.
+        let ok = format!(
+            "role = \"entry\"\nmode = \"reverse\"\n\
+             [[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\n\
+             [tunnel]\ntransport = \"tcpmux\"\nlisten = \"0.0.0.0:443\"\ntoken = \"{TOKEN}\"\n\
+             fallback_transports = [\"wss\"]\n\
+             [tunnel.tls]\ncert = \"/tmp/c.pem\"\nkey = \"/tmp/k.pem\"\n"
+        );
+        assert!(Config::parse(&ok).is_ok(), "{:?}", Config::parse(&ok).err());
+    }
+
+    /// A udp-transport entry with a udp-only forward and the given extra `[tunnel]` lines.
+    #[cfg(feature = "kcp")]
+    fn udp_entry(extra: &str) -> String {
+        format!(
+            "role = \"entry\"\nmode = \"direct\"\n\
+             [[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\nprotocol = \"udp\"\n\
+             [tunnel]\ntransport = \"udp\"\nremote = \"203.0.113.1:443\"\ntoken = \"{TOKEN}\"\n{extra}\n"
+        )
+    }
+
+    #[cfg(feature = "kcp")]
+    #[test]
+    fn udp_transport_constraints() {
+        // A plain udp tunnel is valid.
+        assert!(Config::parse(&udp_entry("")).is_ok());
+        // Mux cannot be turned off (the datagram path needs it).
+        let err = parse_err(&udp_entry("[tunnel.mux]\nenabled = false"));
+        assert!(err.contains("mux"), "{err}");
+        // The datagram side cannot be turned off.
+        let err = parse_err(&udp_entry("[tunnel.kcp]\ndatagrams = false"));
+        assert!(err.contains("datagram"), "{err}");
+        // A fallback chain is not allowed with udp.
+        let err = parse_err(&udp_entry("fallback_transports = [\"kcp\"]"));
+        assert!(err.contains("udp"), "{err}");
+        // FEC stays off by default even in the gaming profile.
+        let config = Config::parse(&format!("profile = \"gaming\"\n{}", udp_entry(""))).unwrap();
+        assert_eq!(config.kcp().fec(), None);
     }
 
     #[cfg(feature = "l3")]
