@@ -80,6 +80,33 @@ enum Command {
         #[arg(long)]
         no_udp: bool,
     },
+    /// Install and inspect the pinned managed-helper binaries (sing-box / NaiveProxy /
+    /// Xray), and the key utilities the helper transports need.
+    #[cfg(feature = "helpers")]
+    Helper {
+        #[command(subcommand)]
+        command: HelperCommand,
+    },
+}
+
+/// Subcommands of `kariz helper`.
+#[cfg(feature = "helpers")]
+#[derive(Subcommand)]
+enum HelperCommand {
+    /// Download, verify and unpack a pinned helper. Never overwrites an existing version.
+    Install {
+        /// The helper to install: `sing-box`, `naive` or `xray`.
+        name: String,
+        /// Install this local archive instead of downloading (still sha256-checked).
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// List the installed pinned helpers.
+    Status,
+    /// Generate a random UUID for `tunnel.helper.uuid`.
+    Uuid,
+    /// Generate a REALITY X25519 key pair with the installed `xray x25519`.
+    RealityKeys,
 }
 
 fn main() -> Result<()> {
@@ -117,6 +144,45 @@ fn main() -> Result<()> {
                 udp: !no_udp,
             };
             speedtest(&Config::load(&config)?, options)
+        }
+        #[cfg(feature = "helpers")]
+        Command::Helper { command } => helper(command),
+    }
+}
+
+/// `kariz helper <install|status|uuid|reality-keys>`.
+#[cfg(feature = "helpers")]
+fn helper(command: HelperCommand) -> Result<()> {
+    use kariz::transport::helper::install;
+    match command {
+        HelperCommand::Install { name, from } => {
+            let path = install::install(&name, from.as_deref())?;
+            println!("installed {name} at {}", path.display());
+            Ok(())
+        }
+        HelperCommand::Status => {
+            let installed = install::status();
+            if installed.is_empty() {
+                println!(
+                    "no helpers installed under {}",
+                    install::helper_dir().display()
+                );
+            } else {
+                for (name, version) in installed {
+                    println!("{name}\t{version}");
+                }
+            }
+            Ok(())
+        }
+        HelperCommand::Uuid => {
+            println!("{}", install::gen_uuid()?);
+            Ok(())
+        }
+        HelperCommand::RealityKeys => {
+            let (private, public) = install::reality_keys()?;
+            println!("private_key = \"{private}\"");
+            println!("public_key  = \"{public}\"");
+            Ok(())
         }
     }
 }

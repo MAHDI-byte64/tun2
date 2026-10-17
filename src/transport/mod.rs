@@ -74,6 +74,9 @@ pub struct Settings {
     pub kcp: kcp::KcpParams,
     /// Set for `transport = "stealth"`.
     pub stealth: Option<StealthParams>,
+    /// Set for the managed-helper transports (`naive`, `xhttp`, `reality`).
+    #[cfg(feature = "helpers")]
+    pub helper: Option<helper::HelperParams>,
 }
 
 impl Settings {
@@ -87,12 +90,19 @@ impl Settings {
                 jitter: Duration::from_millis(u64::from(s.jitter_ms)),
             }
         });
+        #[cfg(feature = "helpers")]
+        let helper = tunnel.transport.is_helper().then(|| helper::HelperParams {
+            config: tunnel.helper.clone().unwrap_or_default(),
+            token: tunnel.token.clone(),
+        });
         Self {
             kind: tunnel.transport,
             ws: tunnel.ws.clone(),
             tls: tunnel.tls.clone(),
             kcp: kcp::KcpParams::new(tunnel, kcp),
             stealth,
+            #[cfg(feature = "helpers")]
+            helper,
         }
     }
 }
@@ -106,6 +116,10 @@ pub enum Listener {
         Option<TlsAcceptor>,
     ),
     Kcp(kcp::KcpListener),
+    /// A managed-helper transport (`naive`, `xhttp`, `reality`): a supervised helper
+    /// server process plus the Kariz-owned internal loopback listener it forwards to.
+    #[cfg(all(feature = "helpers", unix))]
+    Helper(helper::HelperListener),
 }
 
 impl Listener {
@@ -138,7 +152,15 @@ impl Listener {
                 return Ok(Self::Kcp(listener));
             }
             TransportKind::Naive | TransportKind::Xhttp | TransportKind::Reality => {
-                return Err(helper::unsupported(settings.kind));
+                #[cfg(all(feature = "helpers", unix))]
+                {
+                    let listener = helper::HelperListener::bind(settings, addr, tuning).await?;
+                    return Ok(Self::Helper(listener));
+                }
+                #[cfg(not(all(feature = "helpers", unix)))]
+                {
+                    return Err(helper::unsupported(settings.kind));
+                }
             }
             _ => {}
         }
@@ -194,6 +216,12 @@ impl Listener {
                 let (s, peer) = l.accept().await?;
                 Ok((Incoming::Kcp(s), peer))
             }
+            // A helper connection arrives as a plain TCP stream on the internal listener.
+            #[cfg(all(feature = "helpers", unix))]
+            Self::Helper(l) => {
+                let (s, peer) = l.accept().await?;
+                Ok((Incoming::Tcp(s), peer))
+            }
         }
     }
 
@@ -201,6 +229,8 @@ impl Listener {
         match self {
             Self::Tcp(l) | Self::Ws(l, ..) => l.local_addr(),
             Self::Kcp(l) => l.local_addr(),
+            #[cfg(all(feature = "helpers", unix))]
+            Self::Helper(l) => l.local_addr(),
         }
     }
 }
@@ -261,6 +291,10 @@ pub enum Dialer {
     Tcp(tcp::TcpTransportDialer),
     Ws(tcp::TcpTransportDialer, Box<WsDialer>),
     Kcp(kcp::KcpDialer),
+    /// A managed-helper transport: a supervised helper client process whose local SOCKS5
+    /// inbound Kariz dials through.
+    #[cfg(all(feature = "helpers", unix))]
+    Helper(helper::HelperDialer),
 }
 
 /// WebSocket part of a [`Dialer`].
@@ -290,7 +324,16 @@ impl Dialer {
             | TransportKind::Faketcp
             | TransportKind::Icmp => unreachable!("handled above"),
             TransportKind::Naive | TransportKind::Xhttp | TransportKind::Reality => {
-                return Err(helper::unsupported(settings.kind))
+                #[cfg(all(feature = "helpers", unix))]
+                {
+                    return Ok(Self::Helper(helper::HelperDialer::new(
+                        settings, addr, tuning,
+                    )?));
+                }
+                #[cfg(not(all(feature = "helpers", unix)))]
+                {
+                    return Err(helper::unsupported(settings.kind));
+                }
             }
             TransportKind::Ws | TransportKind::Wsmux => {
                 (ws::ClientConfig::new(ws, addr, "http", 80), None)
@@ -336,6 +379,8 @@ impl Dialer {
                 }
                 Ok(TunnelStream::Kcp(stream))
             }
+            #[cfg(all(feature = "helpers", unix))]
+            Self::Helper(d) => d.dial_with(first).await,
             Self::Ws(d, ws) => {
                 let stream = d.dial().await?;
                 timeout(ws.timeout, ws.establish(stream, first))

@@ -1892,6 +1892,13 @@ impl Config {
                 self.tunnel.transport.name()
             );
         }
+        // The managed helpers carry one TCP stream each; they cannot forward UDP.
+        if self.forward.iter().any(|f| f.protocol.has_udp()) {
+            bail!(
+                "transport = \"{}\" cannot forward UDP; use tcp forward rules only",
+                self.tunnel.transport.name()
+            );
+        }
         let h = self.tunnel.helper.clone().unwrap_or_default();
         let acceptor = self.is_acceptor();
         for (path, what) in [
@@ -3224,6 +3231,19 @@ keepalive_secs = 1
             ),
         ));
         assert!(err.contains("public_key"), "{err}");
+    }
+
+    #[cfg(feature = "helpers")]
+    #[test]
+    fn helper_rejects_udp_forwarding() {
+        let text = format!(
+            "role = \"entry\"\nmode = \"direct\"\n\
+             [[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\nprotocol = \"udp\"\n\
+             [tunnel]\ntransport = \"naive\"\nremote = \"203.0.113.1:443\"\ntoken = \"{TOKEN}\"\n\
+             [tunnel.helper]\nusername = \"u\"\npassword = \"p\"\n"
+        );
+        let err = parse_err(&text);
+        assert!(err.contains("cannot forward UDP"), "{err}");
     }
 
     #[test]
