@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.7.0 (unreleased)
+
+### Added
+
+- New transports from BackPack: stealth, wsmux, wssmux, udp, faketcp, icmp, naive, xhttp, reality;
+  transport fallback.
+
 ## 2.6.1 - 2026-10-16
 
 The stable release after 2.5.1, with everything of the four betas

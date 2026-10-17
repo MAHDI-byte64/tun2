@@ -2,6 +2,12 @@
 
 [English](../CHANGELOG.md) · **فارسی**
 
+## 2.7.0 (unreleased)
+
+### اضافه شد
+
+- ترنسپورت‌های تازه از BackPack: ‏stealth، wsmux، wssmux، udp، faketcp، icmp، naive، xhttp، reality؛ و fallback ترنسپورت.
+
 ## 2.6.1 - 2026-10-16
 
 نسخهٔ پایدار پس از ۲٫۵٫۱، با همهٔ چیزهایی که در چهار بتا بود
