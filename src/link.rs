@@ -43,6 +43,15 @@ use crate::transport::{Dialer as TransportDialer, Incoming, Listener, Settings};
 /// through those, WebSocket over TLS looks like an ordinary web site, and QUIC (sealed, so
 /// it is not recognised as QUIC) is another way over UDP. QUIC is last: an agent before it
 /// existed does not try it, and one that does tries it after the others.
+///
+/// The fork's new tunnel transports are deliberately kept off this list: the panel ↔ agent
+/// link must stay on the transports an agent is sure to be able to bring up anywhere, with
+/// no extra privilege or state. `stealth`, `wsmux` and `wssmux` would only duplicate
+/// `tcpmux` and `wss` here (the link already muxes and already seals every byte); `udp` is
+/// datagram-only, so it cannot carry the link's request streams; and `faketcp` / `icmp`
+/// need root, raw sockets and host firewall rules, which a management link must never
+/// require. The managed-helper transports need external, credentialed binaries on both
+/// ends. A tunnel can use any of them; the link stays on the proven four.
 #[cfg(feature = "quic")]
 pub const LINK_TRANSPORTS: [TransportKind; 4] = [
     TransportKind::Tcpmux,
@@ -160,7 +169,7 @@ token = {token:?}
     if kind == TransportKind::Quic {
         toml.push_str("[tunnel.quic]\nobfs = true\n");
     }
-    if kind == TransportKind::Ws {
+    if matches!(kind, TransportKind::Ws | TransportKind::Wsmux) {
         toml.push_str(&format!(
             "[tunnel.ws]
 path = {:?}
@@ -168,7 +177,7 @@ path = {:?}
             ws_path(token)
         ));
     }
-    if kind == TransportKind::Wss {
+    if matches!(kind, TransportKind::Wss | TransportKind::Wssmux) {
         toml.push_str(&format!(
             "[tunnel.ws]
 path = {:?}

@@ -25,21 +25,63 @@ use crate::speedtest::{self, Latency, Options, Pipe, Rate};
 
 /// The transports a benchmark measures, in the order it measures them. `tcp` without mux
 /// moves data like `tcpmux` (one connection per user connection instead of one shared), and
-/// `auto` switches between `tcpmux`, `kcp` and `ws`: both are judged by those.
-#[cfg(feature = "quic")]
-pub const TRANSPORTS: [TransportKind; 5] = [
+/// `auto` switches between `tcpmux`, `kcp` and `ws`: all three are judged by those.
+///
+/// The always-mux WebSocket twins (`wsmux`, `wssmux`) move data exactly like `ws` / `wss`
+/// but are measured under their own name, because a tunnel set to them cannot turn mux off.
+/// `stealth` is measured like `tcpmux` (an encrypted TCP stream; its record padding and
+/// jitter are on the link but add no handshake the benchmark has to arrange). `udp`,
+/// `faketcp` and `icmp` all ride the KCP stack over a datagram carrier, so the benchmark
+/// measures them over a reliable test stream the way `kcp` is measured; what differs is the
+/// carrier (plain UDP, a raw fake-TCP segment, an ICMP echo), which is exactly the path
+/// quality the pre-tunnel benchmark exists to compare.
+///
+/// The root-only raw carriers (`faketcp`, `icmp`) are left in the list but are skipped, not
+/// failed, when they cannot be brought up: their listener/dialer returns a clear
+/// `PermissionDenied` ("needs root or CAP_NET_RAW") or `Unsupported` (not Linux, or the
+/// `rawlink` feature off), which the bench runner records as that candidate's reason while
+/// the other candidates keep going (see `panel/src/bench.rs`). They are included only when
+/// the `rawlink` feature is built in.
+///
+/// The managed-helper transports (`naive`, `xhttp`, `reality`) are deliberately **not**
+/// here: a benchmark link is made from a token alone, but a helper needs a full
+/// `[tunnel.helper]` credential set (certificates, UUIDs, keys, a cover target) and an
+/// installed, supervised helper binary on both ends, none of which the synthetic benchmark
+/// config can supply. They are validated by `kariz check` and exercised by the helper e2e
+/// tests instead.
+const fn transports_len() -> usize {
+    // tcpmux, stealth, ws, wsmux, wss and wssmux are in every release build and need no
+    // optional feature; the rest are added only when their feature is on.
+    let mut n = 6;
+    if cfg!(feature = "kcp") {
+        n += 2; // kcp, udp
+    }
+    if cfg!(feature = "rawlink") {
+        n += 2; // faketcp, icmp (rawlink implies kcp)
+    }
+    if cfg!(feature = "quic") {
+        n += 1; // quic
+    }
+    n
+}
+
+pub const TRANSPORTS: [TransportKind; transports_len()] = [
     TransportKind::Tcpmux,
-    TransportKind::Kcp,
+    TransportKind::Stealth,
     TransportKind::Ws,
+    TransportKind::Wsmux,
     TransportKind::Wss,
+    TransportKind::Wssmux,
+    #[cfg(feature = "kcp")]
+    TransportKind::Kcp,
+    #[cfg(feature = "kcp")]
+    TransportKind::Udp,
+    #[cfg(feature = "rawlink")]
+    TransportKind::Faketcp,
+    #[cfg(feature = "rawlink")]
+    TransportKind::Icmp,
+    #[cfg(feature = "quic")]
     TransportKind::Quic,
-];
-#[cfg(not(feature = "quic"))]
-pub const TRANSPORTS: [TransportKind; 4] = [
-    TransportKind::Tcpmux,
-    TransportKind::Kcp,
-    TransportKind::Ws,
-    TransportKind::Wss,
 ];
 
 /// Longest a test session lives on the listening end, whatever the dialing end does.
@@ -221,10 +263,20 @@ mod tests {
         tls: Option<(&Path, &Path)>,
         sni: Option<&str>,
     ) -> (f64, Latency, Speed) {
-        let acceptor = listen(at, TOKEN, kind, "balanced", tls).await.unwrap();
+        measured_token(at, TOKEN, kind, tls, sni).await
+    }
+
+    async fn measured_token(
+        at: &str,
+        token: &str,
+        kind: TransportKind,
+        tls: Option<(&Path, &Path)>,
+        sni: Option<&str>,
+    ) -> (f64, Latency, Speed) {
+        let acceptor = listen(at, token, kind, "balanced", tls).await.unwrap();
         let addr = acceptor.local_addr().unwrap().to_string();
         let server = tokio::spawn(answer(acceptor, Duration::from_secs(10)));
-        let (session, ms) = dial(&addr, TOKEN, kind, "balanced", sni, Duration::from_secs(10))
+        let (session, ms) = dial(&addr, token, kind, "balanced", sni, Duration::from_secs(10))
             .await
             .unwrap();
         let latency = probe(&session, Duration::from_millis(500)).await.unwrap();
@@ -255,10 +307,27 @@ mod tests {
         }
     }
 
+    /// `stealth` (encrypted TCP with record padding) and `wsmux` (ws that cannot turn mux
+    /// off) are measured like `tcpmux` and `ws`, over plain TCP with no certificate.
+    #[tokio::test]
+    async fn stealth_and_wsmux_are_measured() {
+        for kind in [TransportKind::Stealth, TransportKind::Wsmux] {
+            sane(kind, measured(kind, None).await);
+        }
+    }
+
     #[cfg(feature = "kcp")]
     #[tokio::test]
     async fn kcp_is_measured() {
         sane(TransportKind::Kcp, measured(TransportKind::Kcp, None).await);
+    }
+
+    /// `udp` rides the KCP stack over a plain UDP carrier; the benchmark measures it over a
+    /// reliable test stream, the way `kcp` is measured.
+    #[cfg(feature = "kcp")]
+    #[tokio::test]
+    async fn udp_is_measured() {
+        sane(TransportKind::Udp, measured(TransportKind::Udp, None).await);
     }
 
     #[cfg(feature = "quic")]
@@ -278,10 +347,10 @@ mod tests {
         let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
         std::fs::write(&cert, c.cert.pem()).unwrap();
         std::fs::write(&key, c.signing_key.serialize_pem()).unwrap();
-        sane(
-            TransportKind::Wss,
-            measured(TransportKind::Wss, Some((&cert, &key))).await,
-        );
+        // `wss`, and its always-mux twin `wssmux`, both with the same throwaway certificate.
+        for kind in [TransportKind::Wss, TransportKind::Wssmux] {
+            sane(kind, measured(kind, Some((&cert, &key))).await);
+        }
         // A server name that is not the certificate's, as a tunnel with a domain sends it.
         sane(
             TransportKind::Wss,
@@ -331,11 +400,75 @@ mod tests {
         assert_eq!(ended.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
+    /// The root-only raw carriers are measured here when the host can bring them up (Linux,
+    /// root / `CAP_NET_RAW`, iptables), and otherwise skipped with a printed reason instead
+    /// of failing: their listener returns a clear `PermissionDenied` / `Unsupported` that
+    /// the bench runner records as that candidate's reason. Serialised, because the raw
+    /// socket, the token-derived source port and the iptables rules are global to the host.
+    #[cfg(feature = "rawlink")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn faketcp_and_icmp_are_measured_or_skipped_cleanly() {
+        // An async mutex, so the guard may be held across the measurement's awaits.
+        static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        let ready = cfg!(target_os = "linux")
+            && std::process::Command::new("iptables")
+                .arg("-S")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+        for (kind, token) in [
+            (TransportKind::Faketcp, "bench-faketcp-token-0123456789ab"),
+            (TransportKind::Icmp, "bench-icmp-token-0123456789abcdef"),
+        ] {
+            // They are transports a benchmark measures, so a run reaches them at all.
+            assert!(check(kind).is_ok(), "{kind:?} should be benchmarkable");
+            if !ready {
+                eprintln!(
+                    "skipping {}: the raw-packet carriers need Linux + root + iptables",
+                    kind.name()
+                );
+                continue;
+            }
+            let _serial = SERIAL.lock().await;
+            // A real free TCP port: the raw carriers address a port but bind no kernel
+            // socket on it, so nothing else must be listening there.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let at = format!("127.0.0.1:{port}");
+            sane(kind, measured_token(&at, token, kind, None, None).await);
+        }
+    }
+
     #[test]
     fn only_tunnel_transports_and_profiles_are_taken() {
-        assert!(check(TransportKind::Tcp).is_err());
-        assert!(check(TransportKind::Auto).is_err());
+        // Not measured: plain tcp (judged by tcpmux), auto (judged by its members), and the
+        // managed-helper transports (a token-only test link cannot carry their credentials).
+        for kind in [
+            TransportKind::Tcp,
+            TransportKind::Auto,
+            TransportKind::Naive,
+            TransportKind::Xhttp,
+            TransportKind::Reality,
+        ] {
+            assert!(check(kind).is_err(), "{kind:?} must not be measured");
+        }
+        // Measured: every transport a tunnel can actually be set to and benchmarked.
         assert!(check(TransportKind::Ws).is_ok());
+        assert!(check(TransportKind::Stealth).is_ok());
+        assert!(check(TransportKind::Wsmux).is_ok());
+        assert!(check(TransportKind::Wssmux).is_ok());
+        #[cfg(feature = "kcp")]
+        assert!(check(TransportKind::Udp).is_ok());
+        #[cfg(feature = "rawlink")]
+        {
+            assert!(check(TransportKind::Faketcp).is_ok());
+            assert!(check(TransportKind::Icmp).is_ok());
+        }
         assert!(profile("ultraspeed").is_ok());
         assert!(profile("fast").is_err());
     }
