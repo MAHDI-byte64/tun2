@@ -6,6 +6,7 @@
 //! variants. `tcpmux` is the `tcp` transport with mux on top, so it has no variant;
 //! `ws` and `wss` share the WebSocket code and differ only in the TLS layer.
 
+pub mod helper;
 #[cfg(feature = "kcp")]
 pub mod kcp;
 #[cfg(not(feature = "kcp"))]
@@ -37,6 +38,22 @@ use crate::config::{TlsConfig, TransportKind, Tuning, TunnelConfig, WsConfig};
 /// A TLS connection over TCP, either side.
 pub type TlsTcp = tokio_rustls::TlsStream<TcpStream>;
 
+/// The record-padding and timing-jitter parameters of the `stealth` transport.
+///
+/// TODO(stealth): the record-padding / jitter layer that reads these is added by the
+/// stealth unit; until then `stealth` behaves as a plain encrypted TCP stream. This struct
+/// is the hook it fills: it rides in [`Settings::stealth`] for stealth links only, so no
+/// other transport's wire is touched.
+#[derive(Debug, Clone)]
+pub struct StealthParams {
+    /// Add random padding inside each AEAD record.
+    pub padding: bool,
+    /// Largest padding per record, in bytes.
+    pub pad_max: u16,
+    /// Random delay before flushing a record.
+    pub jitter: Duration,
+}
+
 /// The transport part of `[tunnel]`: everything listeners and dialers need besides the
 /// address.
 #[derive(Debug, Clone, Default)]
@@ -45,16 +62,27 @@ pub struct Settings {
     pub ws: Option<WsConfig>,
     pub tls: Option<TlsConfig>,
     pub kcp: kcp::KcpParams,
+    /// Set for `transport = "stealth"`.
+    pub stealth: Option<StealthParams>,
 }
 
 impl Settings {
     /// `kcp`: `[tunnel.kcp]` with the profile's defaults (`Config::kcp`).
     pub fn new(tunnel: &TunnelConfig, kcp: crate::config::KcpConfig) -> Self {
+        let stealth = (tunnel.transport == TransportKind::Stealth).then(|| {
+            let s = tunnel.stealth.clone().unwrap_or_default();
+            StealthParams {
+                padding: s.padding,
+                pad_max: s.pad_max,
+                jitter: Duration::from_millis(u64::from(s.jitter_ms)),
+            }
+        });
         Self {
             kind: tunnel.transport,
             ws: tunnel.ws.clone(),
             tls: tunnel.tls.clone(),
             kcp: kcp::KcpParams::new(tunnel, kcp),
+            stealth,
         }
     }
 }
@@ -74,7 +102,7 @@ impl Listener {
     pub async fn bind(settings: &Settings, addr: &str, tuning: &Tuning) -> io::Result<Self> {
         // Certificate problems are reported before the port is taken.
         let tls = match settings.kind {
-            TransportKind::Wss => {
+            TransportKind::Wss | TransportKind::Wssmux => {
                 let tls = settings.tls.as_ref();
                 let (Some(cert), Some(key)) = (
                     tls.and_then(|t| t.cert.as_deref()),
@@ -91,19 +119,41 @@ impl Listener {
         };
         match settings.kind {
             TransportKind::Quic | TransportKind::Auto => return Err(not_a_stream_transport()),
-            TransportKind::Kcp => {
+            // The KCP stack over its chosen carrier (UDP, or a raw-packet carrier).
+            TransportKind::Kcp
+            | TransportKind::Udp
+            | TransportKind::Faketcp
+            | TransportKind::Icmp => {
                 let listener = kcp::KcpListener::bind(addr, &settings.kcp, tuning).await?;
                 return Ok(Self::Kcp(listener));
+            }
+            TransportKind::Naive | TransportKind::Xhttp | TransportKind::Reality => {
+                return Err(helper::unsupported(settings.kind));
             }
             _ => {}
         }
         let tcp = tcp::TcpTransportListener::bind(addr, tuning).await?;
         match settings.kind {
-            TransportKind::Quic | TransportKind::Kcp | TransportKind::Auto => {
+            TransportKind::Quic
+            | TransportKind::Kcp
+            | TransportKind::Auto
+            | TransportKind::Udp
+            | TransportKind::Faketcp
+            | TransportKind::Icmp
+            | TransportKind::Naive
+            | TransportKind::Xhttp
+            | TransportKind::Reality => {
                 unreachable!("handled above")
             }
-            TransportKind::Tcp | TransportKind::Tcpmux => Ok(Self::Tcp(tcp)),
-            TransportKind::Ws | TransportKind::Wss => Ok(Self::Ws(
+            // Stealth is a plain TCP stream here; its record-padding layer sits above the
+            // transport (see `StealthParams`), so it needs no special listener.
+            TransportKind::Tcp | TransportKind::Tcpmux | TransportKind::Stealth => {
+                Ok(Self::Tcp(tcp))
+            }
+            TransportKind::Ws
+            | TransportKind::Wss
+            | TransportKind::Wsmux
+            | TransportKind::Wssmux => Ok(Self::Ws(
                 tcp,
                 Arc::new(ws::ServerConfig::new(settings.ws.as_ref())),
                 tls,
@@ -214,17 +264,28 @@ pub struct WsDialer {
 
 impl Dialer {
     pub fn new(settings: &Settings, addr: &str, tuning: &Tuning) -> io::Result<Self> {
-        if settings.kind == TransportKind::Kcp {
+        if settings.kind.is_kcp_based() {
             return Ok(Self::Kcp(kcp::KcpDialer::new(addr, &settings.kcp, tuning)));
         }
         let tcp = tcp::TcpTransportDialer::new(addr, tuning);
         let ws = settings.ws.as_ref();
         let (config, tls) = match settings.kind {
-            TransportKind::Tcp | TransportKind::Tcpmux => return Ok(Self::Tcp(tcp)),
+            // Stealth dials like TCP; its record-padding layer sits above the transport.
+            TransportKind::Tcp | TransportKind::Tcpmux | TransportKind::Stealth => {
+                return Ok(Self::Tcp(tcp))
+            }
             TransportKind::Quic | TransportKind::Auto => return Err(not_a_stream_transport()),
-            TransportKind::Kcp => unreachable!("handled above"),
-            TransportKind::Ws => (ws::ClientConfig::new(ws, addr, "http", 80), None),
-            TransportKind::Wss => {
+            TransportKind::Kcp
+            | TransportKind::Udp
+            | TransportKind::Faketcp
+            | TransportKind::Icmp => unreachable!("handled above"),
+            TransportKind::Naive | TransportKind::Xhttp | TransportKind::Reality => {
+                return Err(helper::unsupported(settings.kind))
+            }
+            TransportKind::Ws | TransportKind::Wsmux => {
+                (ws::ClientConfig::new(ws, addr, "http", 80), None)
+            }
+            TransportKind::Wss | TransportKind::Wssmux => {
                 // SNI: tls.sni, else the Host we send, else the host we dial.
                 let host = ws.and_then(|w| w.host.as_deref()).unwrap_or(addr);
                 let name = ws::upgrade::split_port(host).0;

@@ -9,6 +9,7 @@ fn params(key: u8) -> KcpParams {
     KcpParams {
         config: KcpConfig::default(),
         key: [key; 32],
+        carrier: Carrier::Udp,
     }
 }
 

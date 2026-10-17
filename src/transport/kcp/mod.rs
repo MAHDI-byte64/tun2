@@ -20,8 +20,13 @@
 //! know (after a restart, say) is answered with a close, so the dialer finds out at once.
 //! Packets that were not sealed with the token get no answer at all.
 
+pub mod carrier;
 mod fec;
 pub mod protect;
+#[cfg(feature = "rawlink")]
+pub mod rawlink;
+
+pub use carrier::Carrier;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -101,17 +106,21 @@ const DATAGRAM_QUEUE: usize = 256;
 /// id (`PACKET_DATAGRAM`) or its marker (FEC).
 const DATAGRAM_HEADER: usize = 4;
 
-/// What listeners and dialers need from `[tunnel]`: `[tunnel.kcp]` and the packet key.
+/// What listeners and dialers need from `[tunnel]`: `[tunnel.kcp]`, the packet key, and
+/// which datagram carrier the KCP stack rides.
 #[derive(Clone, Default)]
 pub struct KcpParams {
     pub config: KcpConfig,
     key: Key,
+    /// The carrier chosen from `[tunnel] transport` (udp, faketcp or icmp).
+    pub carrier: Carrier,
 }
 
 impl fmt::Debug for KcpParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KcpParams")
             .field("config", &self.config)
+            .field("carrier", &self.carrier)
             .finish_non_exhaustive()
     }
 }
@@ -122,6 +131,7 @@ impl KcpParams {
         Self {
             config,
             key: Psk::new(&tunnel.token).subkey(KEY_CONTEXT),
+            carrier: Carrier::from_transport(tunnel.transport),
         }
     }
 }
@@ -142,6 +152,14 @@ struct ConnSettings {
     protection: Arc<Protection>,
     /// Data and parity shards per FEC group; `None`: FEC off.
     fec: Option<(usize, usize)>,
+    /// The datagram carrier the packets ride.
+    carrier: Carrier,
+}
+
+/// The UDP-carrier socket helper, kept for the kcp unit tests that build sockets directly.
+#[cfg(test)]
+fn udp_socket(addr: SocketAddr, buffer: usize, dscp: Option<u8>) -> io::Result<UdpSocket> {
+    carrier::open(Carrier::Udp, addr, buffer, dscp)
 }
 
 impl ConnSettings {
@@ -157,22 +175,9 @@ impl ConnSettings {
             datagrams: params.config.datagrams,
             protection: Arc::new(Protection::new(&params.key)),
             fec: params.config.fec(),
+            carrier: params.carrier,
         }
     }
-}
-
-fn udp_socket(addr: SocketAddr, buffer: usize, dscp: Option<u8>) -> io::Result<UdpSocket> {
-    let socket = std::net::UdpSocket::bind(addr)?;
-    let sock = socket2::SockRef::from(&socket);
-    if let Err(e) = sock
-        .set_recv_buffer_size(buffer)
-        .and_then(|_| sock.set_send_buffer_size(buffer))
-    {
-        debug!(error = %e, "could not set KCP socket buffers");
-    }
-    super::mark_dscp(&sock, dscp);
-    socket.set_nonblocking(true)?;
-    UdpSocket::from_std(socket)
 }
 
 /// Seals packets and sends them without waiting: a full socket buffer drops the packet,
@@ -1213,7 +1218,12 @@ impl KcpDialer {
             SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
-        let socket = udp_socket(local, self.settings.socket_buffer, self.settings.dscp)?;
+        let socket = carrier::open(
+            self.settings.carrier,
+            local,
+            self.settings.socket_buffer,
+            self.settings.dscp,
+        )?;
         socket.connect(peer).await?;
         let socket = Arc::new(socket);
         let conv = Nonces::new()?.next_u32();
@@ -1248,7 +1258,12 @@ impl KcpListener {
             io::Error::new(io::ErrorKind::NotFound, "listen address did not resolve")
         })?;
         let settings = ConnSettings::new(params, tuning);
-        let socket = Arc::new(udp_socket(addr, settings.socket_buffer, settings.dscp)?);
+        let socket = Arc::new(carrier::open(
+            settings.carrier,
+            addr,
+            settings.socket_buffer,
+            settings.dscp,
+        )?);
         let local = socket.local_addr()?;
         let (tx, rx) = mpsc::channel(ACCEPT_QUEUE);
         let task = tokio::spawn(demultiplex(socket, settings, tx));

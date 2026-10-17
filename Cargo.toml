@@ -56,11 +56,23 @@ time = { version = "0.3", features = ["local-offset"] }
 webpki-roots = "1"
 
 [features]
-default = ["quic", "kcp", "mimalloc"]
+default = ["quic", "kcp", "mimalloc", "rawlink", "helpers", "l3"]
 # transport = "quic" (quinn).
 quic = ["dep:quinn", "dep:quinn-proto", "dep:rcgen"]
 # transport = "kcp", with FEC.
 kcp = ["dep:kcp", "dep:reed-solomon-simd"]
+# The raw-packet KCP carriers transport = "faketcp" / "icmp" (Linux, root), and their
+# shared RAII iptables helper. Implies kcp (they are KCP carriers). The raw-socket packet
+# parsing deps (etherparse, nix) are added by the faketcp/icmp units, not the scaffold.
+rawlink = ["kcp"]
+# The managed-helper transports transport = "naive" / "xhttp" / "reality". The helper
+# supervisor and its deps are added by the helpers unit; the scaffold ships only the
+# module skeleton.
+helpers = []
+# The [l3] / GRE direct-tunnel mode (Linux, root). Implies rawlink (MSS-clamp rules, and
+# the faketcp/icmp carriers). The TUN + netlink crates are added by the l3 unit, not the
+# scaffold (MSRV 1.80 could not be verified for them here — see the unit report).
+l3 = ["rawlink"]
 # mimalloc as the global allocator of the kariz binary (musl's own is slow).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 

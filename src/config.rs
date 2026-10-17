@@ -75,6 +75,27 @@ pub enum TransportKind {
     /// All of tcpmux, kcp and ws at once, and the dialing side moves to the one that gets
     /// through when a link stalls (see `auto.rs`). Always multiplexed.
     Auto,
+    /// An encrypted TCP stream (like `tcp`) with record-length padding and optional timing
+    /// jitter, so record sizes do not leak the traffic shape. Encryption is mandatory.
+    Stealth,
+    /// `ws` with mux always on (like `tcpmux` vs `tcp`).
+    Wsmux,
+    /// `wss` with mux always on.
+    Wssmux,
+    /// The KCP stack over a plain UDP carrier, for forwarding UDP services.
+    Udp,
+    /// The KCP stack over a raw-socket fake-TCP carrier (Linux, root). BackPack's `pck`.
+    #[serde(alias = "pck")]
+    Faketcp,
+    /// The KCP stack over an ICMP echo carrier (Linux, root). BackPack's `xdi`.
+    #[serde(alias = "xdi")]
+    Icmp,
+    /// A managed sing-box naive inbound/outbound carrying the tunnel.
+    Naive,
+    /// A managed Xray VLESS-over-XHTTP (HTTP/2) tunnel with TLS.
+    Xhttp,
+    /// A managed Xray VLESS + REALITY + Vision tunnel.
+    Reality,
 }
 
 impl TransportKind {
@@ -87,11 +108,57 @@ impl TransportKind {
             Self::Quic => "quic",
             Self::Kcp => "kcp",
             Self::Auto => "auto",
+            Self::Stealth => "stealth",
+            Self::Wsmux => "wsmux",
+            Self::Wssmux => "wssmux",
+            Self::Udp => "udp",
+            Self::Faketcp => "faketcp",
+            Self::Icmp => "icmp",
+            Self::Naive => "naive",
+            Self::Xhttp => "xhttp",
+            Self::Reality => "reality",
         }
     }
 
+    /// Transports that ride the WebSocket code (`ws`, `wss`, and their always-mux twins).
     fn is_websocket(self) -> bool {
-        matches!(self, Self::Ws | Self::Wss)
+        matches!(self, Self::Ws | Self::Wss | Self::Wsmux | Self::Wssmux)
+    }
+
+    /// Transports that need a TLS certificate on the listening side.
+    fn is_wss(self) -> bool {
+        matches!(self, Self::Wss | Self::Wssmux)
+    }
+
+    /// Transports whose mux cannot be turned off (the always-mux twins and the managed
+    /// helpers, which run their own handshake and mux inside the helper stream).
+    fn forces_mux(self) -> bool {
+        matches!(
+            self,
+            Self::Tcpmux
+                | Self::Auto
+                | Self::Wsmux
+                | Self::Wssmux
+                | Self::Naive
+                | Self::Xhttp
+                | Self::Reality
+        )
+    }
+
+    /// The KCP stack over some datagram carrier: `kcp` itself and the raw-packet carriers.
+    pub fn is_kcp_based(self) -> bool {
+        matches!(self, Self::Kcp | Self::Udp | Self::Faketcp | Self::Icmp)
+    }
+
+    /// A managed external-helper transport (`naive`, `xhttp`, `reality`).
+    pub fn is_helper(self) -> bool {
+        matches!(self, Self::Naive | Self::Xhttp | Self::Reality)
+    }
+
+    /// Packets may be lost on the wire (the KCP datagram path, QUIC datagrams), so
+    /// `forward.duplicate` can help and probes do not warn.
+    fn is_unreliable(self) -> bool {
+        self.is_kcp_based() || self == Self::Quic
     }
 }
 
@@ -159,6 +226,9 @@ pub struct Config {
     #[serde(default)]
     pub profile: Profile,
     pub tunnel: TunnelConfig,
+    /// The layer-3 / GRE direct-tunnel mode. When present, the tunnel carries whole IP
+    /// packets over a TUN interface instead of forwarding ports; see [`L3Config`].
+    pub l3: Option<L3Config>,
     #[serde(default)]
     pub forward: Vec<Forward>,
     #[serde(default)]
@@ -196,12 +266,34 @@ pub struct TunnelConfig {
     pub tls: Option<TlsConfig>,
     /// Only for `quic`.
     pub quic: Option<QuicConfig>,
-    /// Only for `kcp`.
+    /// Only for `kcp`, `udp`, `faketcp` and `icmp` (all KCP carriers).
     pub kcp: Option<KcpConfig>,
+    /// Only for `stealth`.
+    pub stealth: Option<StealthConfig>,
+    /// Only for `faketcp`.
+    pub faketcp: Option<FaketcpConfig>,
+    /// Only for `icmp`.
+    pub icmp: Option<IcmpConfig>,
+    /// Only for the managed helper transports `naive`, `xhttp` and `reality`.
+    pub helper: Option<HelperConfig>,
+    /// Transports the tunnel falls back to, in order, when the primary one cannot be
+    /// established; the primary transport is implicitly tried first. Both sides must use
+    /// the same list in the same order. Empty (the default) turns fallback off. Not
+    /// allowed with `transport = "auto"`.
+    #[serde(default)]
+    pub fallback_transports: Vec<TransportKind>,
+    /// How long a fallback candidate is held while it tries to connect (seconds). Minimum
+    /// 10; default 60.
+    #[serde(default = "default_fallback_dwell")]
+    pub fallback_dwell_secs: u64,
     /// The exit side answers speed test streams (`kariz speedtest` on the entry side).
     /// They only produce, consume and echo data; they dial nothing.
     #[serde(default = "default_true")]
     pub speedtest: bool,
+}
+
+fn default_fallback_dwell() -> u64 {
+    60
 }
 
 /// `[control]`: the entry side's local control socket, through which `kariz speedtest`
@@ -342,6 +434,213 @@ impl KcpConfig {
                     self.no_congestion.unwrap_or(fast2.no_congestion),
                 )
             }
+        }
+    }
+}
+
+/// `[tunnel.stealth]`: the record-padding and timing-jitter knobs of the `stealth`
+/// transport. Padding applies only to stealth links (both ends know the transport), so no
+/// other transport's wire is touched.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StealthConfig {
+    /// Add random padding inside the AEAD record so record sizes do not leak the traffic
+    /// shape.
+    #[serde(default = "default_true")]
+    pub padding: bool,
+    /// Largest padding added to a record, in bytes.
+    #[serde(default = "default_stealth_pad_max")]
+    pub pad_max: u16,
+    /// Random delay added before flushing a record, in milliseconds (0 = none).
+    #[serde(default)]
+    pub jitter_ms: u16,
+}
+
+fn default_stealth_pad_max() -> u16 {
+    256
+}
+
+impl Default for StealthConfig {
+    fn default() -> Self {
+        Self {
+            padding: true,
+            pad_max: default_stealth_pad_max(),
+            jitter_ms: 0,
+        }
+    }
+}
+
+/// `[tunnel.faketcp]`: the raw-socket fake-TCP carrier (Linux, root). All keys optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaketcpConfig {
+    /// The TCP flag pattern this end's segments carry: one of `A`, `PA`, `PA,A` or
+    /// `PA,A,PA,PAU`. Each end sets only its own.
+    #[serde(default = "default_faketcp_flags")]
+    pub flags: String,
+    /// Override the auto-detected egress interface (for virtualised networks).
+    #[serde(default)]
+    pub interface: String,
+    /// Override the auto-detected next-hop MAC address.
+    #[serde(default)]
+    pub gateway_mac: String,
+    /// Install and remove the RST-drop and NOTRACK iptables rules (RAII). Off: the tunnel
+    /// still runs but is unreliable under load.
+    #[serde(default = "default_true")]
+    pub manage_firewall: bool,
+}
+
+fn default_faketcp_flags() -> String {
+    "PA".into()
+}
+
+impl Default for FaketcpConfig {
+    fn default() -> Self {
+        Self {
+            flags: default_faketcp_flags(),
+            interface: String::new(),
+            gateway_mac: String::new(),
+            manage_firewall: true,
+        }
+    }
+}
+
+/// The TCP flag patterns a `faketcp` end may send.
+const FAKETCP_FLAGS: &[&str] = &["A", "PA", "PA,A", "PA,A,PA,PAU"];
+
+/// `[tunnel.icmp]`: the raw ICMP-echo carrier (Linux, root). All keys optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IcmpConfig {
+    /// Install and remove the iptables rules that suppress the kernel's automatic echo
+    /// replies and accept our own echoes (RAII). Off: the tunnel still runs but pays the
+    /// extra uplink.
+    #[serde(default = "default_true")]
+    pub manage_firewall: bool,
+}
+
+impl Default for IcmpConfig {
+    fn default() -> Self {
+        Self {
+            manage_firewall: true,
+        }
+    }
+}
+
+/// `[tunnel.helper]`: credentials and paths for a managed helper transport (`naive`,
+/// `xhttp`, `reality`). Which keys are required depends on the transport; see
+/// [`Config::validate_helper`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperConfig {
+    /// Override the helper binary path (default: the installed pinned path).
+    pub binary: Option<PathBuf>,
+    /// `naive`: username and password of the naive credential.
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// `xhttp` / `reality`: the VLESS client UUID (canonical form).
+    pub uuid: Option<String>,
+    /// `xhttp`: the HTTP path.
+    pub path: Option<String>,
+    /// `xhttp` / `reality`: the TLS server name.
+    pub server_name: Option<String>,
+    /// `xhttp`: the HTTP `Host` header.
+    pub host: Option<String>,
+    /// `reality`: the short id, hex, even length, at most 16 characters.
+    pub short_id: Option<String>,
+    /// `reality` acceptor: the X25519 private key (base64url, 32 bytes).
+    pub private_key: Option<String>,
+    /// `reality` dialer: the X25519 public key (base64url, 32 bytes).
+    pub public_key: Option<String>,
+    /// `reality` acceptor: the cover target, `host:port`.
+    pub target: Option<String>,
+    /// Acceptor TLS (`naive`, `xhttp`): certificate chain (PEM).
+    pub certificate: Option<PathBuf>,
+    /// Acceptor TLS (`naive`, `xhttp`): private key (PEM).
+    pub key: Option<PathBuf>,
+    /// Dialer: a CA bundle (PEM) to verify the helper server against.
+    pub ca_file: Option<PathBuf>,
+}
+
+/// `[l3]`: the layer-3 / GRE direct tunnel. Creates a TUN interface on each host and
+/// carries whole IP packets, GRE-encapsulated and sealed inside the tunnel's own session,
+/// over an unreliable carrier. Linux only, root.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct L3Config {
+    /// `dial` reaches out; `listen` waits for the inbound connection. Either host may
+    /// dial, so both direct and reverse are possible.
+    pub mode: L3Mode,
+    /// `mode = "listen"`: the address to listen on. `mode = "dial"`: the peer's address.
+    pub addr: String,
+    /// Shared secret. Defaults to `[tunnel].token` when unset.
+    pub token: Option<String>,
+    /// This end's address on the tunnel, as a CIDR, e.g. `10.10.0.1/30`.
+    pub local_ip: String,
+    /// The peer's address on the tunnel, e.g. `10.10.0.2`.
+    pub peer_ip: String,
+    /// The carrier the sealed GRE packets ride. Reliable carriers are rejected (two
+    /// retransmit timers melt down).
+    pub carrier: L3Carrier,
+    /// The TUN interface MTU.
+    #[serde(default = "default_l3_mtu")]
+    pub mtu: u16,
+    /// Reed-Solomon FEC over the carrier: both unset = off.
+    pub fec_data: Option<usize>,
+    pub fec_parity: Option<usize>,
+    /// Optional port forwarding over the TUN link (reuses the `[[forward]]` syntax).
+    #[serde(default)]
+    pub ports: Vec<Forward>,
+    /// Accept forwarded UDP over the TUN link.
+    #[serde(default)]
+    pub accept_udp: bool,
+    /// The encapsulation; always `gre` (both ends compare it in the handshake).
+    #[serde(default = "default_l3_encap")]
+    pub encap: String,
+}
+
+fn default_l3_mtu() -> u16 {
+    1400
+}
+
+fn default_l3_encap() -> String {
+    "gre".into()
+}
+
+/// `[l3] mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum L3Mode {
+    Dial,
+    Listen,
+}
+
+impl L3Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dial => "dial",
+            Self::Listen => "listen",
+        }
+    }
+}
+
+/// `[l3] carrier`: only unreliable carriers are allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum L3Carrier {
+    Udp,
+    Quic,
+    Faketcp,
+    Icmp,
+}
+
+impl L3Carrier {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Quic => "quic",
+            Self::Faketcp => "faketcp",
+            Self::Icmp => "icmp",
         }
     }
 }
@@ -874,6 +1173,13 @@ const UDP_TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 5..=3600;
 const UDP_MAX_FLOWS: std::ops::RangeInclusive<usize> = 1..=65536;
 /// Keepalives (mux pings) at most this far apart keep a WebSocket through a CDN.
 const CDN_IDLE_SAFE: Duration = Duration::from_secs(90);
+/// `stealth` record padding bounds: enough to hide short records without wasting much.
+const STEALTH_PAD_MAX: std::ops::RangeInclusive<u16> = 1..=4096;
+const STEALTH_MAX_JITTER_MS: u16 = 1000;
+/// A fallback candidate is held at least this long while it tries to connect.
+const FALLBACK_MIN_DWELL_SECS: u64 = 10;
+/// The l3 TUN interface MTU bounds.
+const L3_MTU: std::ops::RangeInclusive<u16> = 576..=1500;
 
 /// Request headers the WebSocket dialer sets itself.
 const RESERVED_WS_HEADERS: &[&str] = &[
@@ -963,10 +1269,7 @@ impl Config {
                  enable tunnel.mux (or use tcpmux, ws, wss) for UDP",
             );
         }
-        let unreliable = matches!(
-            self.tunnel.transport,
-            TransportKind::Kcp | TransportKind::Quic
-        ) && self.mux().enabled;
+        let unreliable = self.tunnel.transport.is_unreliable() && self.mux().enabled;
         if self.forward.iter().any(|f| f.duplication().is_some()) && !unreliable {
             warnings.push(
                 "forward.duplicate has no effect here: copies are only sent over kcp (with mux) \
@@ -1006,19 +1309,35 @@ impl Config {
         let built_without = match self.tunnel.transport {
             TransportKind::Quic if !cfg!(feature = "quic") => Some("quic"),
             TransportKind::Kcp if !cfg!(feature = "kcp") => Some("kcp"),
+            TransportKind::Udp if !cfg!(feature = "kcp") => Some("udp"),
+            TransportKind::Faketcp if !cfg!(feature = "rawlink") => Some("faketcp"),
+            TransportKind::Icmp if !cfg!(feature = "rawlink") => Some("icmp"),
+            TransportKind::Naive if !cfg!(feature = "helpers") => Some("naive"),
+            TransportKind::Xhttp if !cfg!(feature = "helpers") => Some("xhttp"),
+            TransportKind::Reality if !cfg!(feature = "helpers") => Some("reality"),
             _ => None,
         };
         if let Some(feature) = built_without {
             bail!(
-                "transport = \"{feature}\" is not in this build (built without the \
-                 `{feature}` cargo feature)"
+                "transport = \"{feature}\" is not in this build (built without the needed \
+                 cargo feature)"
             );
+        }
+        if self.l3.is_some() && !cfg!(feature = "l3") {
+            bail!("the [l3] mode is not in this build (built without the `l3` cargo feature)");
         }
         if self.tunnel.token.trim().len() < 16 {
             bail!("tunnel.token must be at least 16 characters (generate one with `kariz token`)");
         }
         if self.tunnel.token.contains("CHANGE-ME") {
             bail!("tunnel.token still has the sample value; generate one with `kariz token`");
+        }
+
+        // The l3 mode is self-contained: it has its own address, mode and (optional) token
+        // in `[l3]`, and carries whole IP packets instead of the port-forwarding tables, so
+        // the entry/exit forward checks below do not apply.
+        if let Some(l3) = &self.l3 {
+            return self.validate_l3(l3);
         }
 
         if self.is_acceptor() {
@@ -1118,18 +1437,26 @@ impl Config {
         self.validate_ws()?;
         self.validate_tls()?;
         self.validate_quic()?;
-        self.validate_kcp()
+        self.validate_kcp()?;
+        self.validate_stealth()?;
+        self.validate_faketcp()?;
+        self.validate_icmp()?;
+        self.validate_helper()?;
+        self.validate_udp()?;
+        self.validate_fallback()
     }
 
     fn validate_kcp(&self) -> Result<()> {
         let Some(k) = &self.tunnel.kcp else {
             return Ok(());
         };
-        if !matches!(
-            self.tunnel.transport,
-            TransportKind::Kcp | TransportKind::Auto
-        ) {
-            bail!("[tunnel.kcp] is only used with transport = \"kcp\" or \"auto\"");
+        if !matches!(self.tunnel.transport, TransportKind::Auto)
+            && !self.tunnel.transport.is_kcp_based()
+        {
+            bail!(
+                "[tunnel.kcp] is only used with transport = \"kcp\", \"auto\", \"udp\", \
+                 \"faketcp\" or \"icmp\""
+            );
         }
         let manual = [
             k.nodelay.is_some(),
@@ -1248,6 +1575,18 @@ impl Config {
         {
             bail!("transport = \"tcpmux\" always uses mux; use transport = \"tcp\" to disable it");
         }
+        if self.tunnel.transport.forces_mux()
+            && !matches!(
+                self.tunnel.transport,
+                TransportKind::Auto | TransportKind::Tcpmux
+            )
+            && self.tunnel.mux.enabled == Some(false)
+        {
+            bail!(
+                "transport = \"{}\" always uses mux; tunnel.mux cannot be disabled",
+                self.tunnel.transport.name()
+            );
+        }
         let mux = self.mux();
         if !MUX_CONNECTIONS.contains(&mux.connections) {
             bail!(
@@ -1358,11 +1697,10 @@ impl Config {
     }
 
     fn validate_tls(&self) -> Result<()> {
-        let tls = match (
-            &self.tunnel.tls,
-            self.tunnel.transport == TransportKind::Wss,
-        ) {
-            (Some(_), false) => bail!("[tunnel.tls] is only used with transport = \"wss\""),
+        let tls = match (&self.tunnel.tls, self.tunnel.transport.is_wss()) {
+            (Some(_), false) => {
+                bail!("[tunnel.tls] is only used with transport = \"wss\" or \"wssmux\"")
+            }
             (None, false) => return Ok(()),
             (tls, true) => tls.clone().unwrap_or_default(),
         };
@@ -1399,6 +1737,306 @@ impl Config {
         }
         Ok(())
     }
+
+    fn validate_stealth(&self) -> Result<()> {
+        let stealth = self.tunnel.transport == TransportKind::Stealth;
+        if self.tunnel.stealth.is_some() && !stealth {
+            bail!("[tunnel.stealth] is only used with transport = \"stealth\"");
+        }
+        if !stealth {
+            return Ok(());
+        }
+        // Padding hides nothing without encryption, and the silent-on-bad-auth behaviour
+        // is the whole point.
+        if self.tunnel.encryption == Encryption::None {
+            bail!("transport = \"stealth\" requires encryption; set tunnel.encryption");
+        }
+        if let Some(s) = &self.tunnel.stealth {
+            if !STEALTH_PAD_MAX.contains(&s.pad_max) {
+                bail!(
+                    "tunnel.stealth.pad_max must be between {} and {} bytes",
+                    STEALTH_PAD_MAX.start(),
+                    STEALTH_PAD_MAX.end()
+                );
+            }
+            if s.jitter_ms > STEALTH_MAX_JITTER_MS {
+                bail!("tunnel.stealth.jitter_ms must be at most {STEALTH_MAX_JITTER_MS}");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_faketcp(&self) -> Result<()> {
+        let Some(f) = &self.tunnel.faketcp else {
+            return Ok(());
+        };
+        if self.tunnel.transport != TransportKind::Faketcp {
+            bail!("[tunnel.faketcp] is only used with transport = \"faketcp\"");
+        }
+        if !FAKETCP_FLAGS.contains(&f.flags.as_str()) {
+            bail!(
+                "tunnel.faketcp.flags must be one of {}",
+                FAKETCP_FLAGS.join(", ")
+            );
+        }
+        if !f.interface.is_empty()
+            && (f.interface.len() > 15 || !f.interface.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            bail!("tunnel.faketcp.interface must be a short interface name");
+        }
+        if !f.gateway_mac.is_empty() && !is_mac(&f.gateway_mac) {
+            bail!("tunnel.faketcp.gateway_mac must be a MAC address (aa:bb:cc:dd:ee:ff)");
+        }
+        Ok(())
+    }
+
+    fn validate_icmp(&self) -> Result<()> {
+        if self.tunnel.icmp.is_some() && self.tunnel.transport != TransportKind::Icmp {
+            bail!("[tunnel.icmp] is only used with transport = \"icmp\"");
+        }
+        Ok(())
+    }
+
+    fn validate_udp(&self) -> Result<()> {
+        if self.tunnel.transport != TransportKind::Udp {
+            return Ok(());
+        }
+        // The udp transport carries forwarded datagrams on the unreliable path; there is no
+        // stream to run a TCP forward or a PROXY header over.
+        for f in &self.forward {
+            if f.protocol.has_tcp() {
+                bail!(
+                    "forward {}: transport = \"udp\" forwards UDP only; use protocol = \"udp\"",
+                    f.listen
+                );
+            }
+            if f.proxy_protocol.is_some() {
+                bail!(
+                    "forward {}: transport = \"udp\" has no stream for a PROXY header",
+                    f.listen
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_helper(&self) -> Result<()> {
+        let helper = self.tunnel.transport.is_helper();
+        if self.tunnel.helper.is_some() && !helper {
+            bail!(
+                "[tunnel.helper] is only used with transport = \"naive\", \"xhttp\" or \"reality\""
+            );
+        }
+        if !helper {
+            return Ok(());
+        }
+        // The helper proxies have surprising half-close semantics, so the tunnel always
+        // runs its own handshake, record encryption and mux inside the helper stream.
+        if self.tunnel.encryption == Encryption::None {
+            bail!(
+                "transport = \"{}\" requires encryption; set tunnel.encryption",
+                self.tunnel.transport.name()
+            );
+        }
+        let h = self.tunnel.helper.clone().unwrap_or_default();
+        let acceptor = self.is_acceptor();
+        for (path, what) in [
+            (&h.binary, "binary"),
+            (&h.certificate, "certificate"),
+            (&h.key, "key"),
+            (&h.ca_file, "ca_file"),
+        ] {
+            if let Some(p) = path {
+                if !p.is_absolute() {
+                    bail!("tunnel.helper.{what} must be an absolute path");
+                }
+            }
+        }
+        match self.tunnel.transport {
+            TransportKind::Naive => {
+                if h.username.as_deref().unwrap_or_default().is_empty()
+                    || h.password.as_deref().unwrap_or_default().is_empty()
+                {
+                    bail!("transport = \"naive\" needs tunnel.helper.username and password");
+                }
+                if acceptor && (h.certificate.is_none() || h.key.is_none()) {
+                    bail!("the listening side of naive needs tunnel.helper.certificate and key");
+                }
+            }
+            TransportKind::Xhttp => {
+                let uuid = h.uuid.as_deref().unwrap_or_default();
+                if !is_uuid(uuid) {
+                    bail!("transport = \"xhttp\" needs a canonical tunnel.helper.uuid");
+                }
+                if h.path.as_deref().unwrap_or_default().is_empty() {
+                    bail!("transport = \"xhttp\" needs tunnel.helper.path");
+                }
+                if h.server_name.as_deref().unwrap_or_default().is_empty() {
+                    bail!("transport = \"xhttp\" needs tunnel.helper.server_name");
+                }
+                if acceptor && (h.certificate.is_none() || h.key.is_none()) {
+                    bail!("the listening side of xhttp needs tunnel.helper.certificate and key");
+                }
+            }
+            TransportKind::Reality => {
+                let uuid = h.uuid.as_deref().unwrap_or_default();
+                if !is_uuid(uuid) {
+                    bail!("transport = \"reality\" needs a canonical tunnel.helper.uuid");
+                }
+                let short_id = h.short_id.as_deref().unwrap_or_default();
+                if short_id.len() > 16
+                    || short_id.len() % 2 != 0
+                    || !short_id.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    bail!(
+                        "tunnel.helper.short_id must be hex, an even length, and at most 16 \
+                         characters"
+                    );
+                }
+                if h.server_name.as_deref().unwrap_or_default().is_empty() {
+                    bail!("transport = \"reality\" needs tunnel.helper.server_name");
+                }
+                if acceptor {
+                    if !is_base64url_32(h.private_key.as_deref().unwrap_or_default()) {
+                        bail!(
+                            "the listening side of reality needs tunnel.helper.private_key \
+                             (base64url, 32 bytes)"
+                        );
+                    }
+                    if h.target.as_deref().unwrap_or_default().is_empty() {
+                        bail!("the listening side of reality needs tunnel.helper.target");
+                    }
+                } else if !is_base64url_32(h.public_key.as_deref().unwrap_or_default()) {
+                    bail!(
+                        "the dialing side of reality needs tunnel.helper.public_key \
+                         (base64url, 32 bytes)"
+                    );
+                }
+            }
+            _ => unreachable!("helper is only naive, xhttp or reality"),
+        }
+        Ok(())
+    }
+
+    fn validate_fallback(&self) -> Result<()> {
+        let list = &self.tunnel.fallback_transports;
+        if list.is_empty() {
+            return Ok(());
+        }
+        if self.tunnel.transport == TransportKind::Auto {
+            bail!("tunnel.fallback_transports is not allowed with transport = \"auto\"");
+        }
+        if self.tunnel.fallback_dwell_secs < FALLBACK_MIN_DWELL_SECS {
+            bail!("tunnel.fallback_dwell_secs must be at least {FALLBACK_MIN_DWELL_SECS}");
+        }
+        for (i, kind) in list.iter().enumerate() {
+            if *kind == TransportKind::Auto {
+                bail!("tunnel.fallback_transports cannot contain \"auto\"");
+            }
+            if *kind == self.tunnel.transport {
+                bail!(
+                    "tunnel.fallback_transports lists the primary transport \"{}\"; it is \
+                     tried first implicitly",
+                    kind.name()
+                );
+            }
+            if list[..i].contains(kind) {
+                bail!(
+                    "tunnel.fallback_transports has a duplicate: \"{}\"",
+                    kind.name()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_l3(&self, l3: &L3Config) -> Result<()> {
+        if l3.encap != "gre" {
+            bail!("l3.encap must be \"gre\"");
+        }
+        // Reliable carriers (tcp/tcpmux/ws/wss and reliable KCP) would stack two retransmit
+        // timers (TCP-over-TCP meltdown); the `L3Carrier` enum only parses the unreliable
+        // carriers udp/quic/faketcp/icmp, so a reliable one is rejected at deserialize time.
+        let token = l3.token.as_deref().unwrap_or(&self.tunnel.token);
+        if token.trim().len() < 16 {
+            bail!("l3.token must be at least 16 characters");
+        }
+        if token.contains("CHANGE-ME") {
+            bail!("l3.token still has the sample value; generate one with `kariz token`");
+        }
+        parse_cidr(&l3.local_ip)
+            .with_context(|| format!("l3.local_ip is not a valid CIDR: {}", l3.local_ip))?;
+        l3.peer_ip
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("l3.peer_ip is not a valid IP address: {}", l3.peer_ip))?;
+        if !L3_MTU.contains(&l3.mtu) {
+            bail!(
+                "l3.mtu must be between {} and {}",
+                L3_MTU.start(),
+                L3_MTU.end()
+            );
+        }
+        match (l3.fec_data.unwrap_or(0), l3.fec_parity.unwrap_or(0)) {
+            (0, 0) => {}
+            (data, parity) if KCP_FEC_DATA.contains(&data) && KCP_FEC_PARITY.contains(&parity) => {}
+            _ => bail!(
+                "l3.fec_data must be between {} and {} and fec_parity between {} and {}, or \
+                 both 0 (FEC off)",
+                KCP_FEC_DATA.start(),
+                KCP_FEC_DATA.end(),
+                KCP_FEC_PARITY.start(),
+                KCP_FEC_PARITY.end()
+            ),
+        }
+        for f in &l3.ports {
+            if f.proxy_protocol.is_some() && !f.protocol.has_tcp() {
+                bail!("l3 forward {}: proxy_protocol is for TCP rules", f.listen);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parses an `addr/prefix` CIDR, returning the address and prefix length.
+fn parse_cidr(s: &str) -> Result<(std::net::IpAddr, u8)> {
+    let (addr, prefix) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("missing /prefix"))?;
+    let addr: std::net::IpAddr = addr.parse()?;
+    let prefix: u8 = prefix.parse()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        bail!("prefix length {prefix} is too large");
+    }
+    Ok((addr, prefix))
+}
+
+/// A canonical lowercase UUID: `8-4-4-4-12` hex digits.
+fn is_uuid(s: &str) -> bool {
+    let groups = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == groups.len()
+        && parts
+            .iter()
+            .zip(groups)
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// True when `s` is base64url (no padding) of exactly 32 bytes.
+fn is_base64url_32(s: &str) -> bool {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .is_ok_and(|b| b.len() == 32)
+}
+
+/// A MAC address `aa:bb:cc:dd:ee:ff`.
+fn is_mac(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn is_visible_ascii(s: &str) -> bool {
@@ -2247,10 +2885,16 @@ keepalive_secs = 1
         for (transport, built) in [
             ("quic", cfg!(feature = "quic")),
             ("kcp", cfg!(feature = "kcp")),
+            ("udp", cfg!(feature = "kcp")),
+            ("faketcp", cfg!(feature = "rawlink")),
+            ("icmp", cfg!(feature = "rawlink")),
+            ("naive", cfg!(feature = "helpers")),
+            ("xhttp", cfg!(feature = "helpers")),
+            ("reality", cfg!(feature = "helpers")),
         ] {
             if !built {
                 let err = parse_err(&with_transport("entry", transport, ""));
-                assert!(err.contains("not in this build"), "{err}");
+                assert!(err.contains("not in this build"), "{transport}: {err}");
             }
         }
     }
@@ -2292,5 +2936,299 @@ keepalive_secs = 1
             ));
             assert!(err.contains(expect), "{extra}: {err}");
         }
+    }
+
+    #[test]
+    fn stealth_parses_and_defaults_to_mux_on() {
+        let c = Config::parse(&with_transport("entry", "stealth", "")).unwrap();
+        assert_eq!(c.tunnel.transport, TransportKind::Stealth);
+        assert!(c.mux().enabled, "stealth defaults to mux on");
+        assert!(c.warnings().is_empty());
+        // Mux can be turned off, like tcp/ws.
+        let off = Config::parse(&with_transport(
+            "entry",
+            "stealth",
+            "[tunnel.mux]\nenabled = false",
+        ));
+        assert!(off.is_ok(), "stealth mux is optional: {off:?}");
+    }
+
+    #[test]
+    fn stealth_validation() {
+        for (extra, expect) in [
+            ("encryption = \"none\"", "requires encryption"),
+            ("[tunnel.stealth]\npad_max = 0", "tunnel.stealth.pad_max"),
+            ("[tunnel.stealth]\npad_max = 9000", "tunnel.stealth.pad_max"),
+            (
+                "[tunnel.stealth]\njitter_ms = 5000",
+                "tunnel.stealth.jitter_ms",
+            ),
+        ] {
+            let err = parse_err(&with_transport("entry", "stealth", extra));
+            assert!(err.contains(expect), "{extra}: {err}");
+        }
+        // The stealth table on another transport is refused.
+        let err = parse_err(&with_transport("entry", "tcp", "[tunnel.stealth]"));
+        assert!(err.contains("[tunnel.stealth]"), "{err}");
+    }
+
+    #[test]
+    fn wsmux_and_wssmux_force_mux_and_take_their_tables() {
+        // wsmux is ws with mux forced on.
+        let c = Config::parse(&with_transport(
+            "entry",
+            "wsmux",
+            "[tunnel.ws]\npath = \"/x\"",
+        ))
+        .unwrap();
+        assert!(c.mux().enabled);
+        let err = parse_err(&with_transport(
+            "entry",
+            "wsmux",
+            "[tunnel.mux]\nenabled = false",
+        ));
+        assert!(err.contains("always uses mux"), "{err}");
+        // wssmux needs a certificate on the listening side, like wss.
+        let err = parse_err(&with_transport("exit", "wssmux", ""));
+        assert!(err.contains("cert") && err.contains("key"), "{err}");
+        let ok = Config::parse(&with_transport(
+            "exit",
+            "wssmux",
+            "[tunnel.tls]\ncert = \"/tmp/c.pem\"\nkey = \"/tmp/k.pem\"",
+        ));
+        assert!(ok.is_ok(), "wssmux with a cert should parse: {ok:?}");
+    }
+
+    #[cfg(feature = "kcp")]
+    #[test]
+    fn udp_transport_allows_only_udp_rules() {
+        // A TCP forward is refused.
+        let err = parse_err(&with_transport("entry", "udp", ""));
+        assert!(err.contains("forwards UDP only"), "{err}");
+        // A UDP forward with a PROXY header is refused (there is no stream for one).
+        let text = "role = \"entry\"\nmode = \"direct\"\n\
+             [[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\n\
+             protocol = \"udp\"\nproxy_protocol = \"v2\"\n\
+             [tunnel]\ntransport = \"udp\"\nremote = \"203.0.113.1:443\"\n\
+             token = \"0123456789abcdef0123\"\n";
+        assert!(parse_err(text).contains("proxy_protocol"), "{text}");
+        // A plain UDP forward is fine, and [tunnel.kcp] is allowed.
+        let ok = "role = \"entry\"\nmode = \"direct\"\n\
+             [[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\n\
+             protocol = \"udp\"\n\
+             [tunnel]\ntransport = \"udp\"\nremote = \"203.0.113.1:443\"\n\
+             token = \"0123456789abcdef0123\"\n[tunnel.kcp]\nmode = \"fast2\"\n";
+        assert!(Config::parse(ok).is_ok(), "{ok}");
+    }
+
+    #[cfg(feature = "rawlink")]
+    #[test]
+    fn faketcp_and_icmp_validation() {
+        // The faketcp table only with faketcp; flags and MAC are checked.
+        let err = parse_err(&with_transport("entry", "icmp", "[tunnel.faketcp]"));
+        assert!(err.contains("[tunnel.faketcp]"), "{err}");
+        for (extra, expect) in [
+            ("[tunnel.faketcp]\nflags = \"X\"", "tunnel.faketcp.flags"),
+            (
+                "[tunnel.faketcp]\ngateway_mac = \"zz:zz\"",
+                "tunnel.faketcp.gateway_mac",
+            ),
+        ] {
+            let err = parse_err(&with_transport("entry", "faketcp", extra));
+            assert!(err.contains(expect), "{extra}: {err}");
+        }
+        // Both carriers accept [tunnel.kcp], and a good faketcp parses.
+        assert!(Config::parse(&with_transport(
+            "entry",
+            "faketcp",
+            "[tunnel.faketcp]\nflags = \"PA,A\"\n[tunnel.kcp]\nmode = \"fast3\"",
+        ))
+        .is_ok());
+        assert!(Config::parse(&with_transport("entry", "icmp", "[tunnel.icmp]")).is_ok());
+        // The icmp table only with icmp.
+        let err = parse_err(&with_transport("entry", "faketcp", "[tunnel.icmp]"));
+        assert!(err.contains("[tunnel.icmp]"), "{err}");
+    }
+
+    #[cfg(feature = "helpers")]
+    #[test]
+    fn helper_validation() {
+        let uuid = "123e4567-e89b-12d3-a456-426614174000";
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 32 bytes base64url-ish
+                                                                 // The helper table only with a helper transport.
+        let err = parse_err(&with_transport("entry", "tcp", "[tunnel.helper]"));
+        assert!(err.contains("[tunnel.helper]"), "{err}");
+        // naive dialer needs username and password; encryption is mandatory.
+        let err = parse_err(&with_transport("entry", "naive", ""));
+        assert!(err.contains("username"), "{err}");
+        let err = parse_err(&with_transport(
+            "entry",
+            "naive",
+            "encryption = \"none\"\n[tunnel.helper]\nusername = \"u\"\npassword = \"p\"",
+        ));
+        assert!(err.contains("requires encryption"), "{err}");
+        assert!(Config::parse(&with_transport(
+            "entry",
+            "naive",
+            "[tunnel.helper]\nusername = \"u\"\npassword = \"p\"",
+        ))
+        .is_ok());
+        // A relative binary path is refused.
+        let err = parse_err(&with_transport(
+            "entry",
+            "naive",
+            "[tunnel.helper]\nusername = \"u\"\npassword = \"p\"\nbinary = \"sing-box\"",
+        ));
+        assert!(err.contains("absolute path"), "{err}");
+        // xhttp needs a canonical uuid, a path and a server name.
+        let err = parse_err(&with_transport(
+            "entry",
+            "xhttp",
+            "[tunnel.helper]\nuuid = \"nope\"",
+        ));
+        assert!(err.contains("uuid"), "{err}");
+        assert!(Config::parse(&with_transport(
+            "entry",
+            "xhttp",
+            &format!(
+                "[tunnel.helper]\nuuid = \"{uuid}\"\npath = \"/x\"\nserver_name = \"a.example\""
+            ),
+        ))
+        .is_ok());
+        // reality: short_id hex even length, public_key (dialer) base64url 32 bytes.
+        let err = parse_err(&with_transport(
+            "entry",
+            "reality",
+            &format!(
+                "[tunnel.helper]\nuuid = \"{uuid}\"\nserver_name = \"a.example\"\n\
+                 short_id = \"abc\"\npublic_key = \"{key}\""
+            ),
+        ));
+        assert!(err.contains("short_id"), "{err}");
+        let err = parse_err(&with_transport(
+            "entry",
+            "reality",
+            &format!(
+                "[tunnel.helper]\nuuid = \"{uuid}\"\nserver_name = \"a.example\"\n\
+                 short_id = \"abcd\"\npublic_key = \"not-base64!\""
+            ),
+        ));
+        assert!(err.contains("public_key"), "{err}");
+    }
+
+    #[test]
+    fn fallback_validation() {
+        // Not allowed with auto.
+        let err = parse_err(&with_transport(
+            "entry",
+            "auto",
+            "fallback_transports = [\"kcp\"]",
+        ));
+        assert!(err.contains("auto"), "{err}");
+        // Dwell has a minimum.
+        let err = parse_err(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"ws\"]\nfallback_dwell_secs = 5",
+        ));
+        assert!(err.contains("fallback_dwell_secs"), "{err}");
+        // No "auto" in the list, no duplicates, no primary.
+        let err = parse_err(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"auto\"]",
+        ));
+        assert!(err.contains("auto"), "{err}");
+        let err = parse_err(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"ws\", \"ws\"]",
+        ));
+        assert!(err.contains("duplicate"), "{err}");
+        let err = parse_err(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"tcpmux\"]",
+        ));
+        assert!(err.contains("primary"), "{err}");
+        // A good list parses.
+        assert!(Config::parse(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"ws\", \"wss\"]\n\
+             [tunnel.tls]\ncert = \"/tmp/c.pem\"\nkey = \"/tmp/k.pem\"",
+        ))
+        .is_err()); // tls belongs on wss, not tcpmux: the table is refused.
+        assert!(Config::parse(&with_transport(
+            "entry",
+            "tcpmux",
+            "fallback_transports = [\"ws\", \"tcp\"]",
+        ))
+        .is_ok());
+    }
+
+    #[cfg(feature = "l3")]
+    fn l3_cfg(body: &str) -> String {
+        format!(
+            "role = \"entry\"\nmode = \"direct\"\n\
+             [tunnel]\ntoken = \"{TOKEN}\"\n[l3]\n{body}\n"
+        )
+    }
+
+    #[cfg(feature = "l3")]
+    const L3_OK: &str = "mode = \"listen\"\naddr = \"0.0.0.0:51820\"\n\
+         local_ip = \"10.10.0.1/30\"\npeer_ip = \"10.10.0.2\"\ncarrier = \"udp\"\n";
+
+    #[cfg(feature = "l3")]
+    #[test]
+    fn l3_parses_in_both_directions() {
+        for mode in ["dial", "listen"] {
+            let body = L3_OK.replacen("listen", mode, 1);
+            let c = Config::parse(&l3_cfg(&body)).unwrap();
+            assert!(c.l3.is_some(), "{mode}");
+            assert_eq!(c.l3.unwrap().mode.name(), mode);
+        }
+        // The token is inherited from [tunnel] when [l3] does not set it.
+        let c = Config::parse(&l3_cfg(L3_OK)).unwrap();
+        assert_eq!(l3_effective_token(&c), TOKEN);
+    }
+
+    #[cfg(feature = "l3")]
+    fn l3_effective_token(c: &Config) -> String {
+        c.l3.as_ref()
+            .unwrap()
+            .token
+            .clone()
+            .unwrap_or_else(|| c.tunnel.token.clone())
+    }
+
+    #[cfg(feature = "l3")]
+    #[test]
+    fn l3_validation() {
+        // A reliable carrier does not even deserialize (the enum excludes it).
+        let err = parse_err(&l3_cfg(&L3_OK.replace("\"udp\"", "\"tcp\"")));
+        assert!(
+            err.contains("unknown variant") || err.contains("carrier"),
+            "{err}"
+        );
+        for (field, bad, expect) in [
+            (
+                "local_ip = \"10.10.0.1/30\"",
+                "local_ip = \"nope\"",
+                "local_ip",
+            ),
+            ("peer_ip = \"10.10.0.2\"", "peer_ip = \"nope\"", "peer_ip"),
+        ] {
+            let err = parse_err(&l3_cfg(&L3_OK.replace(field, bad)));
+            assert!(err.contains(expect), "{bad}: {err}");
+        }
+        // MTU bounds and encap.
+        let err = parse_err(&l3_cfg(&format!("{L3_OK}mtu = 100\n")));
+        assert!(err.contains("l3.mtu"), "{err}");
+        let err = parse_err(&l3_cfg(&format!("{L3_OK}encap = \"ipip\"\n")));
+        assert!(err.contains("l3.encap"), "{err}");
+        // FEC range.
+        let err = parse_err(&l3_cfg(&format!("{L3_OK}fec_data = 100\nfec_parity = 3\n")));
+        assert!(err.contains("fec_parity between"), "{err}");
     }
 }
