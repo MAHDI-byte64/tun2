@@ -388,6 +388,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: Some("n".into()),
+            ..Default::default()
         };
         let at = |mode: &str| {
             let r = req(mode);

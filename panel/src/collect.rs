@@ -335,11 +335,26 @@ async fn tunnel(name: &str, path: &Path, services: &dyn Services) -> TunnelInfo 
         name: name.to_owned(),
         role: role_name(config.role).to_owned(),
         mode: mode_name(config.mode).to_owned(),
-        transport: config.tunnel.transport.name().to_owned(),
+        // The l3 / GRE mode has no core transport of its own; the panel shows it as "l3".
+        transport: if config.l3.is_some() {
+            "l3".to_owned()
+        } else {
+            config.tunnel.transport.name().to_owned()
+        },
         profile: config.profile.name().to_owned(),
         encryption: config.tunnel.encryption.name().to_owned(),
-        listen: config.tunnel.listen.clone(),
-        remote: config.tunnel.remote.clone(),
+        // The l3 mode keeps its address in [l3]: the listening side has it as `listen`, the
+        // dialing side as `remote`, so the list and the edit page line up with other tunnels.
+        listen: match &config.l3 {
+            Some(l3) if matches!(l3.mode, kariz::config::L3Mode::Listen) => Some(l3.addr.clone()),
+            Some(_) => None,
+            None => config.tunnel.listen.clone(),
+        },
+        remote: match &config.l3 {
+            Some(l3) if matches!(l3.mode, kariz::config::L3Mode::Dial) => Some(l3.addr.clone()),
+            Some(_) => None,
+            None => config.tunnel.remote.clone(),
+        },
         forwards: config
             .forward
             .iter()

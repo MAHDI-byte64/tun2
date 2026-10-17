@@ -1,3 +1,4 @@
+import { ENCRYPTION_FORCED } from "./transport";
 import { useApp } from "./store";
 import { Icon } from "./ui";
 
@@ -7,8 +8,16 @@ export type Cipher = (typeof CIPHERS)[number];
 /** The cipher to send: nothing for `auto`, and nothing for QUIC (always TLS 1.3). */
 export const cipherOf = (value: string, transport: string): string | undefined => (value === "auto" || transport === "quic" ? undefined : value);
 
-/** Whether the choice may go on: no encryption has to be confirmed. */
-export const cipherReady = (value: string, transport: string, ack: boolean) => transport === "quic" || value !== "none" || ack;
+/** Whether a transport seals nothing of its own, so the tunnel's encryption is mandatory (`none` is refused). */
+const noneForbidden = (transport: string) => ENCRYPTION_FORCED.includes(transport);
+
+/** Whether the choice may go on: no encryption has to be confirmed, and is refused outright where it is mandatory. */
+export const cipherReady = (value: string, transport: string, ack: boolean) => {
+  if (transport === "quic") return true;
+  if (value !== "none") return true;
+  if (noneForbidden(transport)) return false;
+  return ack;
+};
 
 /** The cipher of a tunnel: the recommended automatic choice, AES, ChaCha, or none (with a warning and a confirmation). */
 export function EncryptionChoice({
@@ -26,6 +35,7 @@ export function EncryptionChoice({
 }) {
   const { t } = useApp();
   const quic = transport === "quic";
+  const forbidNone = noneForbidden(transport);
   return (
     <div className="field enc-choice">
       <span className="label">{t("enc.title")}</span>
@@ -36,9 +46,9 @@ export function EncryptionChoice({
             type="button"
             role="radio"
             aria-checked={!quic && value === c}
-            aria-disabled={quic}
+            aria-disabled={quic || (c === "none" && forbidNone)}
             className={`tile ${c === "none" ? "is-risk" : ""}`}
-            onClick={() => !quic && onChange(c)}
+            onClick={() => !quic && !(c === "none" && forbidNone) && onChange(c)}
           >
             <span className="t1">
               {t(`enc.${c}`)}
@@ -52,8 +62,9 @@ export function EncryptionChoice({
         ))}
       </div>
       {quic && <span className="help">{t("enc.quic")}</span>}
+      {!quic && forbidNone && <span className="help">{t("enc.required")}</span>}
       {!quic && transport === "wss" && value !== "none" && <span className="help">{t("enc.tls")}</span>}
-      {!quic && value === "none" && (
+      {!quic && !forbidNone && value === "none" && (
         <div className="enc-warn" role="alert">
           <Icon name="alert" size={18} />
           <div>

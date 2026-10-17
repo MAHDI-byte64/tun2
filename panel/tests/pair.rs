@@ -176,6 +176,7 @@ async fn a_pair_is_made_edited_stopped_deleted_and_a_failure_leaves_nothing() {
         }],
         rotate: false,
         network: None,
+        ..Default::default()
     };
 
     // ---- a check names a taken port ----

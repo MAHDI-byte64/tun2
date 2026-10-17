@@ -229,8 +229,9 @@ pub struct PingReply {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MuxSpec {
-    /// Off for `ws`, `wss` and `kcp` when a tunnel should not multiplex (`tcp` is the
-    /// transport that is off by itself; `tcpmux` and `auto` cannot be turned off).
+    /// Off for `ws`, `wss`, `kcp` and `stealth` when a tunnel should not multiplex (`tcp`
+    /// is the transport that is off by itself; `tcpmux`, `wsmux`, `wssmux` and `auto`
+    /// cannot be turned off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,8 +314,171 @@ pub struct Spec {
     /// unknown field there without a word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<String>,
+    /// `stealth`: the record-padding and timing-jitter knobs (`[tunnel.stealth]`). Only an
+    /// agent of 2.7 or newer reads it (the `stealth` transport is 2.7's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stealth: Option<StealthSpec>,
+    /// `faketcp`: the fake-TCP carrier knobs (`[tunnel.faketcp]`). 2.7 or newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faketcp: Option<FaketcpSpec>,
+    /// `icmp`: the ICMP carrier knobs (`[tunnel.icmp]`). 2.7 or newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icmp: Option<IcmpSpec>,
+    /// `naive` / `xhttp` / `reality`: the managed-helper credentials (`[tunnel.helper]`),
+    /// already split for this side (the acceptor keeps the server secrets, the dialer the
+    /// client ones). 2.7 or newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper: Option<HelperSpec>,
+    /// The `l3` / GRE direct-tunnel settings (`[l3]`), already resolved for this side.
+    /// Present only when `transport == "l3"`. 2.7 or newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l3: Option<L3Spec>,
     #[serde(default)]
     pub forwards: Vec<ForwardInfo>,
+}
+
+/// `[tunnel.stealth]`: record-length padding and timing jitter of the `stealth` transport.
+/// Every field is optional; what is left out keeps the core's default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StealthSpec {
+    /// Random padding inside the AEAD record. Left out: on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding: Option<bool>,
+    /// Largest padding a record carries, in bytes. Left out: the core's default (256).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_max: Option<u16>,
+    /// Random delay before a record is flushed, in milliseconds. Left out: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter_ms: Option<u16>,
+}
+
+impl StealthSpec {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[tunnel.faketcp]`: the raw-socket fake-TCP carrier knobs (Linux, root).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaketcpSpec {
+    /// The TCP flag pattern this side's segments carry (`A`, `PA`, `PA,A`, `PA,A,PA,PAU`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags: Option<String>,
+    /// Install and remove the RST-drop / NOTRACK iptables rules (RAII). Left out: on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manage_firewall: Option<bool>,
+}
+
+impl FaketcpSpec {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[tunnel.icmp]`: the raw ICMP-echo carrier knobs (Linux, root).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IcmpSpec {
+    /// Install and remove the kernel-echo-reply suppression rules (RAII). Left out: on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manage_firewall: Option<bool>,
+}
+
+impl IcmpSpec {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[tunnel.helper]`: credentials and paths for a managed helper transport (`naive`,
+/// `xhttp`, `reality`), already filtered for one side. A certificate or key path must be
+/// one the manager made (see [`crate::manage::valid_cert_path`]); the agent reads no other.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperSpec {
+    /// Override the helper binary path. Left out: the installed pinned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// `naive`: the credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// `xhttp` / `reality`: the VLESS client UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// `xhttp`: the HTTP path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `xhttp` / `reality`: the TLS server name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// `xhttp`: the HTTP `Host` header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// `reality`: the short id (hex, even length, at most 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
+    /// `reality` acceptor: the X25519 private key (base64url).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// `reality` dialer: the X25519 public key (base64url).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// `reality` acceptor: the cover target, `host:port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// `naive` / `xhttp` acceptor TLS: the certificate chain (PEM), under `/etc/letsencrypt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+    /// `naive` / `xhttp` acceptor TLS: the private key (PEM), under `/etc/letsencrypt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Dialer: a CA bundle (PEM) to verify the helper server against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+}
+
+impl HelperSpec {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[l3]`: the layer-3 / GRE direct-tunnel settings for one side. The tunnel's address is
+/// carried in the ordinary [`Spec::listen`] (acceptor) or [`Spec::remote`] (dialer) field,
+/// and the token in [`Spec::token`]; `local_ip` / `peer_ip` are already this side's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct L3Spec {
+    /// `udp`, `quic`, `faketcp` or `icmp`: the unreliable carrier the sealed GRE rides.
+    pub carrier: String,
+    /// `3` (TUN, IP packets, the default) or `2` (TAP, Ethernet frames). Left out: 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<u8>,
+    /// This side's address on the tunnel, as a CIDR (`10.10.0.1/30`). Required for layer 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_ip: Option<String>,
+    /// The peer's address on the tunnel (`10.10.0.2`). Required for layer 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_ip: Option<String>,
+    /// RFC 2890 key, the same on both sides. Left out: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gre_key: Option<u32>,
+    /// The TUN/TAP MTU. Left out: the core's default (1400).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    /// Accept forwarded UDP over the TUN link.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accept_udp: bool,
+}
+
+impl L3Spec {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Something that listens on a port of this server.

@@ -1206,10 +1206,18 @@ async fn remove_server(
 fn pair_error(e: anyhow::Error) -> Response {
     let code = format!("{e:#}");
     match code.as_str() {
-        "bad_name" | "same_server" | "bad_mode" | "bad_action" | "bad_encryption"
-        | "encryption_quic" | "bad_tls_host" | "bad_proxy_protocol" | "bad_udp_flows" => {
-            error(StatusCode::BAD_REQUEST, &code)
-        }
+        "bad_name"
+        | "same_server"
+        | "bad_mode"
+        | "bad_action"
+        | "bad_encryption"
+        | "encryption_quic"
+        | "bad_tls_host"
+        | "bad_proxy_protocol"
+        | "bad_udp_flows"
+        | "bad_l3_carrier"
+        | "bad_l3_layer"
+        | "encryption_required" => error(StatusCode::BAD_REQUEST, &code),
         "busy" => error(StatusCode::CONFLICT, "busy"),
         // `old_agent:`, and the ones that name what needs the newer version
         // (`old_agent_enc:`, `old_agent_limits:`, ...): the page says which server to update.

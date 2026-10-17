@@ -50,8 +50,14 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
     if let Some(profile) = &spec.profile {
         root.insert("profile".into(), text(profile));
     }
+    // The `l3` tile is the panel's name for the GRE direct-tunnel mode: it has no core
+    // transport of its own (the carrier lives in `[l3]`), so `[tunnel].transport` is left
+    // at its default and the address and forward rules move into `[l3]`.
+    let is_l3 = spec.transport == "l3";
     let mut tunnel = Table::new();
-    tunnel.insert("transport".into(), text(&spec.transport));
+    if !is_l3 {
+        tunnel.insert("transport".into(), text(&spec.transport));
+    }
     if let Some(cipher) = spec.encryption.as_deref().filter(|c| *c != "auto") {
         tunnel.insert("encryption".into(), text(cipher));
     }
@@ -60,11 +66,54 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
         quic.insert("obfs".into(), Value::Boolean(true));
         tunnel.insert("quic".into(), Value::Table(quic));
     }
-    if let Some(listen) = &spec.listen {
-        tunnel.insert("listen".into(), text(listen));
+    if let Some(s) = spec.stealth.as_ref().filter(|s| !s.is_empty()) {
+        if spec.transport == "stealth" {
+            let mut t = Table::new();
+            if let Some(v) = s.padding {
+                t.insert("padding".into(), Value::Boolean(v));
+            }
+            if let Some(v) = s.pad_max {
+                t.insert("pad_max".into(), Value::Integer(i64::from(v)));
+            }
+            if let Some(v) = s.jitter_ms {
+                t.insert("jitter_ms".into(), Value::Integer(i64::from(v)));
+            }
+            tunnel.insert("stealth".into(), Value::Table(t));
+        }
     }
-    if let Some(remote) = &spec.remote {
-        tunnel.insert("remote".into(), text(remote));
+    if let Some(f) = spec.faketcp.as_ref().filter(|f| !f.is_empty()) {
+        if spec.transport == "faketcp" {
+            let mut t = Table::new();
+            if let Some(flags) = &f.flags {
+                t.insert("flags".into(), text(flags));
+            }
+            if let Some(v) = f.manage_firewall {
+                t.insert("manage_firewall".into(), Value::Boolean(v));
+            }
+            tunnel.insert("faketcp".into(), Value::Table(t));
+        }
+    }
+    if let Some(i) = spec.icmp.as_ref().filter(|i| !i.is_empty()) {
+        if spec.transport == "icmp" {
+            let mut t = Table::new();
+            if let Some(v) = i.manage_firewall {
+                t.insert("manage_firewall".into(), Value::Boolean(v));
+            }
+            tunnel.insert("icmp".into(), Value::Table(t));
+        }
+    }
+    if let Some(h) = spec.helper.as_ref().filter(|h| !h.is_empty()) {
+        if matches!(spec.transport.as_str(), "naive" | "xhttp" | "reality") {
+            tunnel.insert("helper".into(), Value::Table(helper_table(h, text)));
+        }
+    }
+    if !is_l3 {
+        if let Some(listen) = &spec.listen {
+            tunnel.insert("listen".into(), text(listen));
+        }
+        if let Some(remote) = &spec.remote {
+            tunnel.insert("remote".into(), text(remote));
+        }
     }
     tunnel.insert("token".into(), text(token));
     if let Some(pool) = spec.pool {
@@ -150,10 +199,81 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
             Value::Table(t)
         })
         .collect();
-    if !forwards.is_empty() {
+    if is_l3 {
+        // The GRE tunnel carries whole packets: its address, carrier and the (optional)
+        // forward rules over the TUN link all live in `[l3]`, not the port-forwarding tables.
+        let l3 = spec
+            .l3
+            .as_ref()
+            .ok_or_else(|| anyhow!("the l3 tunnel is missing its [l3] settings"))?;
+        let mut t = Table::new();
+        t.insert(
+            "mode".into(),
+            text(if is_acceptor(spec) { "listen" } else { "dial" }),
+        );
+        let addr = if is_acceptor(spec) {
+            spec.listen.as_deref()
+        } else {
+            spec.remote.as_deref()
+        };
+        t.insert(
+            "addr".into(),
+            text(addr.ok_or_else(|| anyhow!("the l3 tunnel is missing its address"))?),
+        );
+        t.insert("carrier".into(), text(&l3.carrier));
+        if let Some(v) = l3.layer {
+            t.insert("layer".into(), Value::Integer(i64::from(v)));
+        }
+        if let Some(ip) = &l3.local_ip {
+            t.insert("local_ip".into(), text(ip));
+        }
+        if let Some(ip) = &l3.peer_ip {
+            t.insert("peer_ip".into(), text(ip));
+        }
+        if let Some(v) = l3.gre_key {
+            t.insert("gre_key".into(), Value::Integer(i64::from(v)));
+        }
+        if let Some(v) = l3.mtu {
+            t.insert("mtu".into(), Value::Integer(i64::from(v)));
+        }
+        if l3.accept_udp {
+            t.insert("accept_udp".into(), Value::Boolean(true));
+        }
+        if !forwards.is_empty() {
+            t.insert("ports".into(), Value::Array(forwards));
+        }
+        root.insert("l3".into(), Value::Table(t));
+    } else if !forwards.is_empty() {
         root.insert("forward".into(), Value::Array(forwards));
     }
     toml::to_string_pretty(&root).context("failed to render the config")
+}
+
+/// The `[tunnel.helper]` table for a managed-helper side. Only the keys this side needs are
+/// present (the acceptor's spec carries the server secrets, the dialer's the client ones);
+/// `render` writes whatever is set.
+fn helper_table(h: &crate::wire::HelperSpec, text: impl Fn(&str) -> toml::Value) -> toml::Table {
+    let mut t = toml::Table::new();
+    let mut put = |key: &str, v: &Option<String>| {
+        if let Some(s) = v {
+            t.insert(key.into(), text(s));
+        }
+    };
+    put("binary", &h.binary);
+    put("username", &h.username);
+    put("password", &h.password);
+    put("uuid", &h.uuid);
+    put("path", &h.path);
+    put("server_name", &h.server_name);
+    put("host", &h.host);
+    put("short_id", &h.short_id);
+    put("private_key", &h.private_key);
+    put("public_key", &h.public_key);
+    put("target", &h.target);
+    put("certificate", &h.certificate);
+    put("key", &h.key);
+    put("ca_file", &h.ca_file);
+    t
 }
 
 /// Renders and validates a spec (the token of an existing file is kept when the spec has
@@ -235,6 +355,15 @@ fn plain_text(spec: &Spec) -> Result<()> {
             bail!("a certificate must be one the manager got (under {LIVE})");
         }
     }
+    // A managed helper's acceptor certificate and key are read by the helper, so they must
+    // be under the same trusted directory as a wss certificate.
+    if let Some(h) = &spec.helper {
+        for path in [&h.certificate, &h.key, &h.ca_file].into_iter().flatten() {
+            if !valid_cert_path(path) {
+                bail!("a helper certificate must be one the manager got (under {LIVE})");
+            }
+        }
+    }
     let optional = [
         &spec.encryption,
         &spec.profile,
@@ -246,9 +375,33 @@ fn plain_text(spec: &Spec) -> Result<()> {
         &spec.tls_pin,
         &spec.proxy_protocol,
     ];
+    let helper = spec.helper.iter().flat_map(|h| {
+        [
+            &h.binary,
+            &h.username,
+            &h.password,
+            &h.uuid,
+            &h.path,
+            &h.server_name,
+            &h.host,
+            &h.short_id,
+            &h.private_key,
+            &h.public_key,
+            &h.target,
+        ]
+    });
+    let l3 = spec.l3.iter().flat_map(|l| {
+        std::iter::once(&l.carrier)
+            .chain(l.local_ip.as_ref())
+            .chain(l.peer_ip.as_ref())
+    });
+    let stealth_flags = spec.faketcp.iter().filter_map(|f| f.flags.as_ref());
     let fields = [&spec.role, &spec.mode, &spec.transport]
         .into_iter()
         .chain(optional.into_iter().flatten())
+        .chain(helper.flatten())
+        .chain(l3)
+        .chain(stealth_flags)
         .chain(
             spec.forwards
                 .iter()
@@ -262,15 +415,30 @@ fn plain_text(spec: &Spec) -> Result<()> {
     Ok(())
 }
 
+/// The protocol the accepting side listens with, from the transport (for `l3`, from its
+/// carrier). `icmp` answers raw echoes and binds no port, so it has none.
+fn listen_proto(spec: &Spec) -> Option<&'static str> {
+    let carrier = if spec.transport == "l3" {
+        spec.l3.as_ref().map_or("udp", |l| l.carrier.as_str())
+    } else {
+        spec.transport.as_str()
+    };
+    match carrier {
+        "icmp" => None,
+        "quic" | "kcp" | "udp" => Some("udp"),
+        _ => Some("tcp"),
+    }
+}
+
 /// The (protocol, port) pairs a spec listens on.
 pub fn wanted_ports(spec: &Spec) -> Vec<(&'static str, u16)> {
     let mut out = Vec::new();
     let port =
         |addr: &str| -> Option<u16> { addr.rsplit_once(':').map_or(addr, |(_, p)| p).parse().ok() };
     if is_acceptor(spec) {
-        let udp = matches!(spec.transport.as_str(), "quic" | "kcp");
-        if let Some(p) = spec.listen.as_deref().and_then(port) {
-            out.push((if udp { "udp" } else { "tcp" }, p));
+        if let (Some(proto), Some(p)) = (listen_proto(spec), spec.listen.as_deref().and_then(port))
+        {
+            out.push((proto, p));
             // Auto listens for all of its transports: UDP on the port too, and a
             // WebSocket on the next one.
             if spec.transport == "auto" {
@@ -361,14 +529,27 @@ pub fn put(dir: &Path, spec: &Spec) -> Result<Option<String>> {
 pub fn get(dir: &Path, name: &str) -> Result<Spec> {
     let path = config_path(dir, name)?;
     let c = Config::load(&path)?;
+    // The GRE direct-tunnel mode is the `l3` tile: its address and forward rules live in
+    // `[l3]`, so they are read from there and the carrier stands in for the transport name.
+    let (transport, listen, remote) = match &c.l3 {
+        Some(l3) if matches!(l3.mode, kariz::config::L3Mode::Listen) => {
+            ("l3".to_owned(), Some(l3.addr.clone()), None)
+        }
+        Some(l3) => ("l3".to_owned(), None, Some(l3.addr.clone())),
+        None => (
+            c.tunnel.transport.name().to_owned(),
+            c.tunnel.listen.clone(),
+            c.tunnel.remote.clone(),
+        ),
+    };
     Ok(Spec {
         name: name.to_owned(),
         role: role_name(c.role).to_owned(),
         mode: mode_name(c.mode).to_owned(),
-        transport: c.tunnel.transport.name().to_owned(),
+        transport,
         profile: Some(c.profile.name().to_owned()),
-        listen: c.tunnel.listen.clone(),
-        remote: c.tunnel.remote.clone(),
+        listen,
+        remote,
         token: None,
         pool: Some(u32::try_from(c.tunnel.pool).unwrap_or(8)),
         ws_path: c.tunnel.ws.as_ref().map(|w| w.path.clone()),
@@ -421,8 +602,12 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
                     .and_then(|p| crate::cert::fingerprint(p).ok())
             })
         }),
+        // The l3 mode keeps its forward rules in `[l3] ports`; every other transport uses
+        // the top-level `[[forward]]` tables.
         forwards: c
-            .forward
+            .l3
+            .as_ref()
+            .map_or(c.forward.as_slice(), |l3| l3.ports.as_slice())
             .iter()
             .map(|f| ForwardInfo {
                 listen: f.listen.clone(),
@@ -430,6 +615,50 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
                 protocol: f.protocol.name().to_owned(),
             })
             .collect(),
+        stealth: c.tunnel.stealth.as_ref().map(|s| crate::wire::StealthSpec {
+            padding: Some(s.padding),
+            pad_max: Some(s.pad_max),
+            jitter_ms: Some(s.jitter_ms),
+        }),
+        faketcp: c.tunnel.faketcp.as_ref().map(|f| crate::wire::FaketcpSpec {
+            flags: Some(f.flags.clone()),
+            manage_firewall: Some(f.manage_firewall),
+        }),
+        icmp: c.tunnel.icmp.as_ref().map(|i| crate::wire::IcmpSpec {
+            manage_firewall: Some(i.manage_firewall),
+        }),
+        helper: c.tunnel.helper.as_ref().map(|h| {
+            let path = |p: &Option<PathBuf>| {
+                p.as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|p| valid_cert_path(p))
+            };
+            crate::wire::HelperSpec {
+                binary: h.binary.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                username: h.username.clone(),
+                password: h.password.clone(),
+                uuid: h.uuid.clone(),
+                path: h.path.clone(),
+                server_name: h.server_name.clone(),
+                host: h.host.clone(),
+                short_id: h.short_id.clone(),
+                private_key: h.private_key.clone(),
+                public_key: h.public_key.clone(),
+                target: h.target.clone(),
+                certificate: path(&h.certificate),
+                key: path(&h.key),
+                ca_file: path(&h.ca_file),
+            }
+        }),
+        l3: c.l3.as_ref().map(|l3| crate::wire::L3Spec {
+            carrier: l3.carrier.name().to_owned(),
+            layer: Some(l3.layer),
+            local_ip: l3.local_ip.clone(),
+            peer_ip: l3.peer_ip.clone(),
+            gre_key: Some(l3.gre_key),
+            mtu: Some(l3.mtu),
+            accept_udp: l3.accept_udp,
+        }),
     })
 }
 
@@ -1353,6 +1582,152 @@ mod tests {
     }
 
     #[test]
+    fn stealth_padding_is_written_and_read_back_and_only_for_stealth() {
+        use crate::wire::StealthSpec;
+        let d = Dir::new();
+        let mut s = spec("stlth");
+        s.transport = "stealth".into();
+        s.stealth = Some(StealthSpec {
+            padding: Some(true),
+            pad_max: Some(512),
+            jitter_ms: Some(20),
+        });
+        put(&d.0, &s).unwrap();
+        let text = std::fs::read_to_string(d.0.join("stlth.toml")).unwrap();
+        assert!(
+            text.contains("[tunnel.stealth]") && text.contains("pad_max = 512"),
+            "{text}"
+        );
+        let got = get(&d.0, "stlth").unwrap().stealth.unwrap();
+        assert_eq!((got.pad_max, got.jitter_ms), (Some(512), Some(20)));
+        // Over another transport the table is not written (the core refuses it there).
+        let mut other = spec("tcp-pad");
+        other.stealth = Some(StealthSpec {
+            pad_max: Some(99),
+            ..Default::default()
+        });
+        put(&d.0, &other).unwrap();
+        assert!(!std::fs::read_to_string(d.0.join("tcp-pad.toml"))
+            .unwrap()
+            .contains("stealth"));
+    }
+
+    #[test]
+    fn faketcp_and_icmp_knobs_are_written_and_read_back() {
+        use crate::wire::{FaketcpSpec, IcmpSpec};
+        let d = Dir::new();
+        let mut f = spec("ftcp");
+        f.transport = "faketcp".into();
+        f.faketcp = Some(FaketcpSpec {
+            flags: Some("PA,A".into()),
+            manage_firewall: Some(false),
+        });
+        put(&d.0, &f).unwrap();
+        let text = std::fs::read_to_string(d.0.join("ftcp.toml")).unwrap();
+        assert!(
+            text.contains("[tunnel.faketcp]")
+                && text.contains("flags = \"PA,A\"")
+                && text.contains("manage_firewall = false"),
+            "{text}"
+        );
+        let got = get(&d.0, "ftcp").unwrap().faketcp.unwrap();
+        assert_eq!(got.flags.as_deref(), Some("PA,A"));
+        assert_eq!(got.manage_firewall, Some(false));
+
+        let mut i = spec("icmp1");
+        i.transport = "icmp".into();
+        i.icmp = Some(IcmpSpec {
+            manage_firewall: Some(false),
+        });
+        put(&d.0, &i).unwrap();
+        assert!(std::fs::read_to_string(d.0.join("icmp1.toml"))
+            .unwrap()
+            .contains("[tunnel.icmp]"));
+        assert_eq!(
+            get(&d.0, "icmp1").unwrap().icmp.unwrap().manage_firewall,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_managed_helper_dialer_writes_its_credentials() {
+        use crate::wire::HelperSpec;
+        let d = Dir::new();
+        // A dialing xhttp side (exit in reverse mode) only needs the client identity.
+        let mut s = spec("xh");
+        s.role = "exit".into();
+        s.mode = "reverse".into();
+        s.listen = None;
+        s.remote = Some("example.com:443".into());
+        s.transport = "xhttp".into();
+        s.forwards.clear();
+        s.helper = Some(HelperSpec {
+            uuid: Some("123e4567-e89b-12d3-a456-426614174000".into()),
+            path: Some("/stream".into()),
+            server_name: Some("example.com".into()),
+            ..Default::default()
+        });
+        put(&d.0, &s).unwrap();
+        let text = std::fs::read_to_string(d.0.join("xh.toml")).unwrap();
+        assert!(
+            text.contains("[tunnel.helper]") && text.contains("/stream"),
+            "{text}"
+        );
+        let got = get(&d.0, "xh").unwrap().helper.unwrap();
+        assert_eq!(
+            got.uuid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(got.server_name.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn an_l3_tunnel_renders_its_gre_table_and_reads_back() {
+        use crate::wire::L3Spec;
+        let d = Dir::new();
+        // The accepting side of a direct l3 tunnel listens; its address and the forward
+        // rule move into [l3].
+        let mut s = spec("gre1");
+        s.role = "exit".into();
+        s.mode = "direct".into();
+        s.transport = "l3".into();
+        s.listen = Some("0.0.0.0:51820".into());
+        s.l3 = Some(L3Spec {
+            carrier: "udp".into(),
+            layer: Some(3),
+            local_ip: Some("10.10.7.1/30".into()),
+            peer_ip: Some("10.10.7.2".into()),
+            gre_key: Some(42),
+            mtu: Some(1400),
+            accept_udp: false,
+        });
+        put(&d.0, &s).unwrap();
+        let text = std::fs::read_to_string(d.0.join("gre1.toml")).unwrap();
+        assert!(
+            text.contains("[l3]")
+                && text.contains("carrier = \"udp\"")
+                && text.contains("mode = \"listen\"")
+                && text.contains("addr = \"0.0.0.0:51820\"")
+                && text.contains("local_ip = \"10.10.7.1/30\"")
+                && !text.contains("transport ="),
+            "{text}"
+        );
+        // The forward rule is written under [l3], not as a top-level [[forward]].
+        assert!(
+            text.contains("[[l3.ports]]") && !text.contains("[[forward]]"),
+            "{text}"
+        );
+        let got = get(&d.0, "gre1").unwrap();
+        assert_eq!(got.transport, "l3");
+        assert_eq!(got.listen.as_deref(), Some("0.0.0.0:51820"));
+        let l3 = got.l3.unwrap();
+        assert_eq!(l3.carrier, "udp");
+        assert_eq!(l3.local_ip.as_deref(), Some("10.10.7.1/30"));
+        assert_eq!(l3.gre_key, Some(42));
+        assert_eq!(got.forwards.len(), 1, "the l3 forward rule reads back");
+    }
+
+    #[test]
     fn the_udp_flow_limit_is_written_and_read_back_beside_the_per_address_one() {
         let d = Dir::new();
         let mut s = spec("busy");
@@ -1519,6 +1894,36 @@ mod tests {
             wanted_ports(&exit).is_empty(),
             "an exit dials in reverse mode"
         );
+    }
+
+    #[test]
+    fn the_new_transports_listen_on_the_right_protocol() {
+        use crate::wire::L3Spec;
+        let listen = |t: &str| {
+            let mut s = spec("p");
+            s.transport = t.into();
+            s.forwards.clear();
+            wanted_ports(&s)
+        };
+        // faketcp rides TCP; raw udp rides UDP; icmp binds no port at all.
+        assert_eq!(listen("faketcp"), vec![("tcp", 3080)]);
+        assert_eq!(listen("udp"), vec![("udp", 3080)]);
+        assert!(listen("icmp").is_empty(), "icmp answers raw echoes");
+        assert_eq!(listen("stealth"), vec![("tcp", 3080)]);
+        // l3 follows its carrier.
+        let l3 = |carrier: &str| {
+            let mut s = spec("p");
+            s.transport = "l3".into();
+            s.forwards.clear();
+            s.l3 = Some(L3Spec {
+                carrier: carrier.into(),
+                ..Default::default()
+            });
+            wanted_ports(&s)
+        };
+        assert_eq!(l3("udp"), vec![("udp", 3080)]);
+        assert_eq!(l3("faketcp"), vec![("tcp", 3080)]);
+        assert!(l3("icmp").is_empty());
     }
 
     fn owner(proto: &str, port: u16, process: &str) -> PortOwner {

@@ -349,6 +349,75 @@ export interface PairRequest {
   rotate?: boolean;
   /** Direct mode: run over this private GRE network (its id). */
   network?: string;
+  /** stealth: record padding and timing jitter. */
+  stealth?: StealthSpec;
+  /** faketcp: the fake-TCP carrier knobs. */
+  faketcp?: FaketcpSpec;
+  /** icmp: the ICMP carrier knobs. */
+  icmp?: IcmpSpec;
+  /** naive / xhttp / reality: the managed-helper credentials (split per side by the panel). */
+  helper?: HelperSpec;
+  /** l3: the carrier the sealed GRE rides (`udp`, `quic`, `faketcp` or `icmp`). */
+  l3_carrier?: string;
+  /** l3: `3` (TUN, IP packets) or `2` (TAP, Ethernet frames). */
+  l3_layer?: number;
+  /** l3 layer 3: the `N` of the auto-picked `10.10.N.0/30`. Left out: picked from the name. */
+  l3_net?: number;
+  /** l3: the RFC 2890 GRE key, the same on both sides. */
+  l3_gre_key?: number;
+  /** l3: the TUN/TAP MTU. */
+  l3_mtu?: number;
+}
+
+/** stealth: record-length padding and timing jitter (`[tunnel.stealth]`). */
+export interface StealthSpec {
+  padding?: boolean;
+  /** Largest padding a record carries, in bytes. */
+  pad_max?: number;
+  /** Random delay before a record is flushed, in milliseconds. */
+  jitter_ms?: number;
+}
+
+/** faketcp: the raw-socket fake-TCP carrier knobs (`[tunnel.faketcp]`). */
+export interface FaketcpSpec {
+  /** The TCP flag pattern (`A`, `PA`, `PA,A`, `PA,A,PA,PAU`). */
+  flags?: string;
+  /** Install and remove the iptables rules (RAII). */
+  manage_firewall?: boolean;
+}
+
+/** icmp: the ICMP-echo carrier knobs (`[tunnel.icmp]`). */
+export interface IcmpSpec {
+  manage_firewall?: boolean;
+}
+
+/** naive / xhttp / reality: the managed-helper credentials (`[tunnel.helper]`). */
+export interface HelperSpec {
+  binary?: string;
+  /** naive. */
+  username?: string;
+  password?: string;
+  /** xhttp / reality. */
+  uuid?: string;
+  /** xhttp. */
+  path?: string;
+  /** xhttp / reality. */
+  server_name?: string;
+  /** xhttp. */
+  host?: string;
+  /** reality: hex, even length, at most 16. */
+  short_id?: string;
+  /** reality acceptor: X25519 private key (base64url). */
+  private_key?: string;
+  /** reality dialer: X25519 public key (base64url). */
+  public_key?: string;
+  /** reality acceptor: cover target `host:port`. */
+  target?: string;
+  /** naive / xhttp acceptor TLS. */
+  certificate?: string;
+  key?: string;
+  /** dialer: a CA bundle to trust. */
+  ca_file?: string;
 }
 
 /** One side of a tunnel as an agent keeps it (never with its token). */
@@ -374,6 +443,22 @@ export interface Spec {
   udp_max_flows?: number;
   proxy_protocol?: string;
   forwards: ForwardSpec[];
+  stealth?: StealthSpec;
+  faketcp?: FaketcpSpec;
+  icmp?: IcmpSpec;
+  helper?: HelperSpec;
+  l3?: L3Spec;
+}
+
+/** l3: the GRE direct-tunnel settings an agent keeps (`[l3]`), this side's. */
+export interface L3Spec {
+  carrier: string;
+  layer?: number;
+  local_ip?: string;
+  peer_ip?: string;
+  gre_key?: number;
+  mtu?: number;
+  accept_udp?: boolean;
 }
 
 export interface PortOwner {

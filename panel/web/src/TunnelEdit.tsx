@@ -16,7 +16,30 @@ import { ProxyProtocol, proxyFromSpec, proxyOf } from "./ProxyProtocol";
 import type { ProxyChoice } from "./ProxyProtocol";
 import { GreChoice, linkWithAddress } from "./GreChoice";
 import { useNetworks } from "./Networks";
-import { MUX_OPTIONAL, TRANSPORTS, joinTransport, splitTransport } from "./transport";
+import { MUX_OPTIONAL, ROOT_ONLY, TRANSPORTS, joinTransport, splitTransport } from "./transport";
+import {
+  FaketcpOptions,
+  HelperFields,
+  IcmpOptions,
+  L3Options,
+  RootWarning,
+  StealthOptions,
+  emptyFaketcp,
+  emptyHelper,
+  emptyIcmp,
+  emptyL3,
+  emptyStealth,
+  faketcpFrom,
+  faketcpOf,
+  helperFrom,
+  helperOf,
+  icmpFrom,
+  icmpOf,
+  l3From,
+  l3Of,
+  stealthFrom,
+  stealthOf,
+} from "./TransportOptions";
 import { PROFILES, addressesOf, hostOf, parsePorts, portOf } from "./Wizard";
 import { benchLabel, isV6 } from "./Benchmark";
 import type { BenchChoice } from "./Benchmark";
@@ -48,6 +71,11 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const [enc, setEnc] = useState("auto");
   const [encAck, setEncAck] = useState(false);
   const [obfs, setObfs] = useState(false);
+  const [stealthS, setStealthS] = useState(emptyStealth());
+  const [faketcpS, setFaketcpS] = useState(emptyFaketcp());
+  const [icmpS, setIcmpS] = useState(emptyIcmp());
+  const [helperS, setHelperS] = useState(emptyHelper());
+  const [l3S, setL3S] = useState(emptyL3());
   const [perIp, setPerIp] = useState("");
   const [udpFlows, setUdpFlows] = useState("");
   const [proxy, setProxy] = useState<ProxyChoice>("off");
@@ -68,7 +96,9 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const acceptor = mode === "reverse" ? entry : exit;
   const dialer = mode === "reverse" ? exit : entry;
   const parsed = useMemo(() => parsePorts(ports, protocol, target.trim() || "127.0.0.1"), [ports, protocol, target]);
-  const isWs = transport === "ws" || transport === "wss";
+  const isWs = transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux";
+  const isL3 = transport === "l3";
+  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp"].includes(l3S.carrier));
   const choices = (() => {
     const s = servers.find((x) => x.id === acceptor);
     return s ? addressesOf(s) : [];
@@ -117,6 +147,12 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
         setMux(muxFromSpec(a.mux ?? b.mux));
         setEnc(a.encryption ?? "auto");
         setObfs(!!(a.quic_obfs ?? b.quic_obfs));
+        setStealthS(stealthFrom(a.stealth ?? b.stealth));
+        setFaketcpS(faketcpFrom(a.faketcp ?? b.faketcp));
+        setIcmpS(icmpFrom(a.icmp ?? b.icmp));
+        // The managed-helper credentials are split per side; the two specs together hold them.
+        setHelperS(helperFrom({ ...b.helper, ...acc.helper }));
+        setL3S(l3From(a.l3 ?? b.l3));
         setPerIp(String(a.max_conns_per_ip ?? b.max_conns_per_ip ?? ""));
         setUdpFlows(String(a.udp_max_flows ?? b.udp_max_flows ?? ""));
         setProxy(proxyFromSpec(a.proxy_protocol ?? b.proxy_protocol));
@@ -177,6 +213,11 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     tls_cert: transport === "wss" && tls.mode === "real" && tls.cert ? tls.cert : undefined,
     tls_key: transport === "wss" && tls.mode === "real" && tls.key ? tls.key : undefined,
     tls_host: transport === "wss" && tls.mode === "real" && tls.cert && tls.host ? tls.host : undefined,
+    stealth: stealthOf(stealthS, transport),
+    faketcp: faketcpOf(faketcpS, transport),
+    icmp: icmpOf(icmpS, transport),
+    helper: helperOf(helperS, transport),
+    ...l3Of(l3S, transport),
     rotate: rotate ? true : undefined,
     forwards: parsed.forwards,
   });
@@ -304,6 +345,12 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
             </div>
             <EncryptionChoice value={enc} onChange={setEnc} transport={transport} ack={encAck} onAck={setEncAck} />
             {transport === "quic" && <QuicObfs value={obfs} onChange={setObfs} />}
+            {rootOnly && <RootWarning />}
+            {transport === "stealth" && <StealthOptions value={stealthS} onChange={setStealthS} />}
+            {transport === "faketcp" && <FaketcpOptions value={faketcpS} onChange={setFaketcpS} />}
+            {transport === "icmp" && <IcmpOptions value={icmpS} onChange={setIcmpS} />}
+            {["naive", "xhttp", "reality"].includes(transport) && <HelperFields transport={transport} value={helperS} onChange={setHelperS} />}
+            {isL3 && <L3Options value={l3S} onChange={setL3S} />}
           </fieldset>
 
           <fieldset className="card edit-sec" disabled={running || op?.state === "done"}>
@@ -409,11 +456,13 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
             </div>
           </fieldset>
 
-          <fieldset className="card edit-sec" disabled={running || op?.state === "done"}>
-            <legend>{t("mux.title")}</legend>
-            <MuxToggle transport={transport} value={muxOn} onChange={setMuxOn} />
-            {(muxOn || !MUX_OPTIONAL.includes(transport)) && <MuxFields value={mux} onChange={setMux} profile={profile} transport={transport} />}
-          </fieldset>
+          {!isL3 && (
+            <fieldset className="card edit-sec" disabled={running || op?.state === "done"}>
+              <legend>{t("mux.title")}</legend>
+              <MuxToggle transport={transport} value={muxOn} onChange={setMuxOn} />
+              {(muxOn || !MUX_OPTIONAL.includes(transport)) && <MuxFields value={mux} onChange={setMux} profile={profile} transport={transport} />}
+            </fieldset>
+          )}
 
           <fieldset className="card edit-sec" disabled={running || op?.state === "done"}>
             <legend>{t("te.security")}</legend>

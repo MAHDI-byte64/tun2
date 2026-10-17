@@ -17,7 +17,25 @@ import { ProxyProtocol, proxyOf } from "./ProxyProtocol";
 import type { ProxyChoice } from "./ProxyProtocol";
 import { BenchPanel, benchLabel, isV6 } from "./Benchmark";
 import type { BenchChoice } from "./Benchmark";
-import { MUX_OPTIONAL, TRANSPORTS, joinTransport, transportLabel } from "./transport";
+import { MUX_OPTIONAL, ROOT_ONLY, TRANSPORTS, joinTransport, transportLabel } from "./transport";
+import {
+  FaketcpOptions,
+  HelperFields,
+  IcmpOptions,
+  L3Options,
+  RootWarning,
+  StealthOptions,
+  emptyFaketcp,
+  emptyHelper,
+  emptyIcmp,
+  emptyL3,
+  emptyStealth,
+  faketcpOf,
+  helperOf,
+  icmpOf,
+  l3Of,
+  stealthOf,
+} from "./TransportOptions";
 import { FIRST_TUNNEL_PORT, freeTunnelPort, hostOf, portOf, portsInUse } from "./ports";
 
 export const PROFILES = ["balanced", "ultraspeed", "gaming"] as const;
@@ -106,6 +124,11 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const [encAck, setEncAck] = useState(false);
   // Sealed QUIC (obfs) is on unless it is turned off: it is what makes QUIC work where it is filtered.
   const [obfs, setObfs] = useState(true);
+  const [stealthS, setStealthS] = useState(emptyStealth());
+  const [faketcpS, setFaketcpS] = useState(emptyFaketcp());
+  const [icmpS, setIcmpS] = useState(emptyIcmp());
+  const [helperS, setHelperS] = useState(emptyHelper());
+  const [l3S, setL3S] = useState(emptyL3());
   // Once the address to dial is typed (or loaded from the tunnel), it is not guessed again.
   const [dialTouched, setDialTouched] = useState(false);
   const [ports, setPorts] = useState("");
@@ -161,8 +184,10 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const greLink = netId ? linkBetween(links, netId, entry, exit) : undefined;
   // The tunnel listens on the private address of the server that accepts it, in either mode.
   const greAddr = greLink ? (greLink.a === acceptor ? greLink.addr_a : greLink.addr_b) : "";
-  const udp = transport === "quic" || transport === "kcp";
-  const isWs = transport === "ws" || transport === "wss";
+  const udp = transport === "quic" || transport === "kcp" || transport === "udp";
+  const isWs = transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux";
+  const isL3 = transport === "l3";
+  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp"].includes(l3S.carrier));
 
   // The accepting server's address, as the other one reaches it. A new tunnel starts from
   // the best guess (the address set for it, else the one the panel sees) until one is typed.
@@ -208,6 +233,11 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     tls_cert: transport === "wss" && tls.mode === "real" && tls.cert ? tls.cert : undefined,
     tls_key: transport === "wss" && tls.mode === "real" && tls.key ? tls.key : undefined,
     tls_host: transport === "wss" && tls.mode === "real" && tls.cert && tls.host ? tls.host : undefined,
+    stealth: stealthOf(stealthS, transport),
+    faketcp: faketcpOf(faketcpS, transport),
+    icmp: icmpOf(icmpS, transport),
+    helper: helperOf(helperS, transport),
+    ...l3Of(l3S, transport),
     forwards: parsed.forwards,
   });
 
@@ -430,10 +460,38 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                     <QuicObfs value={obfs} onChange={setObfs} />
                   </div>
                 )}
-                <div style={{ marginTop: "var(--sp-5)" }}>
-                  <MuxToggle transport={transport} value={muxOn} onChange={setMuxOn} />
-                </div>
-                {(muxOn || !MUX_OPTIONAL.includes(transport)) && (
+                {rootOnly && <RootWarning />}
+                {transport === "stealth" && (
+                  <div style={{ marginTop: "var(--sp-5)" }}>
+                    <StealthOptions value={stealthS} onChange={setStealthS} />
+                  </div>
+                )}
+                {transport === "faketcp" && (
+                  <div style={{ marginTop: "var(--sp-5)" }}>
+                    <FaketcpOptions value={faketcpS} onChange={setFaketcpS} />
+                  </div>
+                )}
+                {transport === "icmp" && (
+                  <div style={{ marginTop: "var(--sp-5)" }}>
+                    <IcmpOptions value={icmpS} onChange={setIcmpS} />
+                  </div>
+                )}
+                {["naive", "xhttp", "reality"].includes(transport) && (
+                  <div style={{ marginTop: "var(--sp-5)" }}>
+                    <HelperFields transport={transport} value={helperS} onChange={setHelperS} />
+                  </div>
+                )}
+                {isL3 && (
+                  <div style={{ marginTop: "var(--sp-5)" }}>
+                    <L3Options value={l3S} onChange={setL3S} />
+                  </div>
+                )}
+                {!isL3 && (
+                  <div style={{ marginTop: "var(--sp-5)" }}>
+                    <MuxToggle transport={transport} value={muxOn} onChange={setMuxOn} />
+                  </div>
+                )}
+                {!isL3 && (muxOn || !MUX_OPTIONAL.includes(transport)) && (
                   <details className="adv">
                     <summary>{t("mux.title")}</summary>
                     <MuxFields value={mux} onChange={setMux} profile={profile} transport={transport} />

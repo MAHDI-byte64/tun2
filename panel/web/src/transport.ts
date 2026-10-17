@@ -1,10 +1,37 @@
 import type { MuxSpec } from "./api";
 
 /** The transports a person chooses from. `tcp` with mux on is the core's `tcpmux`; with mux off, plain `tcp`. */
-export const TRANSPORTS = ["auto", "tcp", "ws", "wss", "quic", "kcp"] as const;
+export const TRANSPORTS = [
+  "auto",
+  "tcp",
+  "stealth",
+  "ws",
+  "wss",
+  "wsmux",
+  "wssmux",
+  "quic",
+  "kcp",
+  "udp",
+  "faketcp",
+  "icmp",
+  "naive",
+  "xhttp",
+  "reality",
+  "l3",
+] as const;
 
-/** Transports where mux can be turned off (`auto` and `quic` always multiplex). */
-export const MUX_OPTIONAL = ["tcp", "ws", "wss", "kcp"];
+/** Transports that need root (raw sockets or a TUN device). The wizard warns when one is picked. */
+export const ROOT_ONLY = ["faketcp", "icmp", "l3"];
+
+/** Transports whose own encryption is the tunnel's, so `encryption = "none"` is refused. */
+export const ENCRYPTION_FORCED = ["stealth", "udp", "faketcp", "icmp", "l3"];
+
+/** The managed-helper transports (a sing-box / Xray process carries the tunnel). */
+export const HELPER_TRANSPORTS = ["naive", "xhttp", "reality"];
+
+/** Transports where mux can be turned off (`auto`, `quic`, the `*mux` twins and the KCP
+ *  carriers always multiplex or do not multiplex at all). */
+export const MUX_OPTIONAL = ["tcp", "ws", "wss", "kcp", "stealth"];
 
 /** A tunnel's core transport (and mux settings) as the form shows them: a transport and whether mux is on. */
 export function splitTransport(core: string, mux?: MuxSpec | null): { transport: string; mux: boolean } {
@@ -41,5 +68,6 @@ export const hostPort = (host: string, port: number | string) => (host.includes(
 /** The transport as a list shows it: `tcpmux` is just tcp, and an auto tunnel says what it uses now. */
 export function transportLabel(core: string, via?: string | null): string {
   if (core === "auto") return via ? `auto → ${via.replace(/tcpmux/g, "tcp")}` : "auto";
+  if (core === "l3") return "L3 / GRE";
   return core === "tcpmux" ? "tcp" : core === "tcp" ? "tcp · no mux" : core;
 }

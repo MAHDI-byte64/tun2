@@ -20,7 +20,7 @@ use crate::wire::{
 pub const CONNECT_WAIT: Duration = Duration::from_secs(30);
 
 /// What the wizard sends: one tunnel, both sides.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PairRequest {
     pub name: String,
     /// Server ids (`local` for the panel's own).
@@ -80,6 +80,36 @@ pub struct PairRequest {
     /// dials the private address.
     #[serde(default)]
     pub network: Option<String>,
+    /// `stealth`: the record-padding and timing-jitter knobs, the same on both sides.
+    #[serde(default)]
+    pub stealth: Option<crate::wire::StealthSpec>,
+    /// `faketcp`: the fake-TCP carrier knobs, applied to both sides.
+    #[serde(default)]
+    pub faketcp: Option<crate::wire::FaketcpSpec>,
+    /// `icmp`: the ICMP carrier knobs, applied to both sides.
+    #[serde(default)]
+    pub icmp: Option<crate::wire::IcmpSpec>,
+    /// `naive` / `xhttp` / `reality`: every managed-helper credential the wizard collected.
+    /// The panel splits it per side: the acceptor keeps the server secrets, the dialer the
+    /// client ones.
+    #[serde(default)]
+    pub helper: Option<crate::wire::HelperSpec>,
+    /// `l3`: the carrier the sealed GRE rides (`udp`, `quic`, `faketcp` or `icmp`).
+    #[serde(default)]
+    pub l3_carrier: Option<String>,
+    /// `l3`: `3` (TUN, IP packets, default) or `2` (TAP, Ethernet frames).
+    #[serde(default)]
+    pub l3_layer: Option<u8>,
+    /// `l3` layer 3: the `N` of the auto-picked `10.10.N.0/30` address block. Left out: the
+    /// panel picks one from the tunnel's name.
+    #[serde(default)]
+    pub l3_net: Option<u8>,
+    /// `l3`: the RFC 2890 GRE key, the same on both sides.
+    #[serde(default)]
+    pub l3_gre_key: Option<u32>,
+    /// `l3`: the TUN/TAP MTU.
+    #[serde(default)]
+    pub l3_mtu: Option<u16>,
 }
 
 impl PairRequest {
@@ -118,6 +148,20 @@ impl PairRequest {
             tls_key: (accepts && self.transport == "wss")
                 .then(|| self.tls_key.clone())
                 .flatten(),
+            stealth: (self.transport == "stealth")
+                .then(|| self.stealth.clone())
+                .flatten()
+                .filter(|s| !s.is_empty()),
+            faketcp: (self.transport == "faketcp")
+                .then(|| self.faketcp.clone())
+                .flatten()
+                .filter(|f| !f.is_empty()),
+            icmp: (self.transport == "icmp")
+                .then(|| self.icmp.clone())
+                .flatten()
+                .filter(|i| !i.is_empty()),
+            helper: self.helper_for(accepts),
+            l3: self.l3_for(accepts),
             forwards: if role == "entry" {
                 self.forwards.clone()
             } else {
@@ -196,6 +240,90 @@ impl PairRequest {
         self.encryption.as_deref().filter(|e| *e != "auto")
     }
 
+    /// This side's slice of the managed-helper credentials: the acceptor runs the helper
+    /// server (its private key, cover target and TLS certificate), the dialer the helper
+    /// client (the public key and the CA to trust). The shared identity (credential, UUID,
+    /// path, names, short id) goes to both.
+    fn helper_for(&self, acceptor: bool) -> Option<crate::wire::HelperSpec> {
+        if !matches!(self.transport.as_str(), "naive" | "xhttp" | "reality") {
+            return None;
+        }
+        let h = self.helper.as_ref()?;
+        let mut side = crate::wire::HelperSpec {
+            binary: h.binary.clone(),
+            username: h.username.clone(),
+            password: h.password.clone(),
+            uuid: h.uuid.clone(),
+            path: h.path.clone(),
+            server_name: h.server_name.clone(),
+            host: h.host.clone(),
+            short_id: h.short_id.clone(),
+            ..Default::default()
+        };
+        if acceptor {
+            side.private_key = h.private_key.clone();
+            side.target = h.target.clone();
+            side.certificate = h.certificate.clone();
+            side.key = h.key.clone();
+        } else {
+            side.public_key = h.public_key.clone();
+            side.ca_file = h.ca_file.clone();
+        }
+        (!side.is_empty()).then_some(side)
+    }
+
+    /// This side's `[l3]` settings, with the auto-picked `10.10.N.0/30` address resolved
+    /// (the accepting side is `.1`, the dialing side `.2`). Layer 2 (TAP) takes no address.
+    fn l3_for(&self, acceptor: bool) -> Option<crate::wire::L3Spec> {
+        if self.transport != "l3" {
+            return None;
+        }
+        let layer = self.l3_layer.unwrap_or(3);
+        let (local_ip, peer_ip) = if layer == 3 {
+            let n = self.l3_net.unwrap_or_else(|| self.l3_auto_net());
+            let (me, peer) = if acceptor { (1, 2) } else { (2, 1) };
+            (
+                Some(format!("10.10.{n}.{me}/30")),
+                Some(format!("10.10.{n}.{peer}")),
+            )
+        } else {
+            (None, None)
+        };
+        Some(crate::wire::L3Spec {
+            carrier: self.l3_carrier.clone().unwrap_or_else(|| "udp".to_owned()),
+            layer: Some(layer),
+            local_ip,
+            peer_ip,
+            gre_key: self.l3_gre_key,
+            mtu: self.l3_mtu,
+            accept_udp: self.forwards.iter().any(|f| f.protocol.contains("udp")),
+        })
+    }
+
+    /// An address-block index for `l3` derived from the tunnel's name, so two tunnels with
+    /// different names rarely land on the same `10.10.N.0/30`.
+    fn l3_auto_net(&self) -> u8 {
+        self.name.bytes().fold(0u8, u8::wrapping_add)
+    }
+
+    /// Whether this tunnel uses a transport that only exists from 2.7 (an older agent
+    /// refuses the config with a raw serde error, so the pair step checks it first).
+    fn needs_2_7_transport(&self) -> bool {
+        matches!(
+            self.transport.as_str(),
+            "stealth"
+                | "wsmux"
+                | "wssmux"
+                | "udp"
+                | "faketcp"
+                | "icmp"
+                | "naive"
+                | "xhttp"
+                | "reality"
+                | "l3"
+        )
+    }
+
     /// An error (`old_agent:SERVER:VERSION`, or `old_agent_enc:...` for a cipher,
     /// `old_agent_obfs:...` for sealed QUIC, `old_agent_limits:...` for 2.4's limits and
     /// `old_agent_proxy:...` for PROXY headers) naming the first server that is too old.
@@ -205,7 +333,8 @@ impl PairRequest {
             || self.sealed()
             || self.needs_2_4().0
             || self.proxy_version().is_some()
-            || self.udp_flows().is_some();
+            || self.udp_flows().is_some()
+            || self.needs_2_7_transport();
         if !anything_new {
             return Ok(());
         }
@@ -245,6 +374,11 @@ impl PairRequest {
         // header (an older one refuses the open request, and every connection fails).
         if self.proxy_version().is_some() && !version_at_least(version, (2, 5, 0)) {
             bail!("old_agent_proxy:{id}:{version}");
+        }
+        // The BackPack-style transports and the l3 / GRE mode arrived with 2.7: an older
+        // agent does not know the name and refuses the whole config.
+        if self.needs_2_7_transport() && !release_at_least(version, TRANSPORTS_SINCE) {
+            bail!("old_agent_transport:{id}:{version}");
         }
         // The panel writes the UDP flow limit from 2.6.0-beta.4 (the core had it before; an
         // older agent refuses the field). Only the entry side has UDP rules.
@@ -292,12 +426,37 @@ impl PairRequest {
         if self.udp_flows().is_some_and(|v| v > 65536) {
             bail!("bad_udp_flows");
         }
+        // The l3 / GRE mode needs an unreliable carrier (a reliable one melts down under
+        // TCP-over-TCP) and a layer the core knows.
+        if self.transport == "l3" {
+            let carrier = self.l3_carrier.as_deref().unwrap_or("udp");
+            if !matches!(carrier, "udp" | "quic" | "faketcp" | "icmp") {
+                bail!("bad_l3_carrier");
+            }
+            if self.l3_layer.is_some_and(|l| l != 2 && l != 3) {
+                bail!("bad_l3_layer");
+            }
+        }
+        // udp, faketcp, icmp, stealth and l3 seal nothing of their own: the tunnel's own
+        // encryption carries it, so `none` is refused (as the core does).
+        if self.encryption.as_deref() == Some("none")
+            && matches!(
+                self.transport.as_str(),
+                "udp" | "faketcp" | "icmp" | "stealth" | "l3"
+            )
+        {
+            bail!("encryption_required");
+        }
         Ok(())
     }
 }
 
 /// The first release whose agent writes `tuning.udp_max_flows` from the panel.
 const UDP_FLOWS_SINCE: &str = "2.6.0-beta.4";
+
+/// The first release whose agent knows the BackPack-style transports (`stealth`, `wsmux`,
+/// `wssmux`, `udp`, `faketcp`, `icmp`, `naive`, `xhttp`, `reality`) and the `l3` mode.
+const TRANSPORTS_SINCE: &str = "2.7.0";
 
 /// Whether `version` is `min` or a later release, prereleases in their order
 /// (`2.6.0-beta.3` is before `2.6.0-beta.4`, which is before `2.6.0`). One that cannot be
@@ -1268,6 +1427,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: None,
+            ..Default::default()
         };
         for ok in ["auto", "aes-256-gcm", "chacha20-poly1305", "none"] {
             assert!(req("tcpmux", Some(ok)).validate().is_ok(), "{ok}");
@@ -1331,6 +1491,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: None,
+            ..Default::default()
         };
         // Both sides get it over quic, and nobody over another transport.
         let (entry, exit) = req("quic", true).specs(None, None);
@@ -1376,6 +1537,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: None,
+            ..Default::default()
         };
         let (entry, exit) = req(Some(300), None).specs(None, None);
         assert_eq!(
@@ -1422,6 +1584,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: None,
+            ..Default::default()
         };
         let (entry, exit) = req(Some(8192)).specs(None, None);
         assert_eq!(
@@ -1487,6 +1650,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: None,
+            ..Default::default()
         };
         let (entry, exit) = req(Some("v1")).specs(None, None);
         assert_eq!(
@@ -1548,6 +1712,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: None,
+            ..Default::default()
         };
         assert!(req("auto", None).needs_new_servers());
         let tuned = crate::wire::MuxSpec {
@@ -1591,6 +1756,7 @@ mod tests {
             forwards: Vec::new(),
             rotate: false,
             network: None,
+            ..Default::default()
         };
         // Reverse: the entry listens, the exit dials.
         let dialer = |r: PairRequest| r.specs(None, None).1;
@@ -1622,5 +1788,126 @@ mod tests {
         bad.tls_host = Some("not a host".into());
         assert_eq!(bad.validate().unwrap_err().to_string(), "bad_tls_host");
         assert!(req(None, None, true).validate().is_ok());
+    }
+
+    /// A minimal request for one of the 2.7 transports.
+    fn req_transport(transport: &str) -> PairRequest {
+        PairRequest {
+            name: "t".into(),
+            entry: "a".into(),
+            exit: "b".into(),
+            mode: "reverse".into(),
+            transport: transport.into(),
+            listen: "0.0.0.0:3080".into(),
+            dial: "1.2.3.4:3080".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_new_transports_need_a_2_7_agent_on_both_sides() {
+        for t in [
+            "stealth", "wsmux", "wssmux", "udp", "faketcp", "icmp", "naive", "xhttp", "reality",
+            "l3",
+        ] {
+            for server in ["a", "b"] {
+                // A beta of 2.7.0 is before the release that ships the full set.
+                for old in ["2.6.1", "2.6.0-beta.4", "2.5.0", "1.9.0", "2.7.0-beta.1"] {
+                    let err = req_transport(t).require_version(server, old).unwrap_err();
+                    assert_eq!(
+                        err.to_string(),
+                        format!("old_agent_transport:{server}:{old}"),
+                        "{t} on {old}"
+                    );
+                }
+                for new in ["2.7.0", "2.7.1", "v3.0.0"] {
+                    assert!(
+                        req_transport(t).require_version(server, new).is_ok(),
+                        "{t} on {new}"
+                    );
+                }
+            }
+        }
+        // The old transports still need nothing new.
+        for t in ["tcp", "ws", "wss", "kcp"] {
+            assert!(
+                req_transport(t).require_version("a", "2.5.0").is_ok(),
+                "{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_l3_tunnel_auto_picks_the_two_ends_of_a_30() {
+        let mut r = req_transport("l3");
+        r.l3_carrier = Some("quic".into());
+        r.l3_net = Some(7);
+        let (entry, exit) = r.specs(None, None);
+        // The accepting side (entry in reverse) is `.1`; the dialing side is `.2`.
+        let e = entry.l3.unwrap();
+        let x = exit.l3.unwrap();
+        assert_eq!(e.local_ip.as_deref(), Some("10.10.7.1/30"));
+        assert_eq!(e.peer_ip.as_deref(), Some("10.10.7.2"));
+        assert_eq!(x.local_ip.as_deref(), Some("10.10.7.2/30"));
+        assert_eq!(x.peer_ip.as_deref(), Some("10.10.7.1"));
+        assert_eq!(e.carrier, "quic");
+        // Layer 2 (TAP) carries no address.
+        r.l3_layer = Some(2);
+        let (entry2, _) = r.specs(None, None);
+        let e2 = entry2.l3.unwrap();
+        assert!(e2.local_ip.is_none() && e2.peer_ip.is_none());
+    }
+
+    #[test]
+    fn a_managed_helper_splits_server_and_client_secrets() {
+        let mut r = req_transport("reality");
+        r.helper = Some(crate::wire::HelperSpec {
+            uuid: Some("123e4567-e89b-12d3-a456-426614174000".into()),
+            server_name: Some("example.com".into()),
+            private_key: Some("priv".into()),
+            public_key: Some("pub".into()),
+            target: Some("example.com:443".into()),
+            ..Default::default()
+        });
+        let (entry, exit) = r.specs(None, None);
+        // entry accepts in reverse mode: it keeps the server secret and cover target.
+        let acc = entry.helper.unwrap();
+        assert_eq!(acc.private_key.as_deref(), Some("priv"));
+        assert_eq!(acc.target.as_deref(), Some("example.com:443"));
+        assert!(acc.public_key.is_none(), "the server keeps no client key");
+        // exit dials: it keeps only the public key.
+        let dial = exit.helper.unwrap();
+        assert_eq!(dial.public_key.as_deref(), Some("pub"));
+        assert!(dial.private_key.is_none(), "the client keeps no server key");
+        // The shared identity reaches both.
+        assert_eq!(acc.uuid, dial.uuid);
+    }
+
+    #[test]
+    fn l3_and_mandatory_encryption_are_validated() {
+        let mut r = req_transport("l3");
+        r.l3_carrier = Some("tcp".into());
+        assert_eq!(r.validate().unwrap_err().to_string(), "bad_l3_carrier");
+        r.l3_carrier = Some("udp".into());
+        assert!(r.validate().is_ok());
+        r.l3_layer = Some(4);
+        assert_eq!(r.validate().unwrap_err().to_string(), "bad_l3_layer");
+        // The sealing-less transports refuse `encryption = "none"`.
+        for t in ["udp", "faketcp", "icmp", "stealth", "l3"] {
+            let mut r = req_transport(t);
+            if t == "l3" {
+                r.l3_carrier = Some("udp".into());
+            }
+            r.encryption = Some("none".into());
+            assert_eq!(
+                r.validate().unwrap_err().to_string(),
+                "encryption_required",
+                "{t}"
+            );
+        }
+        // A cipher or auto is fine.
+        let mut r = req_transport("stealth");
+        r.encryption = Some("chacha20-poly1305".into());
+        assert!(r.validate().is_ok());
     }
 }
