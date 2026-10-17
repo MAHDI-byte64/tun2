@@ -125,7 +125,7 @@ pub async fn listen(
         live.fetch_sub(1, Ordering::SeqCst);
         return failed("busy".into());
     }
-    let tls = if kind == TransportKind::Wss {
+    let tls = if matches!(kind, TransportKind::Wss | TransportKind::Wssmux) {
         if let Err(e) = crate::cert::ensure(tls.0, tls.1) {
             live.fetch_sub(1, Ordering::SeqCst);
             return failed(format!("{e:#}"));
@@ -199,7 +199,9 @@ pub async fn dial(
         || ping_ms > 5_000
         || seconds > 5
         || !crate::join::valid_host(addr)
-        || sni.is_some_and(|s| kind != TransportKind::Wss || !valid_sni(s))
+        || sni.is_some_and(|s| {
+            !matches!(kind, TransportKind::Wss | TransportKind::Wssmux) || !valid_sni(s)
+        })
     {
         return failed("bad_input".into());
     }
@@ -397,8 +399,8 @@ fn is_v6(host: &str) -> bool {
 
 /// The candidates for `ask`, and whether IPv6 is measured (see [`Bench::ipv6`]):
 ///
-/// * every transport in each direction over the public addresses, and `wss` once more with
-///   `ask.sni`;
+/// * every transport in each direction over the public addresses, and `wss` / `wssmux` once
+///   more with `ask.sni`;
 /// * the same over the public IPv6 addresses, when both servers have one (and the address
 ///   a server is known by is not already its IPv6 one);
 /// * across a GRE link and across a VXLAN link, for each kind the two servers have a link of
@@ -502,7 +504,7 @@ fn candidates(
         for (path, host) in paths {
             for kind in kariz::bench::TRANSPORTS {
                 add(kind.name(), path, host.clone(), None, None);
-                if kind == TransportKind::Wss && ask.sni.is_some() {
+                if matches!(kind, TransportKind::Wss | TransportKind::Wssmux) && ask.sni.is_some() {
                     add(kind.name(), path, host.clone(), None, ask.sni.clone());
                 }
             }
