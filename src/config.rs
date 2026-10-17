@@ -1767,32 +1767,46 @@ impl Config {
     }
 
     fn validate_faketcp(&self) -> Result<()> {
-        let Some(f) = &self.tunnel.faketcp else {
-            return Ok(());
-        };
-        if self.tunnel.transport != TransportKind::Faketcp {
+        let is_faketcp = self.tunnel.transport == TransportKind::Faketcp;
+        if self.tunnel.faketcp.is_some() && !is_faketcp {
             bail!("[tunnel.faketcp] is only used with transport = \"faketcp\"");
         }
-        if !FAKETCP_FLAGS.contains(&f.flags.as_str()) {
-            bail!(
-                "tunnel.faketcp.flags must be one of {}",
-                FAKETCP_FLAGS.join(", ")
-            );
+        if !is_faketcp {
+            return Ok(());
         }
-        if !f.interface.is_empty()
-            && (f.interface.len() > 15 || !f.interface.bytes().all(|b| b.is_ascii_graphic()))
-        {
-            bail!("tunnel.faketcp.interface must be a short interface name");
+        // faketcp carries the KCP stack over raw TCP segments with no transport crypto of
+        // its own, so the tunnel's own encryption is mandatory.
+        if self.tunnel.encryption == Encryption::None {
+            bail!("transport = \"faketcp\" requires encryption; set tunnel.encryption");
         }
-        if !f.gateway_mac.is_empty() && !is_mac(&f.gateway_mac) {
-            bail!("tunnel.faketcp.gateway_mac must be a MAC address (aa:bb:cc:dd:ee:ff)");
+        if let Some(f) = &self.tunnel.faketcp {
+            if !FAKETCP_FLAGS.contains(&f.flags.as_str()) {
+                bail!(
+                    "tunnel.faketcp.flags must be one of {}",
+                    FAKETCP_FLAGS.join(", ")
+                );
+            }
+            if !f.interface.is_empty()
+                && (f.interface.len() > 15 || !f.interface.bytes().all(|b| b.is_ascii_graphic()))
+            {
+                bail!("tunnel.faketcp.interface must be a short interface name");
+            }
+            if !f.gateway_mac.is_empty() && !is_mac(&f.gateway_mac) {
+                bail!("tunnel.faketcp.gateway_mac must be a MAC address (aa:bb:cc:dd:ee:ff)");
+            }
         }
         Ok(())
     }
 
     fn validate_icmp(&self) -> Result<()> {
-        if self.tunnel.icmp.is_some() && self.tunnel.transport != TransportKind::Icmp {
+        let is_icmp = self.tunnel.transport == TransportKind::Icmp;
+        if self.tunnel.icmp.is_some() && !is_icmp {
             bail!("[tunnel.icmp] is only used with transport = \"icmp\"");
+        }
+        // icmp carries the KCP stack inside ICMP echoes with no transport crypto of its
+        // own, so the tunnel's own encryption is mandatory.
+        if is_icmp && self.tunnel.encryption == Encryption::None {
+            bail!("transport = \"icmp\" requires encryption; set tunnel.encryption");
         }
         Ok(())
     }
@@ -1800,6 +1814,11 @@ impl Config {
     fn validate_udp(&self) -> Result<()> {
         if self.tunnel.transport != TransportKind::Udp {
             return Ok(());
+        }
+        // The udp transport rides plain UDP datagrams with no transport crypto of its own,
+        // so the tunnel's own encryption is mandatory.
+        if self.tunnel.encryption == Encryption::None {
+            bail!("transport = \"udp\" requires encryption; set tunnel.encryption");
         }
         // The udp transport carries forwarded datagrams on the unreliable path; there is no
         // stream to run a TCP forward or a PROXY header over.
@@ -1953,6 +1972,12 @@ impl Config {
     fn validate_l3(&self, l3: &L3Config) -> Result<()> {
         if l3.encap != "gre" {
             bail!("l3.encap must be \"gre\"");
+        }
+        // The GRE header and the inner IP packets are sealed inside the tunnel's own
+        // handshake + record session (never bare IP proto 47 on the wire), so the tunnel's
+        // encryption is mandatory for the l3 mode.
+        if self.tunnel.encryption == Encryption::None {
+            bail!("the [l3] / GRE tunnel requires encryption; set tunnel.encryption");
         }
         // Reliable carriers (tcp/tcpmux/ws/wss and reliable KCP) would stack two retransmit
         // timers (TCP-over-TCP meltdown); the `L3Carrier` enum only parses the unreliable
@@ -3012,6 +3037,13 @@ keepalive_secs = 1
              [tunnel]\ntransport = \"udp\"\nremote = \"203.0.113.1:443\"\n\
              token = \"0123456789abcdef0123\"\n";
         assert!(parse_err(text).contains("proxy_protocol"), "{text}");
+        // udp has no transport crypto of its own, so encryption = "none" is refused.
+        let text = "role = \"entry\"\nmode = \"direct\"\n\
+             [[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\n\
+             protocol = \"udp\"\n\
+             [tunnel]\ntransport = \"udp\"\nremote = \"203.0.113.1:443\"\n\
+             token = \"0123456789abcdef0123\"\nencryption = \"none\"\n";
+        assert!(parse_err(text).contains("requires encryption"), "{text}");
         // A plain UDP forward is fine, and [tunnel.kcp] is allowed.
         let ok = "role = \"entry\"\nmode = \"direct\"\n\
              [[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\n\
@@ -3048,6 +3080,12 @@ keepalive_secs = 1
         // The icmp table only with icmp.
         let err = parse_err(&with_transport("entry", "faketcp", "[tunnel.icmp]"));
         assert!(err.contains("[tunnel.icmp]"), "{err}");
+        // Both carriers have no transport crypto of their own, so encryption = "none" is
+        // refused (even with no [tunnel.faketcp] / [tunnel.icmp] table present).
+        for transport in ["faketcp", "icmp"] {
+            let err = parse_err(&with_transport("entry", transport, "encryption = \"none\""));
+            assert!(err.contains("requires encryption"), "{transport}: {err}");
+        }
     }
 
     #[cfg(feature = "helpers")]
@@ -3227,6 +3265,12 @@ keepalive_secs = 1
         assert!(err.contains("l3.mtu"), "{err}");
         let err = parse_err(&l3_cfg(&format!("{L3_OK}encap = \"ipip\"\n")));
         assert!(err.contains("l3.encap"), "{err}");
+        // The GRE tunnel is sealed inside the Kariz session, so encryption = "none" is refused.
+        let text = format!(
+            "role = \"entry\"\nmode = \"direct\"\n\
+             [tunnel]\ntoken = \"{TOKEN}\"\nencryption = \"none\"\n[l3]\n{L3_OK}\n"
+        );
+        assert!(parse_err(&text).contains("requires encryption"), "{text}");
         // FEC range.
         let err = parse_err(&l3_cfg(&format!("{L3_OK}fec_data = 100\nfec_parity = 3\n")));
         assert!(err.contains("fec_parity between"), "{err}");
