@@ -593,10 +593,20 @@ pub struct L3Config {
     pub addr: String,
     /// Shared secret. Defaults to `[tunnel].token` when unset.
     pub token: Option<String>,
-    /// This end's address on the tunnel, as a CIDR, e.g. `10.10.0.1/30`.
-    pub local_ip: String,
-    /// The peer's address on the tunnel, e.g. `10.10.0.2`.
-    pub peer_ip: String,
+    /// `3` (default): a TUN device carrying whole IP packets. `2`: a TAP device carrying
+    /// Ethernet frames (an encrypted GRETAP), for bridging.
+    #[serde(default = "default_l3_layer")]
+    pub layer: u8,
+    /// This end's address on the tunnel, as a CIDR, e.g. `10.10.0.1/30`. Required for
+    /// `layer = 3`; optional for `layer = 2` (an address-less TAP can simply be bridged).
+    pub local_ip: Option<String>,
+    /// The peer's address on the tunnel, e.g. `10.10.0.2`. Required for `layer = 3`.
+    pub peer_ip: Option<String>,
+    /// RFC 2890 key, letting several logical tunnels share a carrier. Both ends compare it.
+    #[serde(default)]
+    pub gre_key: u32,
+    /// The interface name to create. Default: the next free `kzN`.
+    pub iface: Option<String>,
     /// The carrier the sealed GRE packets ride. Reliable carriers are rejected (two
     /// retransmit timers melt down).
     pub carrier: L3Carrier,
@@ -619,6 +629,10 @@ pub struct L3Config {
 
 fn default_l3_mtu() -> u16 {
     1400
+}
+
+fn default_l3_layer() -> u8 {
+    3
 }
 
 fn default_l3_encap() -> String {
@@ -2068,11 +2082,35 @@ impl Config {
         if token.contains("CHANGE-ME") {
             bail!("l3.token still has the sample value; generate one with `kariz token`");
         }
-        parse_cidr(&l3.local_ip)
-            .with_context(|| format!("l3.local_ip is not a valid CIDR: {}", l3.local_ip))?;
-        l3.peer_ip
-            .parse::<std::net::IpAddr>()
-            .with_context(|| format!("l3.peer_ip is not a valid IP address: {}", l3.peer_ip))?;
+        // `layer = 3` is a TUN (IP packets); `layer = 2` is a TAP (Ethernet frames / an
+        // encrypted GRETAP). Nothing else exists.
+        if l3.layer != 2 && l3.layer != 3 {
+            bail!("l3.layer must be 3 (TUN, IP packets) or 2 (TAP, Ethernet frames)");
+        }
+        // Layer 3 carries IP, so each end needs its tunnel address. Layer 2 carries whole
+        // Ethernet frames and may come up address-less to be put in a bridge, so the
+        // addresses are optional there; whatever is given is still checked.
+        if l3.layer == 3 && l3.local_ip.is_none() {
+            bail!("l3.local_ip is required for layer = 3 (e.g. \"10.10.0.1/30\")");
+        }
+        if l3.layer == 3 && l3.peer_ip.is_none() {
+            bail!("l3.peer_ip is required for layer = 3 (e.g. \"10.10.0.2\")");
+        }
+        if let Some(local_ip) = &l3.local_ip {
+            parse_cidr(local_ip)
+                .with_context(|| format!("l3.local_ip is not a valid CIDR: {local_ip}"))?;
+        }
+        if let Some(peer_ip) = &l3.peer_ip {
+            peer_ip
+                .parse::<std::net::IpAddr>()
+                .with_context(|| format!("l3.peer_ip is not a valid IP address: {peer_ip}"))?;
+        }
+        if let Some(iface) = &l3.iface {
+            // Interface names are bounded (IFNAMSIZ is 16, including the NUL).
+            if iface.is_empty() || iface.len() > 15 || iface.contains(['/', ' ']) {
+                bail!("l3.iface must be a valid interface name (1-15 chars, no '/' or space)");
+            }
+        }
         if !L3_MTU.contains(&l3.mtu) {
             bail!(
                 "l3.mtu must be between {} and {}",
@@ -3434,5 +3472,22 @@ keepalive_secs = 1
         // FEC range.
         let err = parse_err(&l3_cfg(&format!("{L3_OK}fec_data = 100\nfec_parity = 3\n")));
         assert!(err.contains("fec_parity between"), "{err}");
+        // layer must be 2 or 3.
+        let err = parse_err(&l3_cfg(&format!("{L3_OK}layer = 4\n")));
+        assert!(err.contains("l3.layer"), "{err}");
+    }
+
+    #[cfg(feature = "l3")]
+    #[test]
+    fn l3_layer2_may_omit_addresses() {
+        // A layer-2 (GRETAP) tunnel can come up address-less to be bridged.
+        let body = "mode = \"listen\"\naddr = \"0.0.0.0:51820\"\nlayer = 2\ncarrier = \"udp\"\n";
+        let c = Config::parse(&l3_cfg(body)).unwrap();
+        let l3 = c.l3.unwrap();
+        assert_eq!(l3.layer, 2);
+        assert!(l3.local_ip.is_none() && l3.peer_ip.is_none());
+        // Layer 3 still requires them.
+        let body3 = "mode = \"listen\"\naddr = \"0.0.0.0:51820\"\ncarrier = \"udp\"\n";
+        assert!(parse_err(&l3_cfg(body3)).contains("l3.local_ip is required"));
     }
 }

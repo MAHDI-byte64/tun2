@@ -12,6 +12,9 @@ const FLAG_KEY: u16 = 0x2000;
 const PROTO_IPV4: u16 = 0x0800;
 /// EtherType of an inner IPv6 packet.
 const PROTO_IPV6: u16 = 0x86DD;
+/// GRE protocol type for Transparent Ethernet Bridging (RFC 1701), i.e. the payload is a
+/// whole Ethernet frame — this is what makes a layer-2 tunnel a GRETAP.
+const PROTO_TEB: u16 = 0x6558;
 /// flags/version (2) + protocol (2) + key (4).
 pub const HEADER_LEN: usize = 8;
 
@@ -58,6 +61,35 @@ pub fn decode(packet: &[u8]) -> Option<(u32, &[u8])> {
         return None;
     }
     Some((key, inner))
+}
+
+/// Writes the GRE header for a whole Ethernet frame (Transparent Ethernet Bridging) and
+/// the frame into `out`. The layer-2 / GRETAP counterpart of [`encode`]; a frame is never
+/// inspected, so any Ethernet frame is carried.
+pub fn encode_eth(key: u32, frame: &[u8], out: &mut Vec<u8>) {
+    out.reserve(HEADER_LEN + frame.len());
+    out.extend_from_slice(&FLAG_KEY.to_be_bytes());
+    out.extend_from_slice(&PROTO_TEB.to_be_bytes());
+    out.extend_from_slice(&key.to_be_bytes());
+    out.extend_from_slice(frame);
+}
+
+/// Parses a GRETAP packet, returning `(key, frame)`. Rejects anything but a version-0,
+/// Key-only header whose protocol type is Transparent Ethernet Bridging.
+pub fn decode_eth(packet: &[u8]) -> Option<(u32, &[u8])> {
+    if packet.len() < HEADER_LEN {
+        return None;
+    }
+    let flags = u16::from_be_bytes([packet[0], packet[1]]);
+    if flags != FLAG_KEY {
+        return None;
+    }
+    let proto = u16::from_be_bytes([packet[2], packet[3]]);
+    if proto != PROTO_TEB {
+        return None;
+    }
+    let key = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+    Some((key, &packet[HEADER_LEN..]))
 }
 
 #[cfg(test)]
@@ -126,5 +158,27 @@ mod tests {
         // Set the checksum bit: no longer the plain keyed header we accept.
         out[0] |= 0x80;
         assert!(decode(&out).is_none());
+    }
+
+    #[test]
+    fn roundtrip_ethernet_frame() {
+        // An arbitrary Ethernet frame (dst/src MAC, EtherType ARP, then payload): not an
+        // IP packet, so the IP path would reject it, but the GRETAP path carries it whole.
+        let frame = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+            0xde, 0xad, 0xbe, 0xef,
+        ];
+        let mut out = Vec::new();
+        encode_eth(0x0abc_def0, &frame, &mut out);
+        assert_eq!(out.len(), HEADER_LEN + frame.len());
+        // The IP decoder refuses it; the Ethernet decoder returns it.
+        assert!(decode(&out).is_none());
+        let (key, back) = decode_eth(&out).expect("decodes");
+        assert_eq!(key, 0x0abc_def0);
+        assert_eq!(back, &frame[..]);
+        // An IP-typed GRE packet is not a GRETAP one.
+        let mut ip = Vec::new();
+        encode(1, &ipv4(9), &mut ip);
+        assert!(decode_eth(&ip).is_none());
     }
 }

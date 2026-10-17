@@ -37,7 +37,7 @@ httparse = "1.10"
 # sockets / getifaddrs (nix). Both pinned to an MSRV-1.80-safe line: etherparse 0.17 has
 # no declared MSRV (the 1.83 bump is in 0.18); nix 0.29 declares rust-version 1.69.
 etherparse = { version = "0.17", optional = true }
-nix = { version = "0.29", default-features = false, features = ["net", "socket", "signal", "process"], optional = true }
+nix = { version = "0.29", default-features = false, features = ["net", "socket", "signal", "process", "ioctl"], optional = true }
 kcp = { version = "0.6.0", optional = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 # Pinned exactly: src/allocator.rs names an option by its index in this version.
@@ -77,14 +77,19 @@ rawlink = ["kcp", "dep:etherparse", "dep:nix"]
 # dials through. The supervisor uses nix for the process-group kill on teardown.
 helpers = ["dep:nix", "tokio/process"]
 # The [l3] / GRE direct-tunnel mode (Linux, root). Implies rawlink (MSS-clamp rules, and
-# the faketcp/icmp carriers). The TUN + netlink crates are added by the l3 unit, not the
-# scaffold (MSRV 1.80 could not be verified for them here — see the unit report).
+# the faketcp/icmp carriers). The TUN/TAP device is created with nix's TUNSETIFF ioctl
+# (nix is already a dep; the `ioctl` feature is enabled for it) and configured with the
+# `ip` iproute2 command — no netlink crate is added, so MSRV 1.80 is unaffected.
 l3 = ["rawlink"]
 # mimalloc as the global allocator of the kariz binary (musl's own is slow).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dev-dependencies]
 rcgen = "0.14"
+# The l3 end-to-end tests put each tunnel endpoint in its own network namespace (two TUN
+# devices cannot talk to each other inside one namespace, as the kernel routes locally);
+# `setns` enters a namespace on a test thread. nix 0.29 declares rust-version 1.69.
+nix = { version = "0.29", features = ["sched"] }
 
 [profile.release]
 opt-level = 3
