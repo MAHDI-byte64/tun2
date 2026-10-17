@@ -19,13 +19,15 @@ Unknown keys are errors, so a typo is caught rather than ignored.
 
 | Key | Values | Default | Notes |
 |---|---|---|---|
-| `transport` | `tcp`, `tcpmux`, `ws`, `wss`, `quic`, `kcp` | `tcp` | Same on both sides. See [Transports](transports.md). |
+| `transport` | `tcp`, `tcpmux`, `ws`, `wss`, `quic`, `kcp`, `stealth`, `wsmux`, `wssmux`, `udp`, `faketcp` (alias `pck`), `icmp` (alias `xdi`), `naive`, `xhttp`, `reality`, `auto` | `tcp` | Same on both sides. See [Transports](transports.md). `stealth`, `udp`, `faketcp`, `icmp` and the managed helpers force `encryption` on. `faketcp`, `icmp` are Linux + root. |
 | `listen` | `host:port` | | Listening side: entry in reverse mode, exit in direct mode. |
 | `remote` | `host:port` | | Dialing side: the other side's address (or a CDN edge). Resolved on every attempt. |
 | `token` | at least 16 characters | required | Same on both sides. Generate with `kariz token`. |
 | `encryption` | `auto`, `chacha20-poly1305`, `aes-256-gcm`, `none` | `auto` | `auto` dials with AES-256-GCM on CPUs with AES instructions, else ChaCha20-Poly1305, and accepts either. `none` only authenticates; set it on both sides or neither. `quic` always uses TLS 1.3: leave `auto`. |
 | `pool` | at least 1 | `8` | Reverse mode without mux: idle connections the exit keeps open. |
 | `speedtest` | `true`, `false` | `true` | The exit answers speed test streams from `kariz speedtest` on the entry side (at most 32 at once). They only produce, read and echo data. See [Speed test](speedtest.md). |
+| `fallback_transports` | a list of transport names | `[]` (off) | Transports the tunnel falls back to, in order, when the primary cannot be established (the primary is tried first). Same list, same order, on both sides. Cannot contain `auto` or `udp`, repeat the primary, or list a helper transport; not allowed with `transport = "auto"`. See [Transports](transports.md#transport-fallback). |
+| `fallback_dwell_secs` | at least 10 | `60` | How long each fallback candidate is held while it tries to connect. |
 
 ## `[tunnel.mux]`
 
@@ -94,6 +96,82 @@ root certificates.
 | `fast` | off | 30 ms | 2 | off |
 | `fast2` | on | 20 ms | 2 | off |
 | `fast3` | on | 10 ms | 2 | off |
+
+`[tunnel.kcp]` also applies to the KCP carriers `udp`, `faketcp` and `icmp`.
+
+## `[tunnel.stealth]` (`stealth`)
+
+Record-length padding and timing jitter; applied only to stealth links, so no other
+transport's wire is touched.
+
+| Key | Values | Default | Notes |
+|---|---|---|---|
+| `padding` | `true`, `false` | `true` | Add random padding inside each AEAD record so record sizes do not leak the traffic shape. |
+| `pad_max` | 1 - 4096 | `256` | Largest padding added to a record, in bytes. |
+| `jitter_ms` | 0 - 1000 | `0` | Random delay before flushing a record, in milliseconds. Costs latency; leave at 0 unless a timing classifier is the concern. |
+
+## `[tunnel.faketcp]` (`faketcp`)
+
+The raw-socket fake-TCP carrier. Linux + root (CAP_NET_RAW); all keys optional.
+
+| Key | Values | Default | Notes |
+|---|---|---|---|
+| `flags` | `A`, `PA`, `PA,A`, `PA,A,PA,PAU` | `PA` | This end's TCP flag pattern; each end sets only its own. |
+| `interface` | name | auto | Override the auto-detected egress interface (for virtualised networks). |
+| `gateway_mac` | `aa:bb:cc:dd:ee:ff` | auto | Override the auto-detected next-hop MAC. |
+| `manage_firewall` | `true`, `false` | `true` | Install and remove the RST-drop and NOTRACK iptables rules (RAII). Off: the tunnel still runs but is unreliable under load. |
+
+## `[tunnel.icmp]` (`icmp`)
+
+The raw ICMP-echo carrier. Linux + root.
+
+| Key | Values | Default | Notes |
+|---|---|---|---|
+| `manage_firewall` | `true`, `false` | `true` | Install and remove the iptables rules that suppress the kernel's automatic echo replies (RAII). Off: the tunnel still runs but pays an extra uplink. |
+
+## `[tunnel.helper]` (`naive`, `xhttp`, `reality`)
+
+Credentials and paths for a managed helper transport. Which keys are required depends on the
+transport and the side (acceptor vs dialer). All file paths must be absolute; `insecure` is
+not allowed. See [Transports](transports.md#managed-helper-transports-naive-xhttp-reality).
+
+| Key | Transport | Side | Notes |
+|---|---|---|---|
+| `binary` | all | both | Override the helper binary path. Default: the installed pinned path. |
+| `username`, `password` | `naive` | both | The naive credential. |
+| `uuid` | `xhttp`, `reality` | both | The VLESS client UUID, canonical form (`kariz helper uuid`). |
+| `path` | `xhttp` | both | The HTTP path. |
+| `server_name` | `xhttp`, `reality` | both | The TLS server name (the cover host for `reality`). |
+| `host` | `xhttp` | dialer | The HTTP `Host` header. |
+| `short_id` | `reality` | both | Hex, even length, at most 16 characters. |
+| `private_key` | `reality` | acceptor | X25519 private key, base64url, 32 bytes (`kariz helper reality-keys`). |
+| `public_key` | `reality` | dialer | X25519 public key, base64url, 32 bytes. |
+| `target` | `reality` | acceptor | The cover target, `host:port`. |
+| `certificate`, `key` | `naive`, `xhttp` | acceptor | PEM certificate chain and private key for the helper's TLS. |
+| `ca_file` | all | dialer | Optional CA bundle (PEM) to verify the helper server against. |
+
+## `[l3]` (the layer-3 / GRE direct tunnel)
+
+Present instead of the `[[forward]]` rules: the tunnel creates a TUN (or TAP) device and
+carries whole IP packets (or Ethernet frames), GRE-encapsulated and sealed inside the tunnel's
+own session. Linux only, root. See [Transports](transports.md#l3--gre-direct-tunnel).
+
+| Key | Values | Default | Notes |
+|---|---|---|---|
+| `mode` | `dial`, `listen` | required | `dial` reaches out; `listen` waits for the inbound connection. Either host may dial. |
+| `addr` | `host:port` | required | `listen`: the address to listen on. `dial`: the peer's address. |
+| `token` | at least 16 characters | `[tunnel].token` | Shared secret; defaults to the tunnel token. |
+| `layer` | `3`, `2` | `3` | `3`: a TUN device carrying IP packets. `2`: a TAP device carrying Ethernet frames (an encrypted GRETAP). |
+| `local_ip` | CIDR, e.g. `10.10.0.1/30` | required for `layer = 3` | This end's address on the tunnel. Optional for `layer = 2`. |
+| `peer_ip` | IP, e.g. `10.10.0.2` | required for `layer = 3` | The peer's address on the tunnel. Optional for `layer = 2`. |
+| `carrier` | `udp`, `quic`, `faketcp`, `icmp` | required | The carrier the sealed GRE packets ride. Reliable carriers are rejected (TCP-over-TCP meltdown). |
+| `gre_key` | a 32-bit number | `0` | RFC 2890 key; both ends compare it. Lets several logical tunnels share a carrier. |
+| `iface` | interface name | next free `kzN` | The device name to create. |
+| `mtu` | 576 - 1500 | `1400` | The TUN/TAP interface MTU. |
+| `fec_data`, `fec_parity` | 1-64 and 1-32, or both 0 | off | Reed-Solomon FEC over the carrier. |
+| `ports` | `[[l3.ports]]` rules | none | Optional port forwarding over the link (the `[[forward]]` syntax). |
+| `accept_udp` | `true`, `false` | `false` | Accept forwarded UDP over the link. |
+| `encap` | `gre` | `gre` | The encapsulation; both ends compare it. |
 
 ## `[[forward]]` (entry only)
 
@@ -186,4 +264,9 @@ errors itself and `journalctl -u kariz -p warning` shows only those.
 
 `transport`, `token`, mux on or off, `ws.path`, `quic.alpn`, `quic.obfs`, and `encryption = "none"`
 (both or neither). A mismatch fails the handshake with an error saying which setting
-differs, where the protocol can tell.
+differs, where the protocol can tell. For the managed helpers the shared credentials
+(`helper.uuid` / `username` / `short_id` / `server_name` and the matching key pair) must
+agree. `fallback_transports` must be the same list in the same order on both sides. For the
+`[l3]` mode, `carrier`, `layer`, `gre_key` and `encap` must match (the ends compare `encap`
+in the handshake and refuse a mismatch by name). The `[tunnel.stealth]` padding and jitter are
+per side and need not match.

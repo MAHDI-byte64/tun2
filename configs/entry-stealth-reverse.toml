@@ -1,0 +1,26 @@
+# Entry side (Iran), reverse mode, stealth transport: an encrypted TCP stream like `tcp`,
+# with random padding inside each AEAD record so record sizes do not leak the traffic
+# shape, and optional timing jitter. On the wire there is no handshake fingerprint and no
+# fixed bytes; on bad authentication the listening side stays silent and then drops the
+# connection. Encryption is mandatory (it cannot be "none"). Pair: exit-stealth-reverse.toml.
+role = "entry"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "stealth"
+listen = "0.0.0.0:3080"
+token = "CHANGE-ME-run-kariz-token"
+# encryption = "auto"              # mandatory for stealth; "none" is rejected
+
+[tunnel.stealth]
+padding = true                     # random padding inside the AEAD record (default on)
+pad_max = 256                      # largest padding added to a record, in bytes (1-4096)
+jitter_ms = 0                      # random delay before flushing a record, in ms (0 = none)
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"
+
+[log]
+level = "info"

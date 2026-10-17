@@ -1,0 +1,15 @@
+# Exit side (abroad), reverse mode, wsmux transport. Pair: entry-wsmux-reverse.toml.
+role = "exit"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "wsmux"
+remote = "ENTRY_SERVER_IP:8080"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.ws]
+path = "/ws"
+
+[log]
+level = "info"

@@ -1,0 +1,21 @@
+# Exit side, direct mode, wssmux with a self-signed certificate. Pair: entry-wssmux-direct.toml.
+# Make a certificate as in exit-wss-direct.toml, then put the output of
+# `kariz pin /etc/kariz/cert.pem` into the entry's pin_sha256.
+role = "exit"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "wssmux"
+listen = "0.0.0.0:443"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.ws]
+path = "/ws"
+
+[tunnel.tls]
+cert = "/etc/kariz/cert.pem"
+key = "/etc/kariz/key.pem"
+
+[log]
+level = "info"

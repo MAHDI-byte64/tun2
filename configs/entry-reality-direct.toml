@@ -1,0 +1,28 @@
+# Entry side, direct mode, reality transport: a managed helper running Xray on both ends,
+# carrying VLESS + REALITY + Vision with a Chrome fingerprint. REALITY borrows the TLS
+# handshake of a real cover site (no certificate of your own), so the connection is
+# indistinguishable from a browser visiting that site. Install first:
+# `kariz helper install xray`, and make a key pair with `kariz helper reality-keys`:
+# the public key goes on this dialing side, the private key on the acceptor.
+# Encryption is mandatory; TCP only. Pair: exit-reality-direct.toml.
+role = "entry"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "reality"
+remote = "EXIT_SERVER_IP:443"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.helper]
+uuid = "d7f34a40-c82f-46c3-a4bb-92755e60bc91"   # run: kariz helper uuid; same on both sides
+short_id = "ea040ef1b16585d4"                   # hex, even length, at most 16 chars; same on both sides
+server_name = "www.microsoft.com"              # the cover site both ends present
+public_key = "RDBxb2MPw2k6MSKhTXJKJ7YoD1v_nEhi-ho6dzCn1aY"  # from `kariz helper reality-keys`
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"
+
+[log]
+level = "info"

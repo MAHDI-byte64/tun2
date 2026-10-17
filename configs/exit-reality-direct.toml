@@ -1,0 +1,20 @@
+# Exit side, direct mode, reality transport: the acceptor runs the Xray REALITY server and
+# proxies the TLS handshake to the cover `target`. Pair: entry-reality-direct.toml.
+role = "exit"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "reality"
+listen = "0.0.0.0:443"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.helper]
+uuid = "d7f34a40-c82f-46c3-a4bb-92755e60bc91"
+short_id = "ea040ef1b16585d4"
+server_name = "www.microsoft.com"
+private_key = "CwpacYJtp9TBYh3_dcnXP9gY_rz6F6hQXB8a5PP__io"  # from `kariz helper reality-keys`
+target = "www.microsoft.com:443"               # the real cover site the handshake is borrowed from
+
+[log]
+level = "info"

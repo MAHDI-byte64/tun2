@@ -1,0 +1,29 @@
+# Entry side, the l3 / GRE direct-tunnel mode: instead of forwarding ports, Kariz creates
+# a TUN interface (kz0, kz1, ...) on each host and carries whole IP packets between them.
+# The GRE header and the inner packets are sealed INSIDE Kariz's own handshake + record
+# session and handed to a DPI-resistant carrier (never bare IP proto 47 on the wire).
+# This side listens; either host may dial, so both direct and reverse are possible.
+# Linux only, needs root (/dev/net/tun + CAP_NET_ADMIN). Reliable carriers are rejected
+# (udp | quic | faketcp | icmp only). Encryption is mandatory. Pair: exit-l3.toml.
+role = "entry"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+token = "CHANGE-ME-run-kariz-token"
+
+[l3]
+mode = "listen"                    # listen | dial (this side waits for the inbound connection)
+addr = "0.0.0.0:51820"
+layer = 3                          # 3: TUN, whole IP packets. 2: TAP, Ethernet frames (encrypted GRETAP)
+local_ip = "10.10.0.1/30"          # this end's address on the tunnel
+peer_ip = "10.10.0.2"              # the peer's address on the tunnel
+carrier = "udp"                    # udp | quic | faketcp | icmp
+mtu = 1400
+# gre_key = 0                      # RFC 2890 key; both ends compare it
+# fec_data = 10                    # Reed-Solomon FEC over the carrier (both unset = off)
+# fec_parity = 3
+# iface = "kz0"                    # default: the next free kzN
+
+[log]
+level = "info"

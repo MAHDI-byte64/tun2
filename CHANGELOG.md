@@ -2,10 +2,56 @@
 
 ## 2.7.0 (unreleased)
 
+Nine new transports, from padded TCP to protocols that borrow a real HTTPS site, and a new
+**direct layer-3 / GRE tunnel** that carries whole IP packets (or Ethernet frames) between two
+hosts — all sealed inside Kariz's own encryption, none of them sending anything in the clear on
+an untrusted path. The chooser and the transports page now cover which of them evade a network
+that fights back, and which have a UDP shape that such a network can throttle. Both sides of a
+tunnel need this version for any of the new transports.
+
 ### Added
 
-- New transports from BackPack: stealth, wsmux, wssmux, udp, faketcp, icmp, naive, xhttp, reality;
-  transport fallback.
+- **Nine new transports** (fifteen in all), each encrypted end to end like the rest:
+  - **`stealth`** — an encrypted TCP stream with **record-length padding** (random padding
+    inside each AEAD record so record sizes do not leak the traffic shape) and optional
+    **timing jitter**. No handshake fingerprint, no fixed bytes; the acceptor stays silent on
+    bad authentication. `[tunnel.stealth]`: `padding`, `pad_max`, `jitter_ms`.
+  - **`wsmux`** and **`wssmux`** — `ws` and `wss` with mux forced on, as `tcpmux` is to `tcp`.
+    Same `[tunnel.ws]` / `[tunnel.tls]` tables and CDN behaviour.
+  - **`udp`** — the tunnel rides plain sealed UDP datagrams; forwarded packets take the
+    unreliable datagram path (no retransmit), which suits real-time services. UDP forward rules
+    only.
+  - **`faketcp`** (alias `pck`) — the KCP stack over a raw-socket fake-TCP carrier; looks like a
+    TCP flow of random bytes. Linux + root. `[tunnel.faketcp]`, RAII iptables rules.
+  - **`icmp`** (alias `xdi`) — the KCP stack inside ICMP echo (ping), getting through where a
+    port is filtered. Linux + root. `[tunnel.icmp]`, RAII iptables rules.
+  - **`naive`**, **`xhttp`**, **`reality`** — managed external helpers (NaiveProxy / sing-box,
+    Xray) that give the tunnel a proven HTTPS disguise, with Kariz's own handshake, encryption
+    and mux run inside the helper stream. `reality` borrows a real cover site's TLS handshake.
+    `[tunnel.helper]` holds the credentials; install the pinned binaries with
+    `kariz helper install <naive|sing-box|xray>` (`kariz helper status`,
+    `kariz helper reality-keys`, `kariz helper uuid`).
+- **Direct layer-3 / GRE tunnel** (`[l3]`). Instead of forwarding ports, Kariz creates a TUN
+  interface (`kz0`, `kz1`, …) on each host and carries whole IP packets — a GRE tunnel (RFC 2784
+  header + RFC 2890 key) sealed inside the encrypted Kariz session, never bare IP proto 47 on the
+  wire. `layer = 2` carries Ethernet frames over a TAP instead (an encrypted GRETAP, for
+  bridging). Either host may dial (`mode = "dial" | "listen"`), only DPI-resistant carriers are
+  allowed (`udp`, `quic`, `faketcp`, `icmp`), MSS is clamped on TCP SYNs leaving the link, and
+  the device and its rules are torn down on stop. Linux + root. `[l3]`: `mode`, `addr`, `token`,
+  `layer`, `local_ip`, `peer_ip`, `carrier`, `gre_key`, `mtu`, `fec_data` / `fec_parity`,
+  `ports` / `accept_udp`.
+- **Transport fallback** (`[tunnel] fallback_transports`, `fallback_dwell_secs`). A tunnel can
+  fall back through an ordered list of transports when the primary cannot be established; both
+  sides use the same list, the active one is shown in the status and the panel. Unlike `auto`
+  (which picks among a fixed set), the list may include `wss`, `reality`, `faketcp` and the rest.
+- **Mandatory encryption** on the transports that have no transport-level crypto of their own
+  (`stealth`, `udp`, `faketcp`, `icmp`, the managed helpers and the `[l3]` mode): `encryption =
+  "none"` is rejected rather than left to the user.
+- **The panel** gained the new transports in the tunnel wizard, and a new *Direct L3 / GRE*
+  tunnel kind (carrier choice, an auto-picked `10.10.N.0/30` address block, token).
+- **Sample configs** for every new transport and an L3 pair, and the panel benchmark and speed
+  test cover them (root-only and helper-requiring ones are skipped with a clear reason when they
+  cannot run).
 
 ## 2.6.1 - 2026-10-16
 

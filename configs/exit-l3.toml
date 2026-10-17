@@ -1,0 +1,22 @@
+# Exit side, the l3 / GRE direct-tunnel mode. This side dials. Pair: entry-l3.toml.
+# Linux + root. The carrier, layer, gre_key and (for layer 3) the address block must
+# match the other side; local_ip / peer_ip are swapped.
+role = "exit"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+token = "CHANGE-ME-run-kariz-token"
+
+[l3]
+mode = "dial"                      # reach out to the listening side
+addr = "ENTRY_SERVER_IP:51820"
+layer = 3
+local_ip = "10.10.0.2/30"
+peer_ip = "10.10.0.1"
+carrier = "udp"
+mtu = 1400
+# gre_key = 0
+
+[log]
+level = "info"

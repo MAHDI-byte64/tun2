@@ -1,0 +1,13 @@
+# Exit side, direct mode, udp transport. Pair: entry-udp-direct.toml.
+# The listening side needs its UDP port reachable.
+role = "exit"
+mode = "direct"
+profile = "gaming"
+
+[tunnel]
+transport = "udp"
+listen = "0.0.0.0:51820"
+token = "CHANGE-ME-run-kariz-token"
+
+[log]
+level = "info"

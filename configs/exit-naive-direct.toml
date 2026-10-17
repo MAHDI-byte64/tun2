@@ -1,0 +1,21 @@
+# Exit side, direct mode, naive transport: the acceptor runs the sing-box naive inbound
+# and forwards authenticated traffic to Kariz's internal loopback listener.
+# Pair: entry-naive-direct.toml. Needs a TLS certificate (a real one, or a self-signed
+# pair as in exit-wss-direct.toml).
+role = "exit"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "naive"
+listen = "0.0.0.0:443"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.helper]
+username = "user"
+password = "pass"
+certificate = "/etc/kariz/cert.pem"
+key = "/etc/kariz/key.pem"
+
+[log]
+level = "info"

@@ -1,0 +1,16 @@
+# Exit side (abroad), reverse mode, faketcp transport. Linux + root. Pair: entry-faketcp-reverse.toml.
+role = "exit"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "faketcp"
+remote = "ENTRY_SERVER_IP:3080"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.faketcp]
+# flags = "PA"
+manage_firewall = true
+
+[log]
+level = "info"

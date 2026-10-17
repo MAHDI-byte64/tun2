@@ -1,0 +1,23 @@
+# Entry side, direct mode, udp transport: the tunnel itself rides plain UDP datagrams.
+# The KCP stack is used only for the token handshake and control; every forwarded packet
+# goes on the unreliable sealed datagram path (no retransmit, FEC off by default), which
+# suits real-time UDP services (games, WireGuard, voice). Only `protocol = "udp"` forward
+# rules are allowed, and a PROXY header is not (there is no stream to carry one). Every
+# datagram is sealed with a key from the token, so the port answers nothing else.
+# Encryption is mandatory. Pair: exit-udp-direct.toml.
+role = "entry"
+mode = "direct"
+profile = "gaming"
+
+[tunnel]
+transport = "udp"
+remote = "EXIT_SERVER_IP:51820"
+token = "CHANGE-ME-run-kariz-token"
+
+[[forward]]
+listen = "0.0.0.0:51820"           # WireGuard clients connect here
+target = "127.0.0.1:51820"         # the WireGuard server, as seen from the exit side
+protocol = "udp"                   # udp transport forwards UDP only
+
+[log]
+level = "info"

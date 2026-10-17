@@ -1,0 +1,28 @@
+# Entry side (Iran), reverse mode, faketcp transport (BackPack's `pck`): the KCP stack
+# over a raw-socket fake-TCP carrier. On the wire it looks like a one-way TCP flow of
+# random-looking bytes, with no real TCP state machine and no handshake fingerprint, so
+# it slips through middleboxes that only pass "TCP". Linux only, and needs root (or
+# CAP_NET_RAW) to open the raw socket. Kariz installs RST-drop and NOTRACK iptables rules
+# while the tunnel runs and removes them on stop. Encryption is mandatory.
+# Pair: exit-faketcp-reverse.toml.
+role = "entry"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "faketcp"              # alias: "pck"
+listen = "0.0.0.0:3080"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.faketcp]
+# flags = "PA"                     # this end's TCP flag pattern: A | PA | PA,A | PA,A,PA,PAU
+# interface = "eth0"               # override the auto-detected egress interface
+# gateway_mac = "aa:bb:cc:dd:ee:ff"# override the auto-detected next-hop MAC
+manage_firewall = true             # install/remove the RST-drop and NOTRACK rules (RAII)
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"
+
+[log]
+level = "info"

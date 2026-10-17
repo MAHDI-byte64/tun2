@@ -1,0 +1,27 @@
+# Entry side, direct mode, xhttp transport: a managed helper running Xray on both ends,
+# carrying VLESS over XHTTP (HTTP/2, stream-up) with TLS, so the tunnel looks like an
+# ordinary HTTPS site. Install first: `kariz helper install xray`. The dialing side (this
+# entry) runs the Xray client. Inside the stream Kariz runs its own handshake, record
+# encryption and mux. Encryption is mandatory; TCP only. Pair: exit-xhttp-direct.toml.
+role = "entry"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "xhttp"
+remote = "EXIT_SERVER_IP:443"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.helper]
+uuid = "d7f34a40-c82f-46c3-a4bb-92755e60bc91"   # run: kariz helper uuid; same on both sides
+path = "/xhttp"
+server_name = "www.example.com"
+host = "www.example.com"
+# ca_file = "/etc/kariz/ca.pem"
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"
+
+[log]
+level = "info"

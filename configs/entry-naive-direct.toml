@@ -1,0 +1,27 @@
+# Entry side, direct mode, naive transport: a managed HTTPS helper. The dialing side
+# (this entry) runs the official NaiveProxy client; the acceptor (the exit) runs a
+# sing-box naive inbound. Install the binary first: `kariz helper install naive` and
+# `kariz helper install sing-box`. Inside the helper's HTTP/2 stream Kariz still runs its
+# own handshake, record encryption and mux, so a proxy's half-close does not matter.
+# Encryption is mandatory; the helpers carry TCP only. Pair: exit-naive-direct.toml.
+role = "entry"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "naive"
+remote = "EXIT_SERVER_IP:443"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.helper]
+username = "user"                  # same credential on both sides
+password = "pass"
+# binary = "/usr/local/lib/kariz/helpers/naive/..."  # default: the installed pinned path
+# ca_file = "/etc/kariz/ca.pem"    # verify the acceptor's certificate against this bundle
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"           # TCP only; naive cannot forward UDP
+
+[log]
+level = "info"

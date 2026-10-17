@@ -10,7 +10,7 @@
 | [کار با پنل](using-the-panel.md) | مرور پنل وب: ورود، افزودن سرور، ساخت تانل، تماشا، امنیت |
 | [اسکریپت مدیر](manager.md) | نصب کاریز و پنل روی یک سرور و وصل کردن سرور به پنل |
 | [پنل وب](panel.md) | پنل، ویزارد تانل، نظارت، پشتیبان، به‌روزرسانی |
-| [ترنسپورت‌ها](transports.md) | `tcp`، `tcpmux`، `ws`، `wss`، `quic`، `kcp`: هرکدام چطور کار می‌کند و کی به کار می‌آید |
+| [ترنسپورت‌ها](transports.md) | `tcp`، `tcpmux`، `ws`، `wss`، `quic`، `kcp`، `stealth`، `wsmux`، `wssmux`، `udp`، `faketcp`، `icmp`، helperهای مدیریت‌شده (`naive`، `xhttp`، `reality`) و تانل L3 / GRE: هرکدام چطور کار می‌کند، مقاومتش در برابر DPI، و کی به کار می‌آید |
 | [پروفایل‌ها](profiles.md) | `balanced`، `ultraspeed`، `gaming` و تغییر مقدارهایشان |
 | [UDP و بازی](udp-and-games.md) | قانون‌های UDP، مسیر datagram، دوبل‌کردن بسته، DSCP |
 | [پشت CDN](CDN.md) | `ws` / `wss` از راه Cloudflare یا ArvanCloud |

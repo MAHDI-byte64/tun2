@@ -1,0 +1,15 @@
+# Exit side (abroad), reverse mode, icmp transport. Linux + root. Pair: entry-icmp-reverse.toml.
+role = "exit"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "icmp"
+remote = "ENTRY_SERVER_IP:3080"    # the entry's address; ICMP ignores the port
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.icmp]
+manage_firewall = true
+
+[log]
+level = "info"

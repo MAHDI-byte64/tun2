@@ -1,0 +1,20 @@
+# Exit side, direct mode, xhttp transport: the acceptor runs the Xray server.
+# Pair: entry-xhttp-direct.toml. Needs a TLS certificate.
+role = "exit"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "xhttp"
+listen = "0.0.0.0:443"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.helper]
+uuid = "d7f34a40-c82f-46c3-a4bb-92755e60bc91"
+path = "/xhttp"
+server_name = "www.example.com"
+certificate = "/etc/kariz/cert.pem"
+key = "/etc/kariz/key.pem"
+
+[log]
+level = "info"

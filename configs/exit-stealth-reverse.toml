@@ -1,0 +1,19 @@
+# Exit side (abroad), reverse mode, stealth transport. Pair: entry-stealth-reverse.toml.
+# The [tunnel.stealth] knobs are per side; the exit can set its own padding and jitter.
+role = "exit"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "stealth"
+remote = "ENTRY_SERVER_IP:3080"
+token = "CHANGE-ME-run-kariz-token"
+pool = 8
+
+[tunnel.stealth]
+padding = true
+# pad_max = 256
+# jitter_ms = 0
+
+[log]
+level = "info"

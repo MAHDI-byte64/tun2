@@ -1,0 +1,22 @@
+# Entry side (Iran), reverse mode, wsmux transport: exactly `ws` with mux forced on (as
+# `tcpmux` is to `tcp`), so a few long-lived WebSocket connections carry every user
+# connection. Use it behind a CDN or reverse proxy that talks plain HTTP to the origin.
+# Pair: exit-wsmux-reverse.toml.
+role = "entry"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "wsmux"                # mux cannot be turned off
+listen = "0.0.0.0:8080"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.ws]
+path = "/ws"                       # must match on both sides; anything else gets a 404
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"
+
+[log]
+level = "info"

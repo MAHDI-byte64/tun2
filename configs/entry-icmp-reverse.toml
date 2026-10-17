@@ -1,0 +1,24 @@
+# Entry side (Iran), reverse mode, icmp transport (BackPack's `xdi`): the KCP stack over
+# an ICMP echo request/reply carrier. The tunnel's bytes ride inside ping payloads, which
+# some networks pass even when TCP and UDP to a port are filtered. On the wire it is
+# random-looking bytes with no handshake fingerprint. Linux only, and needs root. Kariz
+# installs iptables rules that suppress the kernel's own echo replies while the tunnel
+# runs and removes them on stop. Encryption is mandatory. Pair: exit-icmp-reverse.toml.
+role = "entry"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "icmp"                 # alias: "xdi"
+listen = "0.0.0.0:3080"            # ICMP has no ports; the port is ignored, only the host is used
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.icmp]
+manage_firewall = true             # suppress the kernel's automatic echo replies (RAII)
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"
+
+[log]
+level = "info"

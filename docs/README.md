@@ -20,7 +20,7 @@ animated diagrams and a live demo of the panel, in English and Persian:
 | [Security review](security-review.md) | who is assumed to attack the panel, what was checked and fixed for 1.0, what is left |
 | [فارسی: مستندات به زبان فارسی](fa/README.md) | every page of this documentation in Persian |
 | [Private networks (GRE, VXLAN)](networks.md) | private addresses between your servers, made by the panel, never repeated |
-| [Transports](transports.md) | `tcp`, `tcpmux`, `ws`, `wss`, `quic`, `kcp`: how each works and when to pick it |
+| [Transports](transports.md) | `tcp`, `tcpmux`, `ws`, `wss`, `quic`, `kcp`, `stealth`, `wsmux`, `wssmux`, `udp`, `faketcp`, `icmp`, the managed helpers (`naive`, `xhttp`, `reality`) and the L3 / GRE tunnel: how each works, its DPI resistance, and when to pick it |
 | [Profiles](profiles.md) | `balanced`, `ultraspeed`, `gaming`, and overriding their values |
 | [UDP forwarding and games](udp-and-games.md) | UDP rules, the datagram path, packet duplication, DSCP |
 | [Performance](performance.md) | Measurements, tuning for speed, running the benchmarks |

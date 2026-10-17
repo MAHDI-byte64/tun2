@@ -6,6 +6,7 @@ const { lang } = Astro.props as { lang: Lang };
 const T = {
   en: {
     q: {
+      blocked: "Is the network actively blocking or fingerprinting the tunnel?",
       cdn: "Is there a CDN or reverse proxy between the two servers?",
       udp: "Does UDP reach the other server reliably?",
       lossy: "Is the path long or lossy (international, throttled)?",
@@ -18,6 +19,7 @@ const T = {
     pick: "Use",
     conf: "In the config",
     v: {
+      blocked: ["reality", "DPI is fingerprinting protocols, so blend in. `reality` is strongest: it borrows a real cover site's TLS handshake, indistinguishable from a browser visiting it. To blend into noise instead, use `stealth` (padded TCP), `faketcp` (raw TCP) or `icmp` (rides ping, gets through where a port is filtered). Raw `udp`, `quic` and `kcp` are encrypted but have a UDP shape a hostile network can throttle.", "The network fights back"],
       cdn: ["wss", "A CDN only carries HTTP, so the tunnel rides a WebSocket. Use `ws` if the CDN talks plain HTTP to your server.", "Through a CDN or reverse proxy"],
       "udp-games": ["kcp", "Games and voice want low, steady latency on a path where UDP works. FEC rebuilds lost packets without a resend.", "UDP works, for games or voice"],
       "udp-lossy": ["kcp", "TCP halves its rate on every loss; KCP keeps its speed. `quic` with BBR is the other choice; if the network recognises QUIC, set `obfs = true` under `[tunnel.quic]` on both sides.", "UDP works, the path is lossy"],
@@ -26,10 +28,11 @@ const T = {
       "noudp-games": ["tcpmux", "UDP is not an option, so tcpmux with the gaming profile is the next best for latency.", "No UDP, for games or voice"],
       noudp: ["tcpmux", "Fewer connections between the servers, all user connections over a few long-lived ones.", "No UDP, a plain path"],
     },
-    note: "Same on both sides: the transport is one line, and it must match.",
+    note: "Same on both sides: the transport is one line, and it must match. On a UDP-hostile network prefer the evasive transports (stealth, faketcp, icmp, reality) over raw udp / quic / kcp.",
   },
   fa: {
     q: {
+      blocked: "شبکه فعالانه تانل را می‌بندد یا fingerprint می‌کند؟",
       cdn: "بین دو سرور CDN یا reverse proxy هست؟",
       udp: "UDP به‌طور قابل‌اعتماد به سرور دیگر می‌رسد؟",
       lossy: "مسیر طولانی یا پراتلاف است (بین‌المللی، محدودشده)؟",
@@ -42,6 +45,7 @@ const T = {
     pick: "استفاده کنید از",
     conf: "در کانفیگ",
     v: {
+      blocked: ["reality", "DPI پروتکل‌ها را می‌شناسد، پس گم شوید. `reality` قوی‌ترین است: handshakeِ TLS یک سایت پوششی واقعی را قرض می‌گیرد و از مرورگری که به آن سایت می‌رود قابل‌تشخیص نیست. برای گم شدن در نویز، `stealth` (TCPِ padding‌خورده)، `faketcp` (TCP خام) یا `icmp` (روی ping سوار می‌شود و جایی که پورت بسته است رد می‌شود). `udp`، `quic` و `kcp` خام رمزشده‌اند ولی شکل UDP دارند که شبکهٔ خصم می‌تواند throttle‌شان کند.", "شبکه مقابله می‌کند"],
       cdn: ["wss", "CDN فقط HTTP می‌برد، پس تانل روی WebSocket سوار می‌شود. اگر CDN با سرور شما ساده HTTP حرف می‌زند، `ws` را بگذارید.", "از پشت CDN یا reverse proxy"],
       "udp-games": ["kcp", "بازی و صدا تأخیر کم و پایدار می‌خواهند و UDP کار می‌کند. FEC بسته‌های گم‌شده را بدون ارسال دوباره می‌سازد.", "UDP کار می‌کند، برای بازی یا صدا"],
       "udp-lossy": ["kcp", "TCP با هر اتلاف سرعتش را نصف می‌کند، ولی KCP سرعتش را نگه می‌دارد. گزینهٔ دیگر `quic` با BBR است؛ اگر شبکه QUIC را می‌شناسد و فیلتر می‌کند، `obfs = true` را زیر `[tunnel.quic]` روی هر دو سمت بگذارید.", "UDP کار می‌کند، مسیر پراتلاف است"],
@@ -50,7 +54,7 @@ const T = {
       "noudp-games": ["tcpmux", "UDP گزینه نیست، پس tcpmux با پروفایل gaming بهترین گزینهٔ بعدی برای تأخیر است.", "بدون UDP، برای بازی یا صدا"],
       noudp: ["tcpmux", "اتصال کمتر بین دو سرور؛ همهٔ اتصال‌های کاربرها روی چند اتصال بلندمدت.", "بدون UDP، مسیر ساده"],
     },
-    note: "روی هر دو طرف یکسان: ترنسپورت یک خط است و باید یکی باشد.",
+    note: "روی هر دو طرف یکسان: ترنسپورت یک خط است و باید یکی باشد. روی شبکهٔ خصمِ UDP، ترنسپورت‌های عبوردهنده (stealth، faketcp، icmp، reality) را به udp / quic / kcp خام ترجیح بدهید.",
   },
 }[lang];
 const keys = Object.keys(T.v) as (keyof typeof T.v)[];
@@ -58,6 +62,7 @@ const snippet = (k: string, transport: string) =>
   k === "udp-games" || k === "noudp-games" ? `profile = "gaming"\n\n[tunnel]\ntransport = "${transport}"` : `[tunnel]\ntransport = "${transport}"`;
 const q = (name: keyof typeof T.q, opts: [string, string][], checked: string) => ({ name, text: T.q[name], opts, checked });
 const questions = [
+  q("blocked", [["yes", T.yes], ["no", T.no]], "no"),
   q("cdn", [["yes", T.yes], ["no", T.no]], "no"),
   q("udp", [["yes", T.yes], ["no", T.unsure]], "yes"),
   q("lossy", [["yes", T.yes], ["no", T.no]], "yes"),
@@ -102,18 +107,21 @@ const questions = [
     const val = (n: string) => box.querySelector<HTMLInputElement>(`input[name="ch-${n}"]:checked`)?.value;
     const fs = (n: string) => box.querySelector<HTMLFieldSetElement>(`[data-q="${n}"]`)!;
     const update = () => {
+      const blocked = val("blocked") === "yes";
       const cdn = val("cdn") === "yes";
       const udp = val("udp") === "yes";
       const lossy = val("lossy") === "yes";
       const games = val("games") === "yes";
       const https = val("https") === "yes";
-      // A question that does not change the answer is set aside, not hidden.
-      fs("udp").disabled = cdn;
-      fs("lossy").disabled = cdn || !udp;
-      fs("games").disabled = cdn;
-      fs("https").disabled = cdn || udp;
-      for (const n of ["udp", "lossy", "games", "https"]) fs(n).style.opacity = fs(n).disabled ? "0.45" : "1";
-      const key = cdn ? "cdn" : udp ? (games ? "udp-games" : lossy ? "udp-lossy" : "udp-clean") : https ? "noudp-https" : games ? "noudp-games" : "noudp";
+      // A question that does not change the answer is set aside, not hidden. When the
+      // network fights back, the evasion verdict stands on its own.
+      fs("cdn").disabled = blocked;
+      fs("udp").disabled = blocked || cdn;
+      fs("lossy").disabled = blocked || cdn || !udp;
+      fs("games").disabled = blocked || cdn;
+      fs("https").disabled = blocked || cdn || udp;
+      for (const n of ["cdn", "udp", "lossy", "games", "https"]) fs(n).style.opacity = fs(n).disabled ? "0.45" : "1";
+      const key = blocked ? "blocked" : cdn ? "cdn" : udp ? (games ? "udp-games" : lossy ? "udp-lossy" : "udp-clean") : https ? "noudp-https" : games ? "noudp-games" : "noudp";
       box.querySelectorAll<HTMLElement>("[data-key]").forEach((v) => (v.hidden = v.dataset.key !== key));
     };
     box.addEventListener("change", update);
