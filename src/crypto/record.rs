@@ -10,15 +10,18 @@
 //! Each direction has its own key, so a counter never repeats under the same key.
 //! Reordered, replayed, truncated or modified records fail to open and end the stream.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::Sleep;
 
 use super::handshake::Key;
-use super::Cipher;
+use super::{random_below, Cipher};
 
 /// Largest payload in one record.
 pub const MAX_PAYLOAD: usize = 0x3fff;
@@ -30,6 +33,21 @@ pub const MAX_RECORD: usize = HEADER_LEN + MAX_PAYLOAD + AEAD_TAG_LEN;
 const WRITE_BATCH: usize = 4 * MAX_PAYLOAD;
 /// Ciphertext read buffer: room for a few records per read.
 const READ_BUFFER: usize = 4 * MAX_RECORD;
+/// Bytes a padded (stealth) record spends on the trailing padding-length field.
+const PAD_LEN_FIELD: usize = 2;
+
+/// Record-layer traffic shaping for a `stealth` link. Both ends of a stealth link set it
+/// the same way (it is not negotiated on the wire); other transports never use it, so
+/// their records stay byte-identical.
+///
+/// `pad_max == 0` turns padding off; a zero `jitter` turns the inter-write delay off.
+#[derive(Debug, Clone, Copy)]
+pub struct Shaping {
+    /// Largest random padding appended inside a record, in bytes (0 = no padding).
+    pub pad_max: u16,
+    /// Random delay before a batch of records is flushed (zero = none).
+    pub jitter: Duration,
+}
 
 pub(super) fn algorithm(cipher: Cipher) -> io::Result<&'static aead::Algorithm> {
     match cipher {
@@ -67,23 +85,71 @@ impl Direction {
 }
 
 /// Seals records for one direction.
-pub struct Sealer(Direction);
+pub struct Sealer {
+    dir: Direction,
+    /// Upper bound on random bytes appended inside each record (0 = off, non-stealth).
+    pad_max: u16,
+    /// Random delay the write path adds before flushing records (zero = off).
+    jitter: Duration,
+}
 
 impl Sealer {
     pub fn new(cipher: Cipher, key: &Key) -> io::Result<Self> {
-        Direction::new(cipher, key).map(Self)
+        Direction::new(cipher, key).map(|dir| Self {
+            dir,
+            pad_max: 0,
+            jitter: Duration::ZERO,
+        })
     }
 
-    /// Appends one record carrying `payload` (at most [`MAX_PAYLOAD`] bytes) to `out`.
+    /// A sealer for a `stealth` link: it adds up to `shaping.pad_max` random bytes of
+    /// padding inside each record, and the write path delays flushes by up to
+    /// `shaping.jitter`. With `pad_max == 0` the wire stays byte-identical to [`Self::new`].
+    pub fn stealth(cipher: Cipher, key: &Key, shaping: Shaping) -> io::Result<Self> {
+        Direction::new(cipher, key).map(|dir| Self {
+            dir,
+            pad_max: shaping.pad_max,
+            jitter: shaping.jitter,
+        })
+    }
+
+    /// Largest plaintext this sealer puts in one record, leaving room for the padding it
+    /// may add. [`MAX_PAYLOAD`] when padding is off.
+    pub fn max_chunk(&self) -> usize {
+        if self.pad_max == 0 {
+            MAX_PAYLOAD
+        } else {
+            MAX_PAYLOAD - PAD_LEN_FIELD - self.pad_max as usize
+        }
+    }
+
+    /// The write path's inter-write delay (zero when off).
+    pub fn jitter(&self) -> Duration {
+        self.jitter
+    }
+
+    /// Appends one record carrying `payload` (at most [`Self::max_chunk`] bytes) to `out`.
     pub fn seal(&mut self, payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         self.seal_parts(&[payload], out)
     }
 
     /// Like [`Sealer::seal`], with the payload given as consecutive pieces.
     pub fn seal_parts(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> io::Result<()> {
-        let len: usize = parts.iter().map(|p| p.len()).sum();
+        let data: usize = parts.iter().map(|p| p.len()).sum();
+        // On a stealth link the record also carries `pad` random bytes and a 2-byte length
+        // so the receiver can strip them; the length field hides the real size.
+        let pad = if self.pad_max == 0 {
+            0
+        } else {
+            random_below(u32::from(self.pad_max) + 1)? as usize
+        };
+        let len = if self.pad_max == 0 {
+            data
+        } else {
+            data + pad + PAD_LEN_FIELD
+        };
         debug_assert!(len <= MAX_PAYLOAD);
-        let d = &mut self.0;
+        let d = &mut self.dir;
         let start = out.len();
         out.extend_from_slice(&(len as u16).to_be_bytes());
         let nonce = d.next_nonce()?;
@@ -97,6 +163,12 @@ impl Sealer {
         for p in parts {
             out.extend_from_slice(p);
         }
+        if self.pad_max != 0 {
+            let pad_start = out.len();
+            out.resize(pad_start + pad, 0);
+            getrandom::fill(&mut out[pad_start..]).map_err(io::Error::other)?;
+            out.extend_from_slice(&(pad as u16).to_be_bytes());
+        }
         let nonce = d.next_nonce()?;
         let tag = d
             .key
@@ -108,16 +180,29 @@ impl Sealer {
 }
 
 /// Opens records for one direction.
-pub struct Opener(Direction);
+pub struct Opener {
+    dir: Direction,
+    /// Strip the trailing padding a stealth sealer adds. Set to match the peer's sealer.
+    stealth: bool,
+}
 
 impl Opener {
     pub fn new(cipher: Cipher, key: &Key) -> io::Result<Self> {
-        Direction::new(cipher, key).map(Self)
+        Direction::new(cipher, key).map(|dir| Self {
+            dir,
+            stealth: false,
+        })
+    }
+
+    /// An opener for a `stealth` link whose peer pads: it strips the padding each record
+    /// carries. Pair it with a peer [`Sealer::stealth`] whose `pad_max` is non-zero.
+    pub fn stealth(cipher: Cipher, key: &Key) -> io::Result<Self> {
+        Direction::new(cipher, key).map(|dir| Self { dir, stealth: true })
     }
 
     /// Opens a record header in place and returns the payload length.
     fn open_header(&mut self, header: &mut [u8]) -> io::Result<usize> {
-        let d = &mut self.0;
+        let d = &mut self.dir;
         let nonce = d.next_nonce()?;
         let plain = d
             .key
@@ -130,14 +215,25 @@ impl Opener {
         Ok(len)
     }
 
-    /// Opens a record payload (ciphertext plus tag) in place.
-    fn open_payload(&mut self, payload: &mut [u8]) -> io::Result<()> {
-        let d = &mut self.0;
+    /// Opens a record payload (ciphertext plus tag) in place and returns how many leading
+    /// bytes are real data: all of it, or, on a stealth link, what is left once the
+    /// trailing padding and its length field are stripped.
+    fn open_payload(&mut self, payload: &mut [u8]) -> io::Result<usize> {
+        let d = &mut self.dir;
         let nonce = d.next_nonce()?;
-        d.key
+        let plain = d
+            .key
             .open_in_place(nonce, Aad::empty(), payload)
             .map_err(|_| bad_record())?;
-        Ok(())
+        if !self.stealth {
+            return Ok(plain.len());
+        }
+        let len = plain.len();
+        if len < PAD_LEN_FIELD {
+            return Err(bad_record());
+        }
+        let pad = u16::from_be_bytes([plain[len - 2], plain[len - 1]]) as usize;
+        len.checked_sub(PAD_LEN_FIELD + pad).ok_or_else(bad_record)
     }
 }
 
@@ -232,12 +328,14 @@ impl ReadState {
             let record = &mut self.rbuf[self.rstart..self.rstart + need];
             match self.pending_len {
                 None => self.pending_len = Some(opener.open_header(record)?),
-                Some(len) => {
-                    opener.open_payload(record)?;
+                Some(_) => {
+                    // The record holds `need - AEAD_TAG_LEN` plaintext bytes; `open_payload`
+                    // reports how many of them are real data (padding, if any, is stripped).
+                    let data = opener.open_payload(record)?;
                     self.early = None;
                     self.pending_len = None;
                     self.plain_start = self.rstart;
-                    self.plain_end = self.rstart + len;
+                    self.plain_end = self.rstart + data;
                 }
             }
             self.rstart += need;
@@ -251,15 +349,43 @@ struct WriteState {
     /// Sealed records not yet written to the inner stream, from `wpos`.
     wbuf: Vec<u8>,
     wpos: usize,
+    /// Stealth inter-write delay (zero = off), copied from the sealer.
+    jitter: Duration,
+    /// The pending delay for the current batch, armed once it is chosen.
+    sleep: Option<Pin<Box<Sleep>>>,
+    /// Whether the current batch's delay has already elapsed, so a mid-batch wakeup does
+    /// not pick a fresh one.
+    delayed: bool,
 }
 
 impl WriteState {
     fn new(sealer: Sealer) -> Self {
+        let jitter = sealer.jitter();
         Self {
             sealer,
             wbuf: Vec::new(),
             wpos: 0,
+            jitter,
+            sleep: None,
+            delayed: false,
         }
+    }
+
+    /// Waits out the batch's random delay. Chosen once (0..=`jitter`) and held across
+    /// wakeups until it elapses.
+    fn poll_jitter(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.sleep.is_none() {
+            let ms = random_below(self.jitter.as_millis() as u32 + 1).unwrap_or(0);
+            if ms == 0 {
+                return Poll::Ready(());
+            }
+            self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+                u64::from(ms),
+            ))));
+        }
+        ready!(self.sleep.as_mut().unwrap().as_mut().poll(cx));
+        self.sleep = None;
+        Poll::Ready(())
     }
 
     /// Writes out sealed records that are still buffered.
@@ -269,6 +395,11 @@ impl WriteState {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         while self.wpos < self.wbuf.len() {
+            // Delay this batch once, before its first byte goes out (stealth only).
+            if !self.jitter.is_zero() && !self.delayed {
+                ready!(self.poll_jitter(cx));
+                self.delayed = true;
+            }
             let n = ready!(Pin::new(&mut *inner).poll_write(cx, &self.wbuf[self.wpos..]))?;
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
@@ -277,6 +408,7 @@ impl WriteState {
         }
         self.wbuf.clear();
         self.wpos = 0;
+        self.delayed = false;
         Poll::Ready(Ok(()))
     }
 
@@ -305,7 +437,7 @@ impl WriteState {
             return Poll::Ready(Ok(0));
         }
         let take = buf.len().min(WRITE_BATCH);
-        for chunk in buf[..take].chunks(MAX_PAYLOAD) {
+        for chunk in buf[..take].chunks(self.sealer.max_chunk()) {
             self.sealer.seal(chunk, &mut self.wbuf)?;
         }
         self.finish_write(inner, cx, take)
@@ -320,6 +452,7 @@ impl WriteState {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         ready!(self.poll_buffered(inner, cx))?;
+        let max_chunk = self.sealer.max_chunk();
         let mut parts: Vec<&[u8]> = Vec::new();
         let mut in_record = 0;
         let mut taken = 0;
@@ -331,13 +464,13 @@ impl WriteState {
                 }
                 let n = buf
                     .len()
-                    .min(MAX_PAYLOAD - in_record)
+                    .min(max_chunk - in_record)
                     .min(WRITE_BATCH - taken);
                 parts.push(&buf[..n]);
                 buf = &buf[n..];
                 in_record += n;
                 taken += n;
-                if in_record == MAX_PAYLOAD {
+                if in_record == max_chunk {
                     self.sealer.seal_parts(&parts, &mut self.wbuf)?;
                     parts.clear();
                     in_record = 0;
@@ -541,6 +674,36 @@ mod tests {
             b,
             Sealer::new(cipher, &K2).unwrap(),
             Opener::new(cipher, &K1).unwrap(),
+            None,
+        );
+        (a, b)
+    }
+
+    /// A stealth stream pair with `shaping` on both ends (the opener strips padding only
+    /// when the peer pads), as [`crate::channel::Link`] builds it.
+    fn stealth_pair(
+        cipher: Cipher,
+        pipe: usize,
+        shaping: Shaping,
+    ) -> (SecureStream<DuplexStream>, SecureStream<DuplexStream>) {
+        let (a, b) = tokio::io::duplex(pipe);
+        let opener = |key: &Key| {
+            if shaping.pad_max > 0 {
+                Opener::stealth(cipher, key)
+            } else {
+                Opener::new(cipher, key)
+            }
+        };
+        let a = SecureStream::new(
+            a,
+            Sealer::stealth(cipher, &K1, shaping).unwrap(),
+            opener(&K2).unwrap(),
+            None,
+        );
+        let b = SecureStream::new(
+            b,
+            Sealer::stealth(cipher, &K2, shaping).unwrap(),
+            opener(&K1).unwrap(),
             None,
         );
         (a, b)
@@ -763,5 +926,103 @@ mod tests {
     #[tokio::test]
     async fn empty_stream_is_a_clean_eof() {
         assert!(read_wire(&[], None).await.unwrap().is_empty());
+    }
+
+    /// A non-stealth record keeps its exact framing (header + payload + tag, no padding),
+    /// so every other transport's wire is untouched.
+    #[test]
+    fn non_stealth_records_have_no_padding() {
+        let mut s = Sealer::new(Cipher::Aes256Gcm, &K1).unwrap();
+        assert_eq!(s.max_chunk(), MAX_PAYLOAD);
+        assert_eq!(s.jitter(), Duration::ZERO);
+        for len in [0usize, 1, 100, MAX_PAYLOAD] {
+            let mut out = Vec::new();
+            s.seal(&pattern(len), &mut out).unwrap();
+            assert_eq!(out.len(), HEADER_LEN + len + AEAD_TAG_LEN, "len {len}");
+        }
+    }
+
+    /// Stealth padding varies a record's size and never exceeds `pad_max`.
+    #[test]
+    fn stealth_padding_varies_size_and_is_bounded() {
+        let shaping = Shaping {
+            pad_max: 256,
+            jitter: Duration::ZERO,
+        };
+        let mut s = Sealer::stealth(Cipher::Aes256Gcm, &K1, shaping).unwrap();
+        assert_eq!(s.max_chunk(), MAX_PAYLOAD - PAD_LEN_FIELD - 256);
+        let payload = pattern(100);
+        let mut sizes = std::collections::BTreeSet::new();
+        for _ in 0..300 {
+            let mut out = Vec::new();
+            s.seal(&payload, &mut out).unwrap();
+            // payload record = len + tag; len = data + pad + the 2-byte pad-length field.
+            let len = out.len() - HEADER_LEN - AEAD_TAG_LEN;
+            let pad = len - payload.len() - PAD_LEN_FIELD;
+            assert!(pad <= shaping.pad_max as usize, "pad {pad} over max");
+            sizes.insert(out.len());
+        }
+        assert!(
+            sizes.len() > 30,
+            "padding should vary the record size: {} distinct",
+            sizes.len()
+        );
+    }
+
+    /// Padded data round-trips intact across record and read splits, for both ciphers and
+    /// data far larger than one record.
+    #[tokio::test]
+    async fn stealth_padding_round_trips() {
+        for cipher in [Cipher::Chacha20Poly1305, Cipher::Aes256Gcm] {
+            let shaping = Shaping {
+                pad_max: 300,
+                jitter: Duration::ZERO,
+            };
+            for (pipe, chunk, len) in [
+                (7, 1, 3_000),
+                (64, 1000, 100_000),
+                (1 << 16, 200_000, 300_000),
+            ] {
+                let (a, b) = stealth_pair(cipher, pipe, shaping);
+                let data = pattern(len);
+                assert_eq!(
+                    transfer(a, b, data.clone(), chunk).await,
+                    data,
+                    "{cipher:?} {pipe} {chunk}"
+                );
+            }
+        }
+    }
+
+    /// With jitter off the write path adds no delay (and no padding changes correctness).
+    #[tokio::test]
+    async fn jitter_disabled_adds_no_delay() {
+        let shaping = Shaping {
+            pad_max: 0,
+            jitter: Duration::ZERO,
+        };
+        let (mut a, mut b) = stealth_pair(Cipher::Aes256Gcm, 1 << 16, shaping);
+        let start = std::time::Instant::now();
+        a.write_all(b"hello stealth").await.unwrap();
+        a.flush().await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "no jitter must not delay the flush"
+        );
+        let mut got = vec![0u8; 13];
+        b.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello stealth");
+    }
+
+    /// With jitter on, writes are delayed yet the data still arrives in order and intact.
+    #[tokio::test]
+    async fn stealth_jitter_still_round_trips() {
+        let shaping = Shaping {
+            pad_max: 64,
+            jitter: Duration::from_millis(5),
+        };
+        let (a, b) = stealth_pair(Cipher::Chacha20Poly1305, 1 << 16, shaping);
+        let data = pattern(20_000);
+        assert_eq!(transfer(a, b, data.clone(), 500).await, data);
     }
 }

@@ -12,6 +12,7 @@ use std::io;
 use crate::config::Encryption;
 
 pub use handshake::{Psk, ReplayFilter};
+pub use record::Shaping;
 
 /// Record cipher chosen by the dialing side and sent in the (authenticated) hello.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,8 @@ pub struct Crypto {
     encryption: Encryption,
     cipher: Cipher,
     mux: bool,
+    /// Record-layer shaping for a `stealth` link; `None` on every other transport.
+    stealth: Option<Shaping>,
 }
 
 impl Crypto {
@@ -102,6 +105,7 @@ impl Crypto {
             encryption,
             cipher: Cipher::for_config(encryption),
             mux: false,
+            stealth: None,
         }
     }
 
@@ -111,8 +115,20 @@ impl Crypto {
         self
     }
 
+    /// The record-layer shaping of a `stealth` link (padding and timing jitter); `None`
+    /// leaves the record layer unshaped, as every other transport uses it.
+    pub fn with_stealth(mut self, stealth: Option<Shaping>) -> Self {
+        self.stealth = stealth;
+        self
+    }
+
     pub fn mux(&self) -> bool {
         self.mux
+    }
+
+    /// The record-layer shaping to apply, if this is a stealth link.
+    pub fn shaping(&self) -> Option<Shaping> {
+        self.stealth
     }
 
     pub fn psk(&self) -> &Psk {

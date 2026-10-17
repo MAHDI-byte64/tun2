@@ -233,7 +233,10 @@ fn common(toml: String) -> io::Result<Common> {
     let config = Config::parse(&toml)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:#}")))?;
     let mux = config.mux();
-    let crypto = Crypto::new(&config.tunnel.token, config.tunnel.encryption).with_mux(true);
+    let settings = Settings::new(&config.tunnel, config.kcp());
+    let crypto = Crypto::new(&config.tunnel.token, config.tunnel.encryption)
+        .with_mux(true)
+        .with_stealth(settings.stealth.as_ref().map(|s| s.shaping()));
     let tuning = config.tuning();
     #[cfg(feature = "quic")]
     let quic = if config.tunnel.transport == TransportKind::Quic {
@@ -245,7 +248,7 @@ fn common(toml: String) -> io::Result<Common> {
     Ok(Common {
         crypto,
         tuning,
-        settings: Settings::new(&config.tunnel, config.kcp()),
+        settings,
         sessions: SessionConfig::new(&mux),
         #[cfg(feature = "quic")]
         quic,

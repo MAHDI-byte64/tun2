@@ -77,7 +77,9 @@ pub async fn run(config: Config) -> Result<()> {
     let mux = config.mux();
     let transport = Settings::new(&config.tunnel, config.kcp());
     let exit = Arc::new(Exit {
-        crypto: Crypto::new(&config.tunnel.token, config.tunnel.encryption).with_mux(mux.enabled),
+        crypto: Crypto::new(&config.tunnel.token, config.tunnel.encryption)
+            .with_mux(mux.enabled)
+            .with_stealth(transport.stealth.as_ref().map(|s| s.shaping())),
         tuning: tuning.clone(),
         speedtest: config
             .tunnel

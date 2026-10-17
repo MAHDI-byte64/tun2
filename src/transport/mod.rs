@@ -40,10 +40,9 @@ pub type TlsTcp = tokio_rustls::TlsStream<TcpStream>;
 
 /// The record-padding and timing-jitter parameters of the `stealth` transport.
 ///
-/// TODO(stealth): the record-padding / jitter layer that reads these is added by the
-/// stealth unit; until then `stealth` behaves as a plain encrypted TCP stream. This struct
-/// is the hook it fills: it rides in [`Settings::stealth`] for stealth links only, so no
-/// other transport's wire is touched.
+/// It rides in [`Settings::stealth`] for stealth links only, so no other transport's wire
+/// is touched. The record layer reads it as a [`crate::crypto::Shaping`] (see
+/// [`StealthParams::shaping`]), set the same on both ends of the link.
 #[derive(Debug, Clone)]
 pub struct StealthParams {
     /// Add random padding inside each AEAD record.
@@ -52,6 +51,17 @@ pub struct StealthParams {
     pub pad_max: u16,
     /// Random delay before flushing a record.
     pub jitter: Duration,
+}
+
+impl StealthParams {
+    /// The record-layer shaping these settings ask for: padding bounded by `pad_max` when
+    /// it is on (`pad_max == 0` turns it off), and the timing jitter.
+    pub fn shaping(&self) -> crate::crypto::Shaping {
+        crate::crypto::Shaping {
+            pad_max: if self.padding { self.pad_max } else { 0 },
+            jitter: self.jitter,
+        }
+    }
 }
 
 /// The transport part of `[tunnel]`: everything listeners and dialers need besides the

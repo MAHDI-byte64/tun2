@@ -19,7 +19,7 @@ use crate::crypto::handshake::{self, SessionKeys};
 use crate::crypto::record::{
     Opener, Sealer, SecureReader, SecureStream, SecureWriter, MAX_PAYLOAD,
 };
-use crate::crypto::{random_below, Cipher, Crypto, ReplayFilter};
+use crate::crypto::{random_below, Cipher, Crypto, ReplayFilter, Shaping};
 use crate::mux::Transport;
 use crate::session::SessionStream;
 use crate::transport::kcp::KcpDatagrams;
@@ -48,12 +48,14 @@ enum LinkIo {
 
 impl Link {
     /// `mux`: the link will carry a mux session, which may then use a datagram path.
+    /// `shaping`: the record-layer padding and jitter of a stealth link (`None` otherwise).
     fn new(
         stream: TunnelStream,
         keys: SessionKeys,
         dialer: bool,
         early: Option<&handshake::Key>,
         mux: bool,
+        shaping: Option<Shaping>,
     ) -> io::Result<Self> {
         let datagrams = match stream.datagrams() {
             Some(kcp) if mux => Some(Box::new(DatagramPath::new(kcp, &keys, dialer)?)),
@@ -71,12 +73,23 @@ impl Link {
             (&keys.s2c, &keys.c2s)
         };
         let early = early.map(|k| Opener::new(keys.cipher, k)).transpose()?;
-        let secure = SecureStream::new(
-            stream,
-            Sealer::new(keys.cipher, send)?,
-            Opener::new(keys.cipher, recv)?,
-            early,
-        );
+        // On a stealth link the sealer pads and the opener strips; the padding field is in
+        // the record only when the peer pads (`pad_max > 0`), so the opener matches it.
+        let (sealer, opener) = match shaping {
+            Some(s) => (
+                Sealer::stealth(keys.cipher, send, s)?,
+                if s.pad_max > 0 {
+                    Opener::stealth(keys.cipher, recv)?
+                } else {
+                    Opener::new(keys.cipher, recv)?
+                },
+            ),
+            None => (
+                Sealer::new(keys.cipher, send)?,
+                Opener::new(keys.cipher, recv)?,
+            ),
+        };
+        let secure = SecureStream::new(stream, sealer, opener, early);
         Ok(Self {
             io: LinkIo::Secure(Box::new(secure)),
             datagrams,
@@ -221,7 +234,7 @@ pub async fn connect(dialer: &Dialer, crypto: &Crypto, early: &[u8]) -> io::Resu
     }
     let mut stream = dialer.dial_with(&msg).await?;
     let keys = state.read_reply(&mut stream).await?;
-    let mut link = Link::new(stream, keys, true, None, crypto.mux())?;
+    let mut link = Link::new(stream, keys, true, None, crypto.mux(), crypto.shaping())?;
     if !late.is_empty() {
         link.write_all(late).await?;
         link.flush().await?;
@@ -272,6 +285,7 @@ pub async fn accept(
             false,
             accepted.early_key.as_ref(),
             crypto.mux(),
+            crypto.shaping(),
         ),
         // The peer proved it knows the token; it is misconfigured, not probing.
         Err(e) if e.kind() == io::ErrorKind::Unsupported => {

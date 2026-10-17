@@ -71,7 +71,9 @@ pub async fn run(config: Config) -> Result<()> {
     let tuning = config.tuning();
     let mux = config.mux();
     let transport = Settings::new(&config.tunnel, config.kcp());
-    let crypto = Crypto::new(&config.tunnel.token, config.tunnel.encryption).with_mux(mux.enabled);
+    let crypto = Crypto::new(&config.tunnel.token, config.tunnel.encryption)
+        .with_mux(mux.enabled)
+        .with_stealth(transport.stealth.as_ref().map(|s| s.shaping()));
     let sessions = SessionConfig::new(&mux);
     let stats = Stats::new(&config);
     let mut tasks = JoinSet::new();
