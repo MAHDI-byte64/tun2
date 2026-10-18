@@ -1615,6 +1615,7 @@ async fn tunnel_speedtest(
         Err(e) => match format!("{e:#}").as_str() {
             "no_such_tunnel" => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
             "bad_name" => error(StatusCode::BAD_REQUEST, "bad_name"),
+            "l3_no_speedtest" => error(StatusCode::BAD_REQUEST, "l3_no_speedtest"),
             _ => internal(e),
         },
     }
@@ -1652,6 +1653,7 @@ async fn tunnel_speedtest_start(
         Err(e) => match format!("{e:#}").as_str() {
             "no_such_tunnel" => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
             "bad_name" => error(StatusCode::BAD_REQUEST, "bad_name"),
+            "l3_no_speedtest" => error(StatusCode::BAD_REQUEST, "l3_no_speedtest"),
             _ => internal(e),
         },
     }
@@ -1716,6 +1718,7 @@ async fn tunnel_speedtest_poll(
         Err(e) => match format!("{e:#}").as_str() {
             "no_such_tunnel" => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
             "bad_name" => error(StatusCode::BAD_REQUEST, "bad_name"),
+            "l3_no_speedtest" => error(StatusCode::BAD_REQUEST, "l3_no_speedtest"),
             _ => internal(e),
         },
     }

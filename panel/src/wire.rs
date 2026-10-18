@@ -453,7 +453,8 @@ impl HelperSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct L3Spec {
-    /// `udp`, `quic`, `faketcp` or `icmp`: the unreliable carrier the sealed GRE rides.
+    /// `udp`, `quic`, `faketcp`, `icmp` or `proto47`: the unreliable carrier the sealed GRE
+    /// rides.
     pub carrier: String,
     /// `3` (TUN, IP packets, the default) or `2` (TAP, Ethernet frames). Left out: 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]

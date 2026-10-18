@@ -98,7 +98,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const parsed = useMemo(() => parsePorts(ports, protocol, target.trim() || "127.0.0.1"), [ports, protocol, target]);
   const isWs = transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux";
   const isL3 = transport === "l3";
-  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp"].includes(l3S.carrier));
+  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
   const choices = (() => {
     const s = servers.find((x) => x.id === acceptor);
     return s ? addressesOf(s) : [];

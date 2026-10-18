@@ -416,7 +416,8 @@ fn plain_text(spec: &Spec) -> Result<()> {
 }
 
 /// The protocol the accepting side listens with, from the transport (for `l3`, from its
-/// carrier). `icmp` answers raw echoes and binds no port, so it has none.
+/// carrier). `icmp` answers raw echoes and `proto47` rides raw protocol 47, so they bind no
+/// port and have none.
 fn listen_proto(spec: &Spec) -> Option<&'static str> {
     let carrier = if spec.transport == "l3" {
         spec.l3.as_ref().map_or("udp", |l| l.carrier.as_str())
@@ -424,7 +425,7 @@ fn listen_proto(spec: &Spec) -> Option<&'static str> {
         spec.transport.as_str()
     };
     match carrier {
-        "icmp" => None,
+        "icmp" | "proto47" => None,
         "quic" | "kcp" | "udp" => Some("udp"),
         _ => Some("tcp"),
     }

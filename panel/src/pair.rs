@@ -94,7 +94,7 @@ pub struct PairRequest {
     /// client ones.
     #[serde(default)]
     pub helper: Option<crate::wire::HelperSpec>,
-    /// `l3`: the carrier the sealed GRE rides (`udp`, `quic`, `faketcp` or `icmp`).
+    /// `l3`: the carrier the sealed GRE rides (`udp`, `quic`, `faketcp`, `icmp` or `proto47`).
     #[serde(default)]
     pub l3_carrier: Option<String>,
     /// `l3`: `3` (TUN, IP packets, default) or `2` (TAP, Ethernet frames).
@@ -430,7 +430,7 @@ impl PairRequest {
         // TCP-over-TCP) and a layer the core knows.
         if self.transport == "l3" {
             let carrier = self.l3_carrier.as_deref().unwrap_or("udp");
-            if !matches!(carrier, "udp" | "quic" | "faketcp" | "icmp") {
+            if !matches!(carrier, "udp" | "quic" | "faketcp" | "icmp" | "proto47") {
                 bail!("bad_l3_carrier");
             }
             if self.l3_layer.is_some_and(|l| l != 2 && l != 3) {
@@ -1287,12 +1287,18 @@ fn speedtest_server(hub: &Hub, name: &str) -> Result<String> {
         bail!("bad_name");
     }
     let placement = place(hub, name)?;
-    placement
+    let (server, info) = placement
         .sides
         .into_iter()
         .find(|(_, t)| t.role == "entry")
-        .map(|(server, _)| server)
-        .ok_or_else(|| anyhow::anyhow!("no_such_tunnel"))
+        .ok_or_else(|| anyhow::anyhow!("no_such_tunnel"))?;
+    // The l3 / GRE tunnel is a raw packet pump with no mux stream path, so the channel speed
+    // test (which opens mux streams through the tunnel) cannot run on it; the UI points at
+    // measuring over the kzN interface instead.
+    if info.transport == "l3" {
+        bail!("l3_no_speedtest");
+    }
+    Ok(server)
 }
 
 /// Starts a speed test that can be followed while it runs; its id comes back.
@@ -1366,9 +1372,13 @@ pub async fn speedtest(
         bail!("bad_name");
     }
     let placement = place(hub, name)?;
-    let Some((server, _)) = placement.sides.iter().find(|(_, t)| t.role == "entry") else {
+    let Some((server, info)) = placement.sides.iter().find(|(_, t)| t.role == "entry") else {
         bail!("no_such_tunnel");
     };
+    // No mux stream path on the l3 / GRE tunnel, so the channel speed test cannot run on it.
+    if info.transport == "l3" {
+        bail!("l3_no_speedtest");
+    }
     let seconds = seconds.clamp(1, 60);
     let limit = Duration::from_secs(u64::from(seconds) * 3 + 50);
     let raw = hub

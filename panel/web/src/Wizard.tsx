@@ -187,7 +187,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const udp = transport === "quic" || transport === "kcp" || transport === "udp";
   const isWs = transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux";
   const isL3 = transport === "l3";
-  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp"].includes(l3S.carrier));
+  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
 
   // The accepting server's address, as the other one reaches it. A new tunnel starts from
   // the best guess (the address set for it, else the one the panel sees) until one is typed.

@@ -224,7 +224,7 @@ export function HelperFields({ transport, value, onChange }: { transport: string
 
 // ---- l3 / GRE ----
 
-export const L3_CARRIERS = ["udp", "quic", "faketcp", "icmp"] as const;
+export const L3_CARRIERS = ["udp", "quic", "faketcp", "icmp", "proto47"] as const;
 export interface L3State {
   carrier: string;
   layer: number;
