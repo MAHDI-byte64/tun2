@@ -147,7 +147,8 @@ impl Listener {
             TransportKind::Kcp
             | TransportKind::Udp
             | TransportKind::Faketcp
-            | TransportKind::Icmp => {
+            | TransportKind::Icmp
+            | TransportKind::Proto47 => {
                 let listener = kcp::KcpListener::bind(addr, &settings.kcp, tuning).await?;
                 return Ok(Self::Kcp(listener));
             }
@@ -172,6 +173,7 @@ impl Listener {
             | TransportKind::Udp
             | TransportKind::Faketcp
             | TransportKind::Icmp
+            | TransportKind::Proto47
             | TransportKind::Naive
             | TransportKind::Xhttp
             | TransportKind::Reality => {
@@ -322,7 +324,8 @@ impl Dialer {
             TransportKind::Kcp
             | TransportKind::Udp
             | TransportKind::Faketcp
-            | TransportKind::Icmp => unreachable!("handled above"),
+            | TransportKind::Icmp
+            | TransportKind::Proto47 => unreachable!("handled above"),
             TransportKind::Naive | TransportKind::Xhttp | TransportKind::Reality => {
                 #[cfg(all(feature = "helpers", unix))]
                 {

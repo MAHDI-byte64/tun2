@@ -276,14 +276,24 @@ encrypted, DPI-resistant counterpart of a plain GRE tunnel.
 
 - **Encapsulation is always GRE** (RFC 2784 header + RFC 2890 key), but the GRE header and
   the inner packets are sealed **inside Kariz's own handshake + record session** before the
-  carrier sees them. There is **never bare IP proto 47 on the wire** — a passive observer
-  sees only the carrier's random-looking bytes. Both ends compare an `encap = "gre"` value
-  in the handshake and refuse a mismatch. Each packet carries a counter with a replay window,
-  and the session rekeys periodically.
-- **Only DPI-resistant carriers.** `carrier` is one of `udp`, `quic`, `faketcp` or `icmp`.
-  Reliable carriers (`tcp`, `tcpmux`, `ws`, `wss`, reliable KCP) are rejected: running the
-  tunnel's reliability inside a reliable carrier stacks two retransmit timers (the
+  carrier sees them. With every carrier but `proto47` there is **never bare IP proto 47 on the
+  wire** — a passive observer sees only the carrier's random-looking bytes. Both ends compare
+  an `encap = "gre"` value in the handshake and refuse a mismatch. Each packet carries a
+  counter with a replay window, and the session rekeys periodically.
+- **Unreliable carriers only.** `carrier` is one of `udp`, `quic`, `faketcp`, `icmp` or
+  `proto47`. Reliable carriers (`tcp`, `tcpmux`, `ws`, `wss`, reliable KCP) are rejected:
+  running the tunnel's reliability inside a reliable carrier stacks two retransmit timers (the
   TCP-over-TCP meltdown). Encryption is mandatory.
+- **`proto47` — a raw protocol-47 carrier.** This carrier rides the sealed KCP packets as the
+  payload of a keyed GRE packet on a **raw IP protocol 47** socket. It is still Kariz's own
+  encrypted, authenticated session — **not** bare cleartext GRE, and **not interoperable with
+  standard/kernel GRE**. Protocol 47 has no port, so it **does not traverse NAT** and, being a
+  single identifiable IP protocol, **does not evade DPI**. Linux only, needs root
+  (`CAP_NET_RAW`). Use it only on a trusted/uncensored point-to-point link where the low
+  overhead or a proto-47-only path matters; for a censored path prefer `udp`, `quic`,
+  `faketcp` or `icmp`. With `manage_firewall` (default on) a best-effort `-p gre -j ACCEPT`
+  iptables rule is installed and removed (RAII) so the packets survive a default-DROP INPUT
+  policy.
 - **Both directions.** `mode = "listen"` waits for the inbound connection; `mode = "dial"`
   reaches out. Either host may dial, so the link is usable in both the "direct" and the
   "reverse" sense.

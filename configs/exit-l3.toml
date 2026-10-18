@@ -14,7 +14,7 @@ addr = "ENTRY_SERVER_IP:51820"
 layer = 3
 local_ip = "10.10.0.2/30"
 peer_ip = "10.10.0.1"
-carrier = "udp"
+carrier = "udp"                    # udp | quic | faketcp | icmp | proto47 (must match the entry side)
 mtu = 1400
 # gre_key = 0
 

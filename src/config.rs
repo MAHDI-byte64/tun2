@@ -90,6 +90,10 @@ pub enum TransportKind {
     /// The KCP stack over an ICMP echo carrier (Linux, root). BackPack's `xdi`.
     #[serde(alias = "xdi")]
     Icmp,
+    /// The KCP stack over a raw IP protocol-47 (GRE) carrier (Linux, root). Available only
+    /// as an `[l3]` carrier, never as a standalone `[tunnel] transport` (validation rejects
+    /// that): the sealed KCP packets ride as the payload of a keyed GRE packet.
+    Proto47,
     /// A managed sing-box naive inbound/outbound carrying the tunnel.
     Naive,
     /// A managed Xray VLESS-over-XHTTP (HTTP/2) tunnel with TLS.
@@ -114,6 +118,7 @@ impl TransportKind {
             Self::Udp => "udp",
             Self::Faketcp => "faketcp",
             Self::Icmp => "icmp",
+            Self::Proto47 => "proto47",
             Self::Naive => "naive",
             Self::Xhttp => "xhttp",
             Self::Reality => "reality",
@@ -140,6 +145,7 @@ impl TransportKind {
                 | Self::Udp
                 | Self::Faketcp
                 | Self::Icmp
+                | Self::Proto47
                 | Self::Naive
                 | Self::Xhttp
                 | Self::Reality
@@ -165,7 +171,10 @@ impl TransportKind {
 
     /// The KCP stack over some datagram carrier: `kcp` itself and the raw-packet carriers.
     pub fn is_kcp_based(self) -> bool {
-        matches!(self, Self::Kcp | Self::Udp | Self::Faketcp | Self::Icmp)
+        matches!(
+            self,
+            Self::Kcp | Self::Udp | Self::Faketcp | Self::Icmp | Self::Proto47
+        )
     }
 
     /// A managed external-helper transport (`naive`, `xhttp`, `reality`).
@@ -292,6 +301,8 @@ pub struct TunnelConfig {
     pub faketcp: Option<FaketcpConfig>,
     /// Only for `icmp`.
     pub icmp: Option<IcmpConfig>,
+    /// Only for the `[l3]` carrier `proto47`.
+    pub proto47: Option<Proto47Config>,
     /// Only for the managed helper transports `naive`, `xhttp` and `reality`.
     pub helper: Option<HelperConfig>,
     /// Transports the tunnel falls back to, in order, when the primary one cannot be
@@ -545,6 +556,26 @@ impl Default for IcmpConfig {
     }
 }
 
+/// `[tunnel.proto47]`: the raw IP protocol-47 (GRE) carrier (Linux, root). Only meaningful
+/// as an `[l3]` carrier. All keys optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proto47Config {
+    /// Install and remove the best-effort iptables rule that accepts protocol 47 under a
+    /// default-DROP INPUT policy (RAII). Off: the tunnel still runs unless such a policy
+    /// blocks it.
+    #[serde(default = "default_true")]
+    pub manage_firewall: bool,
+}
+
+impl Default for Proto47Config {
+    fn default() -> Self {
+        Self {
+            manage_firewall: true,
+        }
+    }
+}
+
 /// `[tunnel.helper]`: credentials and paths for a managed helper transport (`naive`,
 /// `xhttp`, `reality`). Which keys are required depends on the transport; see
 /// [`Config::validate_helper`].
@@ -664,6 +695,7 @@ pub enum L3Carrier {
     Quic,
     Faketcp,
     Icmp,
+    Proto47,
 }
 
 impl L3Carrier {
@@ -673,6 +705,7 @@ impl L3Carrier {
             Self::Quic => "quic",
             Self::Faketcp => "faketcp",
             Self::Icmp => "icmp",
+            Self::Proto47 => "proto47",
         }
     }
 }
@@ -1344,6 +1377,7 @@ impl Config {
             TransportKind::Udp if !cfg!(feature = "kcp") => Some("udp"),
             TransportKind::Faketcp if !cfg!(feature = "rawlink") => Some("faketcp"),
             TransportKind::Icmp if !cfg!(feature = "rawlink") => Some("icmp"),
+            TransportKind::Proto47 if !cfg!(feature = "rawlink") => Some("proto47"),
             TransportKind::Naive if !cfg!(feature = "helpers") => Some("naive"),
             TransportKind::Xhttp if !cfg!(feature = "helpers") => Some("xhttp"),
             TransportKind::Reality if !cfg!(feature = "helpers") => Some("reality"),
@@ -1363,6 +1397,13 @@ impl Config {
         }
         if self.tunnel.token.contains("CHANGE-ME") {
             bail!("tunnel.token still has the sample value; generate one with `kariz token`");
+        }
+        // proto47 is a raw proto-47 (GRE) KCP carrier for the point-to-point `[l3]` link only:
+        // it has no port, does not cross NAT and is identifiable on the wire, so it is not
+        // offered as a standalone tunnel transport. (The `[l3]` path builds its own synthetic
+        // carrier config, which is not validated through here.)
+        if self.tunnel.transport == TransportKind::Proto47 {
+            bail!("transport \"proto47\" is only available as an [l3] carrier");
         }
 
         // The l3 mode is self-contained: it has its own address, mode and (optional) token
@@ -1473,6 +1514,7 @@ impl Config {
         self.validate_stealth()?;
         self.validate_faketcp()?;
         self.validate_icmp()?;
+        self.validate_proto47()?;
         self.validate_helper()?;
         self.validate_udp()?;
         self.validate_fallback()
@@ -1852,6 +1894,16 @@ impl Config {
         Ok(())
     }
 
+    fn validate_proto47(&self) -> Result<()> {
+        // proto47 is only ever an `[l3]` carrier (a standalone `transport = "proto47"` is
+        // rejected above, and the `[l3]` path validates through `validate_l3`), so its table
+        // has no place on a normal tunnel.
+        if self.tunnel.proto47.is_some() {
+            bail!("[tunnel.proto47] is only used with the [l3] carrier \"proto47\"");
+        }
+        Ok(())
+    }
+
     fn validate_udp(&self) -> Result<()> {
         if self.tunnel.transport != TransportKind::Udp {
             return Ok(());
@@ -2015,6 +2067,9 @@ impl Config {
             }
             if *kind == TransportKind::Udp {
                 bail!("tunnel.fallback_transports cannot contain \"udp\"");
+            }
+            if *kind == TransportKind::Proto47 {
+                bail!("tunnel.fallback_transports cannot contain \"proto47\" (it is only an [l3] carrier)");
             }
             if *kind == self.tunnel.transport {
                 bail!(
@@ -3489,5 +3544,27 @@ keepalive_secs = 1
         // Layer 3 still requires them.
         let body3 = "mode = \"listen\"\naddr = \"0.0.0.0:51820\"\ncarrier = \"udp\"\n";
         assert!(parse_err(&l3_cfg(body3)).contains("l3.local_ip is required"));
+    }
+
+    #[cfg(feature = "l3")]
+    #[test]
+    fn proto47_is_l3_only() {
+        // proto47 is a valid [l3] carrier (the keyed-GRE raw carrier).
+        let body = L3_OK.replace("\"udp\"", "\"proto47\"");
+        let c = Config::parse(&l3_cfg(&body)).unwrap();
+        assert_eq!(c.l3.unwrap().carrier, L3Carrier::Proto47);
+        // ...but it is rejected as a standalone [tunnel] transport (rawlink implied by l3).
+        let err = parse_err(&with_transport("entry", "proto47", ""));
+        assert!(err.contains("only available as an [l3] carrier"), "{err}");
+        // Its table has no place on a normal tunnel.
+        let err = parse_err(&with_transport("entry", "tcp", "[tunnel.proto47]"));
+        assert!(err.contains("[tunnel.proto47]"), "{err}");
+        // Nor may it appear in a fallback chain.
+        let err = parse_err(&with_transport(
+            "entry",
+            "kcp",
+            "fallback_transports = [\"proto47\"]",
+        ));
+        assert!(err.contains("proto47"), "{err}");
     }
 }

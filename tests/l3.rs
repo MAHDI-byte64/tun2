@@ -396,6 +396,13 @@ fn l3_tun_over_quic() {
     tunnel_e2e("q3", "quic", 32, 132, 52002, 52102);
 }
 
+/// The raw IP protocol-47 (keyed-GRE) carrier: the sealed KCP packets ride as the payload of
+/// a keyed GRE packet on a raw proto-47 socket. Needs root (CAP_NET_RAW) on top of the l3 gate.
+#[test]
+fn l3_tun_over_proto47() {
+    tunnel_e2e("p3", "proto47", 36, 136, 52006, 52106);
+}
+
 /// Layer 2 (GRETAP): two TAP devices, addressed, so an Ethernet-level exchange (ARP then
 /// the TCP flow) crosses the encrypted GRETAP tunnel.
 #[test]

@@ -4,9 +4,12 @@
 //!
 //! The packets are GRE-encapsulated ([`gre`], RFC 2784 + RFC 2890 key), sealed inside the
 //! tunnel's own authenticated, encrypted session ([`session`], reusing `crate::crypto` /
-//! `crate::channel`), and handed to an unreliable carrier (udp / quic / faketcp / icmp).
-//! There is no bare IP protocol 47 on the wire. TCP SYNs leaving a layer-3 interface have
-//! their MSS clamped ([`mss`]).
+//! `crate::channel`), and handed to an unreliable carrier (udp / quic / faketcp / icmp /
+//! proto47). With every carrier but `proto47` there is no bare IP protocol 47 on the wire —
+//! the sealed bytes ride the carrier's own framing. The `proto47` carrier does put protocol
+//! 47 on the wire (the sealed KCP packets are the payload of a keyed GRE packet), still
+//! encrypted and not interoperable with standard/kernel GRE. TCP SYNs leaving a layer-3
+//! interface have their MSS clamped ([`mss`]).
 //!
 //! Both directions: `mode = "listen"` waits for the inbound connection (the acceptor side),
 //! `mode = "dial"` reaches out, and either host may dial — the user's "direct and reverse"
@@ -254,6 +257,7 @@ fn build_params(l3: &L3Config, token: &str, config: &Config) -> io::Result<L3Par
         L3Carrier::Quic => TransportKind::Quic,
         L3Carrier::Faketcp => TransportKind::Faketcp,
         L3Carrier::Icmp => TransportKind::Icmp,
+        L3Carrier::Proto47 => TransportKind::Proto47,
     };
     let synthetic = synthetic_config(kind, token, l3)?;
     let crypto = Crypto::new(token, config.tunnel.encryption).with_mux(true);
@@ -309,7 +313,10 @@ fn synthetic_config(kind: TransportKind, token: &str, l3: &L3Config) -> io::Resu
             ));
         }
     }
-    Config::parse(&toml).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:#}")))
+    // Parsed (not `Config::parse`d) so the standalone-transport validation does not apply: this
+    // is a fixed internal template built after the real `[l3]` config was already validated, and
+    // some carriers (e.g. `proto47`) are valid only here, not as a standalone `[tunnel]` transport.
+    toml::from_str(&toml).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:#}")))
 }
 
 /// Entry point dispatched from [`crate::run`] when `[l3]` is present.
