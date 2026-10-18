@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.7.1 - 2026-10-18
+
+### Fixed
+
+- The `l3` / GRE direct tunnel now serves its control socket and reports the peer's
+  connected / last-error state, as the entry and exit modes do. Pairing an l3 tunnel from the
+  panel waits for both sides to report connected, but an l3 process served no status, so the
+  panel timed out ("the two sides did not connect in time") even when the link was up. It now
+  sees the tunnel connect — and shows the real reason when a side cannot.
+
 ## 2.7.0 - 2026-10-18
 
 Nine new transports, from padded TCP to protocols that borrow a real HTTPS site, and a new
