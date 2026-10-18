@@ -489,3 +489,94 @@ fn l3_key_mismatch_refused() {
         "a GRE-key mismatch must not establish a working tunnel"
     );
 }
+
+/// Whether the l3 endpoint at `sock` reports its peer connected over the control socket.
+async fn peer_connected_on(sock: &std::path::Path) -> bool {
+    let Ok(stream) = kariz::control::connect(sock).await else {
+        return false;
+    };
+    matches!(kariz::control::status(stream).await, Ok(s) if s.peer.connected)
+}
+
+/// Regression test for the panel's "waiting for both sides to connect": an l3 endpoint must
+/// report its peer as connected over the control socket — the status `kariz status` and the
+/// panel read — not merely move packets. Before this was wired, an l3 tunnel could be fully
+/// up yet serve no control socket, so the panel timed out with an empty reason ("the two
+/// sides did not connect in time") even though the link was live.
+#[test]
+fn l3_reports_connected_over_the_control_socket() {
+    if !l3_ready() {
+        eprintln!("skipping l3 status test: needs Linux + /dev/net/tun + root + ip + netns");
+        return;
+    }
+    let (tag, tun_sub, carr_sub, carrier_port) = ("st", 35u8, 135u8, 52005u16);
+    let net = TestNet::setup(tag, tun_sub, carr_sub);
+    let iface_a = format!("kza{tag}");
+    let iface_b = format!("kzb{tag}");
+
+    let dir = std::env::temp_dir();
+    let dial_sock = dir.join(format!("kz-l3-dial-{}.sock", std::process::id()));
+    let listen_sock = dir.join(format!("kz-l3-listen-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&dial_sock);
+    let _ = std::fs::remove_file(&listen_sock);
+
+    let make = |mode: &str,
+                addr: String,
+                iface: &str,
+                local: String,
+                peer: String,
+                sock: &std::path::Path| {
+        let toml = format!(
+            "role = \"entry\"\nmode = \"direct\"\n[tunnel]\ntoken = \"{TOKEN}\"\n\
+             [control]\nsocket = \"{}\"\n\
+             [l3]\nmode = \"{mode}\"\naddr = \"{addr}\"\nlayer = 3\niface = \"{iface}\"\n\
+             carrier = \"udp\"\ngre_key = 0\nmtu = 1400\n\
+             local_ip = \"{local}\"\npeer_ip = \"{peer}\"\n",
+            sock.display()
+        );
+        Config::parse(&toml).expect("config parses")
+    };
+
+    let dial = make(
+        "dial",
+        net.carrier_dial(carrier_port),
+        &iface_a,
+        net.local_ip_dial(),
+        net.peer_ip_dial(),
+        &dial_sock,
+    );
+    let listen = make(
+        "listen",
+        net.carrier_listen(carrier_port),
+        &iface_b,
+        net.local_ip_listen(),
+        net.peer_ip_listen(),
+        &listen_sock,
+    );
+
+    let _listener = Endpoint::spawn(listen, Some(net.ns.clone()), None);
+    let _dialer = Endpoint::spawn(dial, None, None);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let connected = rt.block_on(async {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            if peer_connected_on(&dial_sock).await && peer_connected_on(&listen_sock).await {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+    let _ = std::fs::remove_file(&dial_sock);
+    let _ = std::fs::remove_file(&listen_sock);
+    assert!(
+        connected,
+        "both l3 ends must report peer.connected over the control socket (what the panel polls)"
+    );
+}
