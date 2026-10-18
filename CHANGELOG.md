@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.7.0 (unreleased)
+## 2.7.0 - 2026-10-18
 
 Nine new transports, from padded TCP to protocols that borrow a real HTTPS site, and a new
 **direct layer-3 / GRE tunnel** that carries whole IP packets (or Ethernet frames) between two
