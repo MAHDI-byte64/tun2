@@ -120,5 +120,15 @@ jobs:
           # which `kariz-manager install` and `update` use, stays on the last stable one.
           flags=()
           case "$GITHUB_REF_NAME" in *-*) flags=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" --title "Kariz $GITHUB_REF_NAME" "${flags[@]}" \
-            --notes-file notes.md kariz-*.tar.gz kariz-*.tar.gz.sha256 kariz-*.tar.gz.sig
+          files=(kariz-*.tar.gz kariz-*.tar.gz.sha256 kariz-*.tar.gz.sig)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # The release already exists for this tag (e.g. it was drafted and
+            # published from the GitHub web UI, which is what created the tag).
+            # Attach the signed archives to it and set the notes — idempotent, so
+            # a re-run just re-uploads.
+            gh release upload "$GITHUB_REF_NAME" --clobber "${files[@]}"
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "Kariz $GITHUB_REF_NAME" "${flags[@]}" \
+              --notes-file notes.md "${files[@]}"
+          fi
