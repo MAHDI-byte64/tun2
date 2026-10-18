@@ -1,6 +1,17 @@
 # Changelog
 
-## 2.7.1 - 2026-10-18
+## 2.8.0 - 2026-10-18
+
+### Added
+
+- **`proto47` l3 carrier** — the `[l3]` / GRE tunnel can now ride a raw IP protocol-47
+  (keyed-GRE) socket (`[l3] carrier = "proto47"`), beside `udp`, `quic`, `faketcp` and `icmp`.
+  Kariz's sealed, authenticated session is the GRE payload, so it stays encrypted end to end;
+  this is **not** bare cleartext GRE and is **not** interoperable with standard/kernel GRE. It
+  looks like protocol 47 on the wire, so it does **not** traverse NAT and does **not** evade a
+  DPI network — use it only on a trusted link where a proto-47 path or the lower overhead is
+  what you want. Linux + root; `[tunnel.proto47] manage_firewall` controls the best-effort
+  iptables rule that lets protocol 47 through a default-DROP policy.
 
 ### Fixed
 
@@ -9,6 +20,9 @@
   panel waits for both sides to report connected, but an l3 process served no status, so the
   panel timed out ("the two sides did not connect in time") even when the link was up. It now
   sees the tunnel connect — and shows the real reason when a side cannot.
+- The panel no longer offers its (mux-stream) speed test for an `l3` / GRE tunnel, which has
+  no stream path: it explains to measure throughput over the `kzN` interface instead (for
+  example iperf3 between the tunnel IPs), rather than failing with a confusing error.
 
 ## 2.7.0 - 2026-10-18
 
