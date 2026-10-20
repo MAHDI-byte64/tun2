@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.10.0 - 2026-10-20
+
+### Added
+
+- **Asymmetric (split) transport — a different transport each way.** A tunnel can now send over
+  one transport and receive over another, carried as two paired connections joined into one
+  logical stream, for paths that filter upload and download differently. Set `[tunnel]
+  recv_transport` (one of `tcp`, `ws`, `wss`, different from `transport`); the receive link uses
+  the primary listen/dial port + 1 by default (`recv_listen` / `recv_remote` to override).
+  Encryption, mux and the handshake ride the combined stream unchanged, and it always muxes over
+  the one pair. For a `spoof` tunnel the asymmetry is per on-wire shape instead — `[tunnel.spoof]
+  recv_shape` forges one shape and accepts another over the single KCP session. The tunnel wizard
+  gains a **"different transport each way"** switch for every connection kind (direct, reverse,
+  source spoofing), with a two-direction picker and a flow diagram. Both servers need 2.10.
+
+### Changed
+
+- The panel **IP Tester** presents its results as a scorecard (usable / arrived / tested) with a
+  colour-coded per-source arrival meter, instead of a plain table.
+
 ## 2.9.1 - 2026-10-20
 
 ### Fixed

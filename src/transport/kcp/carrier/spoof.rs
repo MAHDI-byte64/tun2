@@ -550,9 +550,17 @@ mod imp {
 
     /// Installs the best-effort iptables rules that keep the carrier's packets flowing under
     /// a default-DROP policy and suppress the kernel's stray replies to our forged packets.
-    fn install_firewall(send_shape: SpoofShape, recv_shape: SpoofShape, port: u16) -> FirewallRules {
+    fn install_firewall(
+        send_shape: SpoofShape,
+        recv_shape: SpoofShape,
+        port: u16,
+    ) -> FirewallRules {
         let tag = if send_shape == recv_shape {
-            format!("kariz-spoof-{}-{port}-{}", send_shape.name(), unique_suffix())
+            format!(
+                "kariz-spoof-{}-{port}-{}",
+                send_shape.name(),
+                unique_suffix()
+            )
         } else {
             format!(
                 "kariz-spoof-{}-{}-{port}-{}",

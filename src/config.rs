@@ -1785,7 +1785,10 @@ impl Config {
         };
         let send = self.tunnel.transport;
         let ok = |k: TransportKind| {
-            matches!(k, TransportKind::Tcp | TransportKind::Ws | TransportKind::Wss)
+            matches!(
+                k,
+                TransportKind::Tcp | TransportKind::Ws | TransportKind::Wss
+            )
         };
         if !ok(send) || !ok(recv) {
             bail!(
