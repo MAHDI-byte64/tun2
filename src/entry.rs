@@ -252,10 +252,16 @@ async fn build_source(
                     connections = mux.connections,
                     "entry: direct mode with mux, keeping sessions to the exit side"
                 );
+                let recv = config.recv_link_dial();
                 let dialer = Arc::new(if config.tunnel.transport == TransportKind::Auto {
                     Dial::auto(transport, &config.tunnel.token, remote, tuning)?
                 } else {
-                    Dial::one(transport, remote, tuning)?
+                    Dial::One(crate::transport::split::dialer(
+                        transport,
+                        remote,
+                        recv.as_ref().map(|(k, a)| (*k, a.as_str())),
+                        tuning,
+                    )?)
                 });
                 let pool = Arc::new(SessionPool::default());
                 for _ in 0..mux.connections {
@@ -294,7 +300,9 @@ async fn build_source(
                 // Nothing keeps a connection open here, so without this the tunnel would
                 // not say whether the exit side is reachable until someone used it (and a
                 // panel creating the tunnel would wait for a "connected" that never comes).
-                let probe = Dialer::new(transport, remote, tuning)?;
+                let recv = config.recv_link_dial();
+                let recv_opt = recv.as_ref().map(|(k, a)| (*k, a.as_str()));
+                let probe = crate::transport::split::dialer(transport, remote, recv_opt, tuning)?;
                 let (crypto, link) = (crypto.clone(), stats.peer.clone());
                 let wait = tuning.dial_timeout + tuning.handshake_timeout;
                 tasks.spawn(async move {
@@ -307,20 +315,28 @@ async fn build_source(
                         sleep(PROBE_EVERY).await;
                     }
                 });
-                Source::Direct(Dialer::new(transport, remote, tuning)?)
+                Source::Direct(crate::transport::split::dialer(
+                    transport, remote, recv_opt, tuning,
+                )?)
             }
             Mode::Reverse => {
                 let addr = config.tunnel.listen.as_deref().expect("validated");
                 let listeners = if config.tunnel.transport == TransportKind::Auto {
                     auto::bind_all(transport, &config.tunnel.token, addr, tuning).await?
                 } else {
+                    let recv = config.recv_link_listen();
                     vec![(
                         "",
-                        Listener::bind(transport, addr, tuning)
-                            .await
-                            .with_context(|| {
-                                format!("failed to listen for tunnel connections on {addr}")
-                            })?,
+                        crate::transport::split::listener(
+                            transport,
+                            addr,
+                            recv.as_ref().map(|(k, a)| (*k, a.as_str())),
+                            tuning,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("failed to listen for tunnel connections on {addr}")
+                        })?,
                     )]
                 };
                 info!(
