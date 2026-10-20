@@ -32,14 +32,15 @@ flowchart TD
 | `udp` | the tunnel rides plain sealed UDP datagrams; forwards UDP only | random bytes; a UDP shape that can be throttled | — |
 | `faketcp` | KCP over a raw-socket fake-TCP carrier | random bytes, no handshake fingerprint, looks like a TCP flow | Linux, root (CAP_NET_RAW) |
 | `icmp` | KCP inside ICMP echo request/reply (ping) | random bytes, no handshake fingerprint; passes where a port is filtered | Linux, root |
+| `spoof` | KCP inside crafted packets with a **forged, rotating source IP** (`udp`/`tcp`/`icmp`/`gre`/`ipip`/`proto58` shape) | random bytes, no handshake; both ends spoof, so it blends into background traffic and beats stateful DPI | Linux, root; a network that does not filter forged sources |
 | `naive` | a managed sing-box naive HTTP/2 proxy over TLS | looks like HTTP/2 over real HTTPS | Linux, the helper binary, a certificate |
 | `xhttp` | a managed Xray VLESS-over-XHTTP (HTTP/2) tunnel with TLS | looks like a real HTTPS site | Linux, the helper binary, a certificate |
 | `reality` | a managed Xray VLESS + REALITY + Vision tunnel | borrows a real site's TLS handshake: indistinguishable from a browser visiting it | Linux, the helper binary, a cover site |
 
 Every transport is encrypted end to end: the handshake (mutual authentication with the
 token, X25519 for forward secrecy) and the AEAD record layer run inside it. The transports
-that have no transport-level crypto of their own — `stealth`, `udp`, `faketcp`, `icmp`, the
-managed helpers, and the [L3 / GRE](#l3--gre-direct-tunnel) mode — **force encryption on**
+that have no transport-level crypto of their own — `stealth`, `udp`, `faketcp`, `icmp`, `spoof`,
+the managed helpers, and the [L3 / GRE](#l3--gre-direct-tunnel) mode — **force encryption on**
 (`encryption = "none"` is rejected), so nothing rides an untrusted path in the clear. On bad
 authentication the listening side stays silent: it answers nothing a probe can tell apart
 from a closed port, then drops the connection.
@@ -229,6 +230,46 @@ port but still pass ping, this gets through where nothing else does.
 - ICMP has no ports: the address identifies the host, and the configured port is ignored.
 - `[tunnel.icmp]`: just `manage_firewall`.
 - Random bytes, no handshake fingerprint. Encryption is mandatory.
+
+## `spoof`
+
+`spoof` carries the KCP stack inside crafted packets whose **source IP is forged and rotated
+from a pool**, one per packet. Both ends forge their source and blend into ordinary background
+traffic, which is what defeats a stateful DPI box: there is no single flow to track, and the
+return path uses each side's own forged source. Because the forged packets never reveal the
+sender, a spoof tunnel is strictly **point-to-point** — each side is told the other's real
+address (the dialer dials it; the accepting side is given it as `[tunnel.spoof] peer`, which the
+panel fills in automatically).
+
+- **Linux only, and needs root** (raw sockets). Same message as `faketcp` otherwise.
+- **It only works where the network does not filter forged-source packets** (no BCP38 / uRPF on
+  the path). Many datacenters drop them. Use `kariz spooftest` or the panel's **IP Tester** to
+  find which source addresses get through, then put those in the pool.
+- `[tunnel.spoof]`:
+  - `shape` — the on-wire packet shape: `udp` (lowest overhead, the default), `tcp` (a crafted
+    TCP segment like `faketcp`), `icmp` (an echo), or the raw IP protocols `gre` (47), `ipip` (4)
+    and `proto58` (58). Both ends must use the same shape. Match it to whatever the path lets
+    through.
+  - `pool` — the source addresses to forge: a list of single IPs, CIDR blocks (`203.0.113.0/24`)
+    or inclusive ranges (`a.b.c.d-e.f.g.h`), expanded and de-duplicated (capped at 1024). Each
+    side keeps its own pool.
+  - `peer` — the peer's real address (the accepting side needs it to reply).
+  - `manage_firewall` — install/remove the best-effort `iptables` rules (RAII) that keep the
+    carrier's packets flowing and suppress the kernel's stray replies to the forged packets.
+- Random bytes, no handshake fingerprint. Encryption is mandatory. For the highest speed use
+  `profile = "ultraspeed"` with `shape = "udp"`; mux, FEC and the KCP fast modes all apply.
+
+## Finding spoofable addresses: `kariz spooftest`
+
+Source spoofing only works where the path does not drop forged-source packets, and which
+addresses survive depends on the provider. `kariz spooftest` finds them, run as two roles on the
+two servers (or driven from the panel's **IP Tester** page):
+
+- On the destination server: `kariz spooftest receiver --shape udp --bind 0.0.0.0:44300`.
+- On the source server: `kariz spooftest sender --to DEST_IP:44300 --shape udp --source 203.0.113.0/24`.
+
+The receiver prints which forged sources arrived and which met the loss threshold; put the
+usable ones in the tunnel's `[tunnel.spoof] pool`.
 
 ## Managed helper transports: `naive`, `xhttp`, `reality`
 

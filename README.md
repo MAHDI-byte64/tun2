@@ -63,11 +63,12 @@ Want to look first? The [live demo](https://mahdi-byte64.github.io/tun2/try/) ru
 
 ## What you get
 
-- **Fifteen transports.** `tcp`, `tcpmux`, `ws` and `wss` (for CDNs and sites that must look like HTTPS),
+- **Sixteen transports.** `tcp`, `tcpmux`, `ws` and `wss` (for CDNs and sites that must look like HTTPS),
   `quic` and `kcp` over UDP for long or lossy paths, and a set built to evade a network that fights back:
   `stealth` (padded encrypted TCP), `faketcp` and `icmp` (random bytes over raw TCP or ping), `udp`, the
-  `wsmux` / `wssmux` twins, and the managed HTTPS helpers `naive`, `xhttp` and `reality` (which borrows a
-  real cover site's TLS handshake). Every transport is encrypted end to end.
+  `wsmux` / `wssmux` twins, `spoof` (mutual source-IP spoofing that rotates a pool of forged addresses over
+  `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`), and the managed HTTPS helpers `naive`, `xhttp` and
+  `reality` (which borrows a real cover site's TLS handshake). Every transport is encrypted end to end.
 - **Both directions.** The exit can dial the entry (`reverse`) or the other way round (`direct`), with
   automatic reconnects.
 - **TCP and UDP.** WireGuard, DNS and games work through it; on `kcp` and `quic` a lost packet delays

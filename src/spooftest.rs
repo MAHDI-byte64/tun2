@@ -138,7 +138,7 @@ pub fn passes(received: u16, expect: u16, loss_pct: u8) -> bool {
     if expect == 0 {
         return false;
     }
-    let need = (u32::from(expect) * u32::from(100u8.saturating_sub(loss_pct)) + 99) / 100;
+    let need = (u32::from(expect) * u32::from(100u8.saturating_sub(loss_pct))).div_ceil(100);
     u32::from(received) >= need.max(1)
 }
 
@@ -253,7 +253,7 @@ mod imp {
     }
 
     /// Returns the probe payload region of a captured IPv4 packet for `shape`, or `None`.
-    fn probe_payload<'a>(shape: SpoofShape, pkt: &'a [u8]) -> Option<(Ipv4Addr, &'a [u8])> {
+    fn probe_payload(shape: SpoofShape, pkt: &[u8]) -> Option<(Ipv4Addr, &[u8])> {
         let first = *pkt.first()?;
         if first >> 4 != 4 {
             return None;

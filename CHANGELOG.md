@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`spoof` transport — mutual source-IP spoofing.** A new tunnel transport (the sixteenth)
+  that rides the KCP stack inside crafted packets whose **source IP is forged and rotated from
+  a pool**, so the traffic blends into ordinary background traffic and defeats stateful DPI.
+  Both ends forge their source and are told the other's real address, so it is strictly
+  point-to-point. The on-wire packet shape is chosen with `[tunnel.spoof] shape`: `udp`
+  (lowest overhead, the default), `tcp`, `icmp`, `gre`, `ipip` or `proto58`. Encryption is
+  mandatory, and mux, FEC and the KCP fast modes all apply, so with the `ultraspeed` profile
+  and the `udp` shape it runs at full tilt. Linux + root; `[tunnel.spoof] manage_firewall`
+  controls the best-effort iptables rules. It only works where the path does not filter
+  forged-source packets (no BCP38 / uRPF).
+- **IP spoof tester.** `kariz spooftest sender|receiver` and a panel **IP Tester** page probe
+  which forged source addresses survive the path between two servers (any shape, single IPs /
+  CIDR blocks / ranges, with a loss threshold), so a spoof tunnel's pool can be filled with
+  addresses that get through. The panel page copies the usable addresses straight into a pool.
+- The tunnel wizard gains a third connection kind, **source spoofing**, beside direct and
+  reverse: picking it swaps the transport tiles for the six spoof shapes and adds the
+  forged-source pool field. Both sides of a tunnel need this version for the `spoof` transport.
+
 ## 2.8.0 - 2026-10-18
 
 ### Added
