@@ -88,6 +88,7 @@ pub(super) use imp::{open_dialer, open_listener, SpoofSocket};
 
 #[cfg(all(feature = "rawlink", target_os = "linux"))]
 mod imp {
+    use std::cell::RefCell;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -119,6 +120,14 @@ mod imp {
     /// `setsockopt` level/option for `PACKET_IGNORE_OUTGOING` (not always in libc).
     const SOL_PACKET: nix::libc::c_int = 263;
     const PACKET_IGNORE_OUTGOING: nix::libc::c_int = 23;
+
+    thread_local! {
+        /// Per-thread scratch for the send hot path: the framed body and the finished
+        /// packet, reused across sends so a steady stream allocates nothing. Each thread
+        /// gets its own, so `&self` sends from different worker threads stay safe.
+        static SCRATCH: RefCell<(Vec<u8>, Vec<u8>)> =
+            const { RefCell::new((Vec::new(), Vec::new())) };
+    }
 
     /// One source-spoofing endpoint: an `AF_PACKET` receive socket, a raw-IP send socket, a
     /// forged-source pool with a shared round-robin cursor, and the per-shape bookkeeping
@@ -171,59 +180,55 @@ mod imp {
             self.pool[i % self.pool.len()]
         }
 
-        /// Builds and sends one crafted packet carrying `sealed` to `dst`.
+        /// Builds and sends one crafted packet carrying `sealed` to `dst`, reusing per-thread
+        /// scratch buffers so a steady stream of packets allocates nothing.
         fn send_to_dst(&self, dst: SocketAddrV4, sealed: &[u8]) -> io::Result<usize> {
             let src = self.next_source();
-            let mut body = Vec::with_capacity(FRAMING + sealed.len());
-            body.extend_from_slice(&self.tag);
-            body.push(self.dir_send);
-            body.extend_from_slice(sealed);
-            let packet = self.build_packet(src, *dst.ip(), dst.port(), &body);
             let to = SockAddr::from(SocketAddr::V4(SocketAddrV4::new(*dst.ip(), 0)));
-            self.send.send_to(&packet, &to)
+            SCRATCH.with(|cell| {
+                let (body, packet) = &mut *cell.borrow_mut();
+                body.clear();
+                body.extend_from_slice(&self.tag);
+                body.push(self.dir_send);
+                body.extend_from_slice(sealed);
+                packet.clear();
+                self.build_into(packet, src, *dst.ip(), dst.port(), body);
+                self.send.send_to(packet, &to)
+            })
         }
 
-        /// Builds the full IPv4 packet for this socket's shape, from `src` to `dst:dport`,
-        /// carrying `body` (`tag | dir | sealed`).
-        fn build_packet(&self, src: Ipv4Addr, dst: Ipv4Addr, dport: u16, body: &[u8]) -> Vec<u8> {
+        /// Builds the full IPv4 packet for this socket's shape into `out` (already cleared),
+        /// from `src` to `dst:dport`, carrying `body` (`tag | dir | sealed`).
+        fn build_into(&self, out: &mut Vec<u8>, src: Ipv4Addr, dst: Ipv4Addr, dport: u16, body: &[u8]) {
             match self.shape {
                 SpoofShape::Udp => {
-                    let builder = PacketBuilder::ipv4(src.octets(), dst.octets(), TTL)
-                        .udp(self.local_port, dport);
-                    let mut out = Vec::with_capacity(builder.size(body.len()));
-                    builder
-                        .write(&mut out, body)
+                    PacketBuilder::ipv4(src.octets(), dst.octets(), TTL)
+                        .udp(self.local_port, dport)
+                        .write(out, body)
                         .expect("writing to a Vec cannot fail");
-                    out
                 }
                 SpoofShape::Tcp => {
                     let seq = self.seq.fetch_add(body.len() as u32, Ordering::Relaxed);
                     let ack = self.ack.load(Ordering::Relaxed);
                     let tsval = self.start.elapsed().as_millis() as u32;
-                    let builder = PacketBuilder::ipv4(src.octets(), dst.octets(), TTL)
+                    PacketBuilder::ipv4(src.octets(), dst.octets(), TTL)
                         .tcp(self.local_port, dport, seq, WINDOW)
                         .ack(ack)
                         .psh()
                         .options(&[TcpOptionElement::Timestamp(tsval, 0)])
-                        .expect("a timestamp option is always valid");
-                    let mut out = Vec::with_capacity(builder.size(body.len()));
-                    builder
-                        .write(&mut out, body)
+                        .expect("a timestamp option is always valid")
+                        .write(out, body)
                         .expect("writing to a Vec cannot fail");
-                    out
                 }
                 SpoofShape::Icmp => {
                     let seq = self.seq16.fetch_add(1, Ordering::Relaxed);
-                    let builder = PacketBuilder::ipv4(src.octets(), dst.octets(), TTL)
-                        .icmpv4_echo_request(self.echo_id, seq);
-                    let mut out = Vec::with_capacity(builder.size(body.len()));
-                    builder
-                        .write(&mut out, body)
+                    PacketBuilder::ipv4(src.octets(), dst.octets(), TTL)
+                        .icmpv4_echo_request(self.echo_id, seq)
+                        .write(out, body)
                         .expect("writing to a Vec cannot fail");
-                    out
                 }
                 SpoofShape::Gre | SpoofShape::Ipip | SpoofShape::Proto58 => {
-                    build_raw_proto(self.shape.ip_protocol(), src, dst, body)
+                    build_raw_proto_into(out, self.shape.ip_protocol(), src, dst, body);
                 }
             }
         }
@@ -347,10 +352,10 @@ mod imp {
         }
     }
 
-    /// Builds an IPv4 packet with the given protocol number carrying `body` as its payload
+    /// Builds an IPv4 packet with the given protocol number carrying `body` into `out`
     /// (the `gre`, `ipip` and `proto58` shapes). The `IP_HDRINCL` socket recomputes the IP
     /// checksum and total length, but a correct header is built anyway.
-    fn build_raw_proto(proto: u8, src: Ipv4Addr, dst: Ipv4Addr, body: &[u8]) -> Vec<u8> {
+    fn build_raw_proto_into(out: &mut Vec<u8>, proto: u8, src: Ipv4Addr, dst: Ipv4Addr, body: &[u8]) {
         let mut header = Ipv4Header::new(
             body.len() as u16,
             TTL,
@@ -360,11 +365,17 @@ mod imp {
         )
         .expect("a sealed KCP packet is far below the IPv4 payload limit");
         header.header_checksum = header.calc_header_checksum();
-        let mut out = Vec::with_capacity(header.header_len() + body.len());
         header
-            .write(&mut out)
+            .write(out)
             .expect("writing to a Vec cannot fail");
         out.extend_from_slice(body);
+    }
+
+    /// Allocating wrapper for [`build_raw_proto_into`], used by the tests.
+    #[cfg(test)]
+    fn build_raw_proto(proto: u8, src: Ipv4Addr, dst: Ipv4Addr, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        build_raw_proto_into(&mut out, proto, src, dst, body);
         out
     }
 
@@ -455,8 +466,9 @@ mod imp {
     }
 
     /// Opens the raw `IP_HDRINCL` send socket (IPPROTO_RAW, so any protocol can be built and
-    /// the kernel keeps our forged, non-zero source address).
-    fn send_socket(dscp: Option<u8>, mark: u32) -> io::Result<Socket> {
+    /// the kernel keeps our forged, non-zero source address). A large send buffer lets the
+    /// KCP driver's bursts drain without dropping under load.
+    fn send_socket(dscp: Option<u8>, mark: u32, buffer: usize) -> io::Result<Socket> {
         let socket = Socket::new(
             Domain::IPV4,
             Type::RAW,
@@ -465,6 +477,7 @@ mod imp {
         .map_err(map_perm)?;
         socket.set_header_included_v4(true)?;
         socket.set_nonblocking(true)?;
+        let _ = socket.set_send_buffer_size(buffer);
         let _ = socket.set_mark(mark);
         if let Some(dscp) = dscp {
             let _ = socket.set_tos_v4(u32::from(dscp) << 2);
@@ -697,7 +710,7 @@ mod imp {
         local: SocketAddr,
     ) -> io::Result<CarrierSocket> {
         let recv = packet_socket(ifindex, buffer)?;
-        let send = send_socket(dscp, mark_of(params.tag))?;
+        let send = send_socket(dscp, mark_of(params.tag), buffer)?;
         let firewall = params
             .manage_firewall
             .then(|| install_firewall(params.shape, local_port));
