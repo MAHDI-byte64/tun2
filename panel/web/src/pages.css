@@ -1091,6 +1091,20 @@ label.sp-opt { display: inline-flex; align-items: center; gap: var(--sp-2); min-
 .asym-dir { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); font-weight: 600; font-size: var(--fs-sm); }
 .asym-dir.send::before { content: "↑"; color: var(--accent); font-weight: 700; }
 .asym-dir.recv::before { content: "↓"; color: var(--water); font-weight: 700; }
+
+/* IP Tester results: a scorecard and a per-source arrival meter. */
+.ipt-stats { display: flex; gap: var(--sp-3); margin-bottom: var(--sp-4); flex-wrap: wrap; }
+.ipt-stat { flex: 1 1 0; min-width: 96px; display: flex; flex-direction: column; gap: 2px; padding: var(--sp-3) var(--sp-4); border: var(--hairline) solid var(--line-strong); border-radius: 12px; background: color-mix(in srgb, var(--card) 55%, transparent); }
+.ipt-stat .n { font-size: var(--fs-2xl); font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.ipt-stat .l { font-size: var(--fs-xs); color: var(--text-3); }
+.ipt-stat.ok .n { color: var(--water); }
+.ipt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.ipt-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(70px, 2.2fr) auto auto; align-items: center; gap: var(--sp-3); padding: var(--sp-2) var(--sp-3); border-radius: 10px; background: color-mix(in srgb, var(--card) 40%, transparent); }
+.ipt-meter { height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.ipt-bar { display: block; height: 100%; border-radius: 999px; background: var(--danger); transition: width var(--dur-short) var(--ease-out); }
+.ipt-row.ok .ipt-bar { background: var(--water); }
+.ipt-rate { font-size: var(--fs-sm); color: var(--text-2); font-variant-numeric: tabular-nums; }
+@media (max-width: 560px) { .ipt-row { grid-template-columns: 1fr auto; } .ipt-meter { display: none; } }
 .enc-warn { display: flex; gap: var(--sp-3); align-items: flex-start; padding: var(--sp-4); border: 1px solid var(--danger); border-radius: 12px; background: var(--danger-soft); color: var(--text); }
 .enc-warn svg { color: var(--danger); flex: none; margin-top: 2px; }
 .enc-warn p { margin: 0 0 var(--sp-3); font-size: var(--fs-sm); line-height: 1.6; }
