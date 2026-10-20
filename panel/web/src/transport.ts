@@ -20,11 +20,15 @@ export const TRANSPORTS = [
   "l3",
 ] as const;
 
+/** The on-wire packet shapes of the source-spoofing (`spoof`) transport. When the "source
+ *  spoofing" connection kind is picked, these replace the transport tiles below. */
+export const SPOOF_SHAPES = ["udp", "icmp", "proto58", "tcp", "ipip", "gre"] as const;
+
 /** Transports that need root (raw sockets or a TUN device). The wizard warns when one is picked. */
-export const ROOT_ONLY = ["faketcp", "icmp", "l3"];
+export const ROOT_ONLY = ["faketcp", "icmp", "l3", "spoof"];
 
 /** Transports whose own encryption is the tunnel's, so `encryption = "none"` is refused. */
-export const ENCRYPTION_FORCED = ["stealth", "udp", "faketcp", "icmp", "l3"];
+export const ENCRYPTION_FORCED = ["stealth", "udp", "faketcp", "icmp", "l3", "spoof"];
 
 /** The managed-helper transports (a sing-box / Xray process carries the tunnel). */
 export const HELPER_TRANSPORTS = ["naive", "xhttp", "reality"];
