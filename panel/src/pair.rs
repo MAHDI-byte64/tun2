@@ -89,6 +89,11 @@ pub struct PairRequest {
     /// `icmp`: the ICMP carrier knobs, applied to both sides.
     #[serde(default)]
     pub icmp: Option<crate::wire::IcmpSpec>,
+    /// `spoof`: the source-spoofing carrier knobs (shape, forged-source pool), applied to
+    /// both sides. The accepting side's `peer` is filled in from the dialing server's
+    /// address by the pair layer when the wizard leaves it empty.
+    #[serde(default)]
+    pub spoof: Option<crate::wire::SpoofSpec>,
     /// `naive` / `xhttp` / `reality`: every managed-helper credential the wizard collected.
     /// The panel splits it per side: the acceptor keeps the server secrets, the dialer the
     /// client ones.
@@ -160,6 +165,7 @@ impl PairRequest {
                 .then(|| self.icmp.clone())
                 .flatten()
                 .filter(|i| !i.is_empty()),
+            spoof: self.spoof_for(accepts),
             helper: self.helper_for(accepts),
             l3: self.l3_for(accepts),
             forwards: if role == "entry" {
@@ -272,6 +278,50 @@ impl PairRequest {
         (!side.is_empty()).then_some(side)
     }
 
+    /// This side's `[tunnel.spoof]` settings. Both sides get the shape and the forged-source
+    /// pool; only the accepting side carries `peer` (the dialer's real address), since the
+    /// dialing side learns the peer from the address it dials.
+    fn spoof_for(&self, acceptor: bool) -> Option<crate::wire::SpoofSpec> {
+        if self.transport != "spoof" {
+            return None;
+        }
+        let mut s = self.spoof.clone().unwrap_or_default();
+        if !acceptor {
+            s.peer = None;
+        }
+        (!s.is_empty()).then_some(s)
+    }
+
+    /// For the spoof transport, fills `spoof.peer` (the dialing server's real address) from
+    /// the hub when the wizard left it empty, so the accepting side can address its replies.
+    /// A borrowed no-op for other transports or when the peer is already set.
+    fn with_spoof_peer<'a>(&'a self, hub: &Hub) -> std::borrow::Cow<'a, PairRequest> {
+        use std::borrow::Cow;
+        if self.transport != "spoof" {
+            return Cow::Borrowed(self);
+        }
+        let set = self
+            .spoof
+            .as_ref()
+            .and_then(|s| s.peer.as_deref())
+            .is_some_and(|p| !p.trim().is_empty());
+        if set {
+            return Cow::Borrowed(self);
+        }
+        // The dialing server: reverse → the exit dials; direct → the entry dials.
+        let dialer = if self.mode == "reverse" {
+            &self.exit
+        } else {
+            &self.entry
+        };
+        let Some(addr) = hub.addr_of(dialer) else {
+            return Cow::Borrowed(self);
+        };
+        let mut req = self.clone();
+        req.spoof.get_or_insert_with(Default::default).peer = Some(addr);
+        Cow::Owned(req)
+    }
+
     /// This side's `[l3]` settings, with the auto-picked `10.10.N.0/30` address resolved
     /// (the accepting side is `.1`, the dialing side `.2`). Layer 2 (TAP) takes no address.
     fn l3_for(&self, acceptor: bool) -> Option<crate::wire::L3Spec> {
@@ -324,6 +374,12 @@ impl PairRequest {
         )
     }
 
+    /// The source-spoofing transport, which arrived with 2.9: an older agent does not know
+    /// the name and refuses the whole config.
+    fn needs_spoof_transport(&self) -> bool {
+        self.transport == "spoof"
+    }
+
     /// An error (`old_agent:SERVER:VERSION`, or `old_agent_enc:...` for a cipher,
     /// `old_agent_obfs:...` for sealed QUIC, `old_agent_limits:...` for 2.4's limits and
     /// `old_agent_proxy:...` for PROXY headers) naming the first server that is too old.
@@ -334,7 +390,8 @@ impl PairRequest {
             || self.needs_2_4().0
             || self.proxy_version().is_some()
             || self.udp_flows().is_some()
-            || self.needs_2_7_transport();
+            || self.needs_2_7_transport()
+            || self.needs_spoof_transport();
         if !anything_new {
             return Ok(());
         }
@@ -378,6 +435,10 @@ impl PairRequest {
         // The BackPack-style transports and the l3 / GRE mode arrived with 2.7: an older
         // agent does not know the name and refuses the whole config.
         if self.needs_2_7_transport() && !release_at_least(version, TRANSPORTS_SINCE) {
+            bail!("old_agent_transport:{id}:{version}");
+        }
+        // The source-spoofing transport arrived with 2.9: an older agent refuses the config.
+        if self.needs_spoof_transport() && !release_at_least(version, SPOOF_SINCE) {
             bail!("old_agent_transport:{id}:{version}");
         }
         // The panel writes the UDP flow limit from 2.6.0-beta.4 (the core had it before; an
@@ -437,12 +498,31 @@ impl PairRequest {
                 bail!("bad_l3_layer");
             }
         }
-        // udp, faketcp, icmp, stealth and l3 seal nothing of their own: the tunnel's own
-        // encryption carries it, so `none` is refused (as the core does).
+        // The spoof transport needs a known shape and at least one forged source address.
+        if self.transport == "spoof" {
+            let spoof = self.spoof.as_ref();
+            let shape = spoof.and_then(|s| s.shape.as_deref()).unwrap_or("udp");
+            if kariz::config::SpoofShape::from_name(shape).is_none() {
+                bail!("bad_spoof_shape");
+            }
+            let pool = spoof.map(|s| s.pool.as_slice()).unwrap_or_default();
+            if pool.is_empty() {
+                bail!("spoof_pool_required");
+            }
+            // Reject a malformed pool entry up front (the core also rejects it).
+            if kariz::config::expand_ipv4_specs(pool, kariz::config::SPOOF_POOL_MAX)
+                .map(|p| p.is_empty())
+                .unwrap_or(true)
+            {
+                bail!("bad_spoof_pool");
+            }
+        }
+        // udp, faketcp, icmp, stealth, l3 and spoof seal nothing of their own: the tunnel's
+        // own encryption carries it, so `none` is refused (as the core does).
         if self.encryption.as_deref() == Some("none")
             && matches!(
                 self.transport.as_str(),
-                "udp" | "faketcp" | "icmp" | "stealth" | "l3"
+                "udp" | "faketcp" | "icmp" | "stealth" | "l3" | "spoof"
             )
         {
             bail!("encryption_required");
@@ -457,6 +537,10 @@ const UDP_FLOWS_SINCE: &str = "2.6.0-beta.4";
 /// The first release whose agent knows the BackPack-style transports (`stealth`, `wsmux`,
 /// `wssmux`, `udp`, `faketcp`, `icmp`, `naive`, `xhttp`, `reality`) and the `l3` mode.
 const TRANSPORTS_SINCE: &str = "2.7.0";
+
+/// The first release whose agent knows the source-spoofing transport (`spoof`) and the IP
+/// spoof tester.
+const SPOOF_SINCE: &str = "2.9.0";
 
 /// Whether `version` is `min` or a later release, prereleases in their order
 /// (`2.6.0-beta.3` is before `2.6.0-beta.4`, which is before `2.6.0`). One that cannot be
@@ -623,6 +707,7 @@ fn fail_text(reply: &Ack) -> String {
 pub async fn check(hub: &Hub, req: &PairRequest) -> Result<(CheckReply, CheckReply)> {
     req.validate()?;
     req.require_new_enough(hub)?;
+    let req = req.with_spoof_peer(hub);
     let (entry, exit) = req.specs(None, None);
     let a = hub
         .ask_as(&req.entry, &Request::TunnelCheck { spec: entry })
@@ -821,6 +906,9 @@ async fn run_create(
         Err(e) => return Err((e, true)),
     };
     let req = resolved.as_ref().unwrap_or(req);
+    // For spoof, the accepting side needs the dialer's real address; fill it from the hub.
+    let spoofed = req.with_spoof_peer(hub);
+    let req = &*spoofed;
 
     // Both servers agree it is valid, and its ports are free.
     for (step, server, spec) in [
@@ -979,6 +1067,9 @@ async fn run_edit(
         Err(e) => return Err((e, true)),
     };
     let req = resolved.as_ref().unwrap_or(req);
+    // For spoof, the accepting side needs the dialer's real address; fill it from the hub.
+    let spoofed = req.with_spoof_peer(hub);
+    let req = &*spoofed;
 
     let token = if req.rotate {
         match random_hex(24) {

@@ -634,6 +634,19 @@ impl SpoofShape {
         }
     }
 
+    /// Parses a shape name (`udp`, `tcp`, `icmp`, `gre`, `ipip`, `proto58`), case-sensitive.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "udp" => Self::Udp,
+            "tcp" => Self::Tcp,
+            "icmp" => Self::Icmp,
+            "gre" => Self::Gre,
+            "ipip" => Self::Ipip,
+            "proto58" => Self::Proto58,
+            _ => return None,
+        })
+    }
+
     /// The IP protocol number this shape puts on the wire.
     pub fn ip_protocol(self) -> u8 {
         match self {

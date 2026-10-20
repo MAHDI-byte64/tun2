@@ -95,7 +95,7 @@ fn default_loss() -> u8 {
 }
 
 /// One candidate source address's result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceResult {
     /// The forged source address tested.
     pub ip: String,
@@ -106,7 +106,7 @@ pub struct SourceResult {
 }
 
 /// The receiver's verdict for a run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
     pub run_id: u32,
     pub shape: String,

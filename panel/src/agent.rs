@@ -525,6 +525,22 @@ impl Agent {
                     None => ack(Err(anyhow::anyhow!("no_such_test"))),
                 }
             }
+            Request::IpTestReceiver {
+                shape,
+                bind,
+                seconds,
+                run_id,
+                expect,
+                loss,
+            } => to_json(&ip_test_receive(shape, bind, seconds, run_id, expect, loss).await),
+            Request::IpTestSender {
+                to,
+                shape,
+                sources,
+                count,
+                interval_ms,
+                run_id,
+            } => to_json(&ip_test_send(to, shape, sources, count, interval_ms, run_id).await),
         }
     }
 
@@ -873,6 +889,89 @@ fn ack(result: Result<()>) -> Vec<u8> {
             ok: false,
             error: Some(format!("{e:#}")),
         }),
+    }
+}
+
+/// Runs the spoof-test receiver on this server and wraps the report for the wire.
+async fn ip_test_receive(
+    shape: String,
+    bind: String,
+    seconds: u16,
+    run_id: u32,
+    expect: u16,
+    loss: u8,
+) -> crate::wire::IpTestReceiverReply {
+    use crate::wire::IpTestReceiverReply;
+    let Some(shape) = kariz::config::SpoofShape::from_name(&shape) else {
+        return IpTestReceiverReply {
+            ok: false,
+            error: Some(format!("unknown shape {shape:?}")),
+            report: None,
+        };
+    };
+    let opts = kariz::spooftest::ReceiverOptions {
+        bind,
+        shape,
+        seconds: seconds.clamp(1, 120),
+        run_id,
+        expect,
+        loss_pct: loss.min(100),
+        interface: String::new(),
+    };
+    match kariz::spooftest::receiver(opts).await {
+        Ok(report) => IpTestReceiverReply {
+            ok: true,
+            error: None,
+            report: Some(report),
+        },
+        Err(e) => IpTestReceiverReply {
+            ok: false,
+            error: Some(format!("{e}")),
+            report: None,
+        },
+    }
+}
+
+/// Runs the spoof-test sender on this server and wraps the summary for the wire.
+async fn ip_test_send(
+    to: String,
+    shape: String,
+    sources: Vec<String>,
+    count: u16,
+    interval_ms: u16,
+    run_id: u32,
+) -> crate::wire::IpTestSenderReply {
+    use crate::wire::IpTestSenderReply;
+    let Some(shape) = kariz::config::SpoofShape::from_name(&shape) else {
+        return IpTestSenderReply {
+            ok: false,
+            error: Some(format!("unknown shape {shape:?}")),
+            sent: 0,
+            sources: 0,
+        };
+    };
+    let opts = kariz::spooftest::SenderOptions {
+        to,
+        shape,
+        sources,
+        count,
+        interval_ms,
+        run_id,
+        interface: String::new(),
+    };
+    match kariz::spooftest::sender(opts).await {
+        Ok(r) => IpTestSenderReply {
+            ok: true,
+            error: None,
+            sent: r.sent,
+            sources: r.sources,
+        },
+        Err(e) => IpTestSenderReply {
+            ok: false,
+            error: Some(format!("{e}")),
+            sent: 0,
+            sources: 0,
+        },
     }
 }
 
