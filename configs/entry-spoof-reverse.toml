@@ -1,7 +1,9 @@
 # Entry side (Iran), reverse mode, spoof transport: the KCP stack over a source-spoofing
-# raw-socket carrier. Both ends forge their source IP from a pool and rotate it per packet,
-# so the traffic blends into ordinary background traffic and defeats stateful DPI. Linux
-# only, and needs root (or CAP_NET_RAW). It only works where the network does not filter
+# raw-socket carrier. Each end forges its source IP from its OWN pool and rotates it per
+# packet, so the traffic blends into ordinary background traffic and defeats stateful DPI.
+# The two servers keep separate lists — an address that gets through from one side may be
+# filtered from the other, so test and fill each side's pool on its own. Linux only, and
+# needs root (or CAP_NET_RAW). It only works where the network does not filter
 # forged-source packets (no BCP38 / uRPF on the path); use `kariz spooftest` or the panel's
 # IP Tester to find which source addresses get through. Encryption is mandatory.
 #

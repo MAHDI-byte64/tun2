@@ -115,14 +115,18 @@ export function IcmpOptions({ value, onChange }: { value: IcmpState; onChange: (
 // ---- spoof ----
 
 export interface SpoofState {
-  /** The forged-source pool as the person types it (IPs/CIDRs/ranges, one per line or comma-separated). */
-  pool: string;
+  /** The entry server's forged-source list, as typed (IPs/CIDRs/ranges, per line or comma-separated). */
+  entryPool: string;
+  /** The exit server's forged-source list — the two servers never share a list. */
+  exitPool: string;
   manageFw: boolean;
 }
-export const emptySpoof = (): SpoofState => ({ pool: "", manageFw: true });
-export const spoofFrom = (s?: SpoofSpec | null): SpoofState => ({
-  pool: (s?.pool ?? []).join("\n"),
-  manageFw: s?.manage_firewall ?? true,
+export const emptySpoof = (): SpoofState => ({ entryPool: "", exitPool: "", manageFw: true });
+/** Rebuilds the two-list state from the two servers' resolved per-side specs (entry, exit). */
+export const spoofFrom = (entry?: SpoofSpec | null, exit?: SpoofSpec | null): SpoofState => ({
+  entryPool: (entry?.pool ?? []).join("\n"),
+  exitPool: (exit?.pool ?? []).join("\n"),
+  manageFw: entry?.manage_firewall ?? exit?.manage_firewall ?? true,
 });
 
 /** Splits the pool text into entries (one per line, comma or whitespace separated). */
@@ -154,26 +158,52 @@ export function spoofPoolCount(text: string): number {
 }
 
 export const spoofOf = (s: SpoofState, shape: string, active: boolean): SpoofSpec | undefined =>
-  active ? { shape, pool: parseSpoofPool(s.pool), manage_firewall: s.manageFw } : undefined;
+  active
+    ? { shape, entry_pool: parseSpoofPool(s.entryPool), exit_pool: parseSpoofPool(s.exitPool), manage_firewall: s.manageFw }
+    : undefined;
 
-export function SpoofOptions({ value, onChange }: { value: SpoofState; onChange: (v: SpoofState) => void }) {
+export function SpoofOptions({
+  value,
+  onChange,
+  entryName,
+  exitName,
+}: {
+  value: SpoofState;
+  onChange: (v: SpoofState) => void;
+  entryName?: string;
+  exitName?: string;
+}) {
   const { t } = useApp();
-  const count = spoofPoolCount(value.pool);
+  // Each server forges from its own list, so the two sides never share addresses.
+  const poolField = (which: "entry" | "exit", server: string | undefined, text: string) => {
+    const count = spoofPoolCount(text);
+    const label = server ? t(`spf.poolFor`, { server }) : t(which === "entry" ? "spf.poolEntry" : "spf.poolExit");
+    return (
+      <div className="field">
+        <label htmlFor={`sp-pool-${which}`}>{label}</label>
+        <textarea
+          id={`sp-pool-${which}`}
+          className="text mono"
+          rows={4}
+          dir="ltr"
+          spellCheck={false}
+          placeholder={"203.0.113.10\n203.0.113.0/24\n198.51.100.1-198.51.100.9"}
+          value={text}
+          onChange={(e) => onChange(which === "entry" ? { ...value, entryPool: e.target.value } : { ...value, exitPool: e.target.value })}
+        />
+        <span className="help">{count > 0 ? t("spf.poolCount", { n: String(count) }) : t("spf.poolHelp")}</span>
+      </div>
+    );
+  };
   return (
     <div className="field">
       <span className="label">{t("spf.title")}</span>
-      <div className="field">
-        <label htmlFor="sp-pool">{t("spf.pool")}</label>
-        <textarea
-          id="sp-pool"
-          className="text mono"
-          rows={4}
-          spellCheck={false}
-          placeholder={"203.0.113.10\n203.0.113.0/24\n198.51.100.1-198.51.100.9"}
-          value={value.pool}
-          onChange={(e) => onChange({ ...value, pool: e.target.value })}
-        />
-        <span className="help">{count > 0 ? t("spf.poolCount", { n: String(count) }) : t("spf.poolHelp")}</span>
+      <p className="help" style={{ margin: "0 0 var(--sp-2)" }}>
+        {t("spf.twoLists")}
+      </p>
+      <div className="grid-2">
+        {poolField("entry", entryName, value.entryPool)}
+        {poolField("exit", exitName, value.exitPool)}
       </div>
       <label className="check">
         <input type="checkbox" checked={value.manageFw} onChange={(e) => onChange({ ...value, manageFw: e.target.checked })} /> {t("spf.manageFw")}

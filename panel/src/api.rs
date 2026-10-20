@@ -1489,6 +1489,13 @@ async fn iptest_run(
                     error(StatusCode::BAD_REQUEST, &why)
                 }
                 "offline" => error(StatusCode::CONFLICT, &why),
+                // A sender/receiver failure (no CAP_NET_RAW, a missing port, an egress the
+                // kernel refuses) carries the real reason: surface it so the tester can show
+                // why no result came back, instead of a blank "internal".
+                "sender" | "receiver" => {
+                    tracing::warn!(error = %why, "ip spoof test failed on an agent");
+                    error(StatusCode::BAD_GATEWAY, &why)
+                }
                 _ => internal(e),
             }
         }

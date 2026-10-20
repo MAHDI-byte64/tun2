@@ -89,8 +89,9 @@ pub struct PairRequest {
     /// `icmp`: the ICMP carrier knobs, applied to both sides.
     #[serde(default)]
     pub icmp: Option<crate::wire::IcmpSpec>,
-    /// `spoof`: the source-spoofing carrier knobs (shape, forged-source pool), applied to
-    /// both sides. The accepting side's `peer` is filled in from the dialing server's
+    /// `spoof`: the source-spoofing carrier knobs. The shape is shared; the two servers'
+    /// forged-source lists travel as `entry_pool` / `exit_pool` and the pair layer gives each
+    /// side its own. The accepting side's `peer` is filled in from the dialing server's
     /// address by the pair layer when the wizard leaves it empty.
     #[serde(default)]
     pub spoof: Option<crate::wire::SpoofSpec>,
@@ -165,7 +166,7 @@ impl PairRequest {
                 .then(|| self.icmp.clone())
                 .flatten()
                 .filter(|i| !i.is_empty()),
-            spoof: self.spoof_for(accepts),
+            spoof: self.spoof_for(accepts, role == "entry"),
             helper: self.helper_for(accepts),
             l3: self.l3_for(accepts),
             forwards: if role == "entry" {
@@ -278,17 +279,29 @@ impl PairRequest {
         (!side.is_empty()).then_some(side)
     }
 
-    /// This side's `[tunnel.spoof]` settings. Both sides get the shape and the forged-source
-    /// pool; only the accepting side carries `peer` (the dialer's real address), since the
-    /// dialing side learns the peer from the address it dials.
-    fn spoof_for(&self, acceptor: bool) -> Option<crate::wire::SpoofSpec> {
+    /// This side's `[tunnel.spoof]` settings. Each side gets the shape and *its own*
+    /// forged-source list (the entry server's `entry_pool`, the exit server's `exit_pool`),
+    /// so the two servers never share a pool. Only the accepting side carries `peer` (the
+    /// dialer's real address), since the dialing side learns the peer from the address it
+    /// dials.
+    fn spoof_for(&self, acceptor: bool, is_entry: bool) -> Option<crate::wire::SpoofSpec> {
         if self.transport != "spoof" {
             return None;
         }
-        let mut s = self.spoof.clone().unwrap_or_default();
-        if !acceptor {
-            s.peer = None;
-        }
+        let base = self.spoof.clone().unwrap_or_default();
+        let s = crate::wire::SpoofSpec {
+            shape: base.shape,
+            pool: if is_entry {
+                base.entry_pool
+            } else {
+                base.exit_pool
+            },
+            // The split lists are wizard-only; the resolved per-side spec carries just `pool`.
+            entry_pool: Vec::new(),
+            exit_pool: Vec::new(),
+            peer: acceptor.then_some(base.peer).flatten(),
+            manage_firewall: base.manage_firewall,
+        };
         (!s.is_empty()).then_some(s)
     }
 
@@ -498,23 +511,27 @@ impl PairRequest {
                 bail!("bad_l3_layer");
             }
         }
-        // The spoof transport needs a known shape and at least one forged source address.
+        // The spoof transport needs a known shape and a separate forged-source list for each
+        // server (the two ends never share a pool).
         if self.transport == "spoof" {
             let spoof = self.spoof.as_ref();
             let shape = spoof.and_then(|s| s.shape.as_deref()).unwrap_or("udp");
             if kariz::config::SpoofShape::from_name(shape).is_none() {
                 bail!("bad_spoof_shape");
             }
-            let pool = spoof.map(|s| s.pool.as_slice()).unwrap_or_default();
-            if pool.is_empty() {
+            let entry_pool = spoof.map(|s| s.entry_pool.as_slice()).unwrap_or_default();
+            let exit_pool = spoof.map(|s| s.exit_pool.as_slice()).unwrap_or_default();
+            if entry_pool.is_empty() || exit_pool.is_empty() {
                 bail!("spoof_pool_required");
             }
-            // Reject a malformed pool entry up front (the core also rejects it).
-            if kariz::config::expand_ipv4_specs(pool, kariz::config::SPOOF_POOL_MAX)
-                .map(|p| p.is_empty())
-                .unwrap_or(true)
-            {
-                bail!("bad_spoof_pool");
+            // Reject a malformed entry in either list up front (the core also rejects it).
+            for pool in [entry_pool, exit_pool] {
+                if kariz::config::expand_ipv4_specs(pool, kariz::config::SPOOF_POOL_MAX)
+                    .map(|p| p.is_empty())
+                    .unwrap_or(true)
+                {
+                    bail!("bad_spoof_pool");
+                }
             }
         }
         // udp, faketcp, icmp, stealth, l3 and spoof seal nothing of their own: the tunnel's
@@ -1499,6 +1516,51 @@ mod tests {
         assert!(version_at_least("2.0.0-rc1", min) && version_at_least("1.5.0-dev", min));
         assert!(!version_at_least("1.4.0", min) && !version_at_least("1.4.99", min));
         assert!(!version_at_least("", min) && !version_at_least("unknown", min));
+    }
+
+    #[test]
+    fn spoof_gives_each_server_its_own_forged_list() {
+        let req = PairRequest {
+            name: "t".into(),
+            entry: "a".into(),
+            exit: "b".into(),
+            mode: "direct".into(),
+            transport: "spoof".into(),
+            listen: "0.0.0.0:3080".into(),
+            dial: "1.2.3.4:3080".into(),
+            spoof: Some(crate::wire::SpoofSpec {
+                shape: Some("udp".into()),
+                entry_pool: vec!["203.0.113.1".into(), "203.0.113.2".into()],
+                exit_pool: vec!["198.51.100.9".into()],
+                manage_firewall: Some(true),
+                ..Default::default()
+            }),
+            forwards: Vec::new(),
+            ..Default::default()
+        };
+        // Two non-empty lists are accepted.
+        assert!(req.validate().is_ok());
+
+        let (entry, exit) = req.specs(Some("tok"), None);
+        let es = entry.spoof.expect("entry spoof");
+        let xs = exit.spoof.expect("exit spoof");
+        // Each side forges from its OWN list, and neither carries the other's.
+        assert_eq!(
+            es.pool,
+            vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()]
+        );
+        assert_eq!(xs.pool, vec!["198.51.100.9".to_string()]);
+        // The split lists are wizard-only and never reach a resolved per-side spec.
+        assert!(es.entry_pool.is_empty() && es.exit_pool.is_empty());
+        assert!(xs.entry_pool.is_empty() && xs.exit_pool.is_empty());
+
+        // Leaving either server's list empty is refused: the two never share a pool.
+        let mut bad = req.clone();
+        bad.spoof.as_mut().unwrap().exit_pool.clear();
+        assert_eq!(
+            bad.validate().unwrap_err().to_string(),
+            "spoof_pool_required"
+        );
     }
 
     #[test]

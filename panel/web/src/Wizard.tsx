@@ -268,7 +268,8 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
       if (isWs && !wsPath.startsWith("/")) return t("wz.wsPath");
       if (transport === "wss" && !tlsReady(tls)) return t("tls.needCert");
     }
-    if (s === 1 && spoof && parseSpoofPool(spoofS.pool).length === 0) return t("spf.poolNeeded");
+    if (s === 1 && spoof && (parseSpoofPool(spoofS.entryPool).length === 0 || parseSpoofPool(spoofS.exitPool).length === 0))
+      return t("spf.poolNeeded");
     if (s === 1 && !cipherReady(enc, tp, encAck)) return t("enc.needAck");
     if (s === 1 && muxToSpec(mux).bad) return t(`mux.${muxToSpec(mux).bad}`) + ": " + t("mux.badValue");
     if (s === 3 && parsed.bad !== undefined) return parsed.bad ? t("wz.badPorts", { bit: parsed.bad }) : t("wz.ports");
@@ -504,7 +505,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                 {rootOnly && <RootWarning />}
                 {spoof && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
-                    <SpoofOptions value={spoofS} onChange={setSpoofS} />
+                    <SpoofOptions value={spoofS} onChange={setSpoofS} entryName={serverName(entry)} exitName={serverName(exit)} />
                   </div>
                 )}
                 {!spoof && transport === "stealth" && (

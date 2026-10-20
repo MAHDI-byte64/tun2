@@ -37,9 +37,10 @@ pub struct Ask {
     /// Probes to send per source (0: a default).
     #[serde(default)]
     pub count: u16,
-    /// Acceptable loss as a percentage (a source passes at `100 - loss`% arrival).
+    /// Acceptable loss as a percentage (a source passes at `100 - loss`% arrival). Absent
+    /// (not `0`) means the default — so an explicit `0` asks for strict 100% arrival.
     #[serde(default)]
-    pub loss: u8,
+    pub loss: Option<u8>,
 }
 
 /// The default probes per source, and the default destination port for the port shapes.
@@ -104,11 +105,7 @@ pub async fn run(hub: &Hub, ask: Ask) -> Result<Report> {
     } else {
         ask.count.min(1000)
     };
-    let loss = if ask.loss == 0 {
-        DEFAULT_LOSS
-    } else {
-        ask.loss.min(100)
-    };
+    let loss = ask.loss.map(|v| v.min(100)).unwrap_or(DEFAULT_LOSS);
     let port = if has_ports {
         if ask.port == 0 {
             DEFAULT_PORT
