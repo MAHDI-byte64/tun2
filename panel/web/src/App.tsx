@@ -3,6 +3,7 @@ import { ApiError, api, setCsrf } from "./api";
 import type { ServerInfo, SessionInfo } from "./api";
 import { Login, loginError, tokenIn } from "./Login";
 import { MapPage, ServersPage, SettingsPage } from "./pages";
+import { IpTesterPage } from "./IpTester";
 import { LogsPage } from "./Logs";
 import { NetworksPage } from "./Networks";
 import { PAGES, Shell } from "./Shell";
@@ -258,6 +259,7 @@ export function App() {
             />
           )}
           {route.page === "networks" && <NetworksPage servers={servers} onChanged={changed} />}
+          {route.page === "iptester" && <IpTesterPage servers={servers} loaded={loaded} />}
           {route.page === "logs" && <LogsPage servers={servers} />}
           {route.page === "settings" && (
             <SettingsPage

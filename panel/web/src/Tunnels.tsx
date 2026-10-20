@@ -512,7 +512,7 @@ function TunnelPage({
 
       <div className="tab-panel" role="tabpanel" id="td-panel-tools" aria-labelledby="td-tab-tools" hidden={tab !== "tools"}>
         <Card title={t("sp.title")} sub={t("sp.sub")}>
-          <SpeedTest tunnel={tunnel} />
+          {tunnel.transport === "l3" ? <p className="muted small pad">{t("sp.l3")}</p> : <SpeedTest tunnel={tunnel} />}
         </Card>
 
         {tunnel.paired && tunnel.entry && tunnel.exit && (

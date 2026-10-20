@@ -22,6 +22,8 @@ pub mod l3;
 mod limit;
 mod relay;
 pub mod speedtest;
+#[cfg(feature = "rawlink")]
+pub mod spooftest;
 pub mod stats;
 mod udp;
 

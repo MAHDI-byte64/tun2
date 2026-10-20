@@ -57,6 +57,8 @@ struct Spec {
     token: &'static str,
     /// The firewall comment prefix the rules carry while the tunnel is up.
     fw_prefix: &'static str,
+    /// For `transport = "spoof"`: the on-wire shape (`""` for the other carriers).
+    shape: &'static str,
 }
 
 /// Runs one scenario: brings the tunnel up, echoes a payload through it, checks the RAII
@@ -91,6 +93,11 @@ fn run(spec: &Spec) {
         v => format!("proxy_protocol = \"{v}\""),
     };
     let options = spec.tunnel_options();
+    // For spoof, each side forges from a pool; the accepting side is also told the dialer's
+    // real address (127.0.0.1 over loopback) so it can address its replies.
+    let entry_acceptor = spec.mode == "reverse";
+    let spoof_entry = spec.spoof_table(entry_acceptor);
+    let spoof_exit = spec.spoof_table(!entry_acceptor);
     let entry = format!(
         r#"
         role = "entry"
@@ -104,6 +111,7 @@ fn run(spec: &Spec) {
         {entry_addr}
         token = "{token}"
         {options}
+        {spoof_entry}
         "#,
         mode = spec.mode,
         token = spec.token,
@@ -116,6 +124,7 @@ fn run(spec: &Spec) {
         {exit_addr}
         token = "{token}"
         {options}
+        {spoof_exit}
         "#,
         mode = spec.mode,
         token = spec.token,
@@ -184,6 +193,23 @@ impl Spec {
         }
         o += "[tuning]\nkeepalive_secs = 5\n";
         o
+    }
+
+    /// The `[tunnel.spoof]` table for one side (empty for the non-spoof carriers). Over
+    /// loopback the forged sources are loopback addresses, and `acceptor` adds the peer's
+    /// real address so the accepting side can reply.
+    fn spoof_table(&self, acceptor: bool) -> String {
+        if self.shape.is_empty() {
+            return String::new();
+        }
+        let mut t = format!(
+            "[tunnel.spoof]\nshape = \"{}\"\npool = [\"127.0.0.2\", \"127.0.0.3\"]\n",
+            self.shape
+        );
+        if acceptor {
+            t += "peer = \"127.0.0.1\"\n";
+        }
+        t
     }
 }
 
@@ -336,6 +362,7 @@ const fn icmp(mode: &'static str, token: &'static str) -> Spec {
         proxy_protocol: "",
         token,
         fw_prefix: "kariz-icmp-",
+        shape: "",
     }
 }
 
@@ -343,6 +370,15 @@ const fn faketcp(mode: &'static str, token: &'static str) -> Spec {
     Spec {
         transport: "faketcp",
         fw_prefix: "kariz-faketcp-",
+        ..icmp(mode, token)
+    }
+}
+
+const fn spoof(shape: &'static str, mode: &'static str, token: &'static str) -> Spec {
+    Spec {
+        transport: "spoof",
+        fw_prefix: "kariz-spoof-",
+        shape,
         ..icmp(mode, token)
     }
 }
@@ -367,4 +403,19 @@ rawlink_tests! {
     faketcp_reverse_no_mux_proxy_v2: Spec { mux: false, proxy_protocol: "v2", ..faketcp("reverse", "kariz-e2e-faketcp-nomux-proxy") };
     faketcp_direct_chacha_proxy_v2: Spec { encryption: "chacha20-poly1305", proxy_protocol: "v2", ..faketcp("direct", "kariz-e2e-faketcp-chacha-proxy") };
     faketcp_reverse_fec_proxy_v2: Spec { fec: (10, 3), proxy_protocol: "v2", ..faketcp("reverse", "kariz-e2e-faketcp-fec-proxy") };
+
+    // The source-spoofing carrier, one row per shape plus mux/fec/chacha/direct/proxy
+    // variants, over loopback (forged loopback sources, both ends forging).
+    spoof_udp_reverse: spoof("udp", "reverse", "kariz-e2e-spoof-udp-rev");
+    spoof_udp_direct: spoof("udp", "direct", "kariz-e2e-spoof-udp-dir");
+    spoof_tcp_reverse: spoof("tcp", "reverse", "kariz-e2e-spoof-tcp-rev");
+    spoof_tcp_direct: spoof("tcp", "direct", "kariz-e2e-spoof-tcp-dir");
+    spoof_icmp_reverse: spoof("icmp", "reverse", "kariz-e2e-spoof-icmp-rev");
+    spoof_gre_reverse: spoof("gre", "reverse", "kariz-e2e-spoof-gre-rev");
+    spoof_ipip_reverse: spoof("ipip", "reverse", "kariz-e2e-spoof-ipip-rev");
+    spoof_proto58_reverse: spoof("proto58", "reverse", "kariz-e2e-spoof-proto58-rev");
+    spoof_udp_reverse_no_mux: Spec { mux: false, ..spoof("udp", "reverse", "kariz-e2e-spoof-udp-nomux") };
+    spoof_udp_reverse_fec: Spec { fec: (10, 3), ..spoof("udp", "reverse", "kariz-e2e-spoof-udp-fec") };
+    spoof_tcp_direct_chacha: Spec { encryption: "chacha20-poly1305", ..spoof("tcp", "direct", "kariz-e2e-spoof-tcp-chacha") };
+    spoof_udp_reverse_proxy_v2: Spec { proxy_protocol: "v2", ..spoof("udp", "reverse", "kariz-e2e-spoof-udp-proxy") };
 }

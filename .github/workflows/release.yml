@@ -4,6 +4,13 @@ name: Release
 # and publishes a GitHub release with the notes of that version from CHANGELOG.md.
 # One archive per architecture, named kariz-<tag>-<arch>-linux.tar.gz, each with its
 # SHA-256 (scripts/kariz.sh downloads them by those names).
+#
+# The binaries move between jobs as release assets (uploaded with `gh release`), not as
+# Actions artifacts: release-asset storage is separate from the Actions artifact-storage
+# quota, so a full artifact quota no longer blocks a release. A `prepare` job creates the
+# release (as a draft) first so the matrix uploads have somewhere to go, and the `publish`
+# job downloads the archives back, signs them, attaches the signatures, sets the notes and
+# publishes it.
 on:
   push:
     tags: ["v*"]
@@ -15,7 +22,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Make sure a release exists for the tag before the matrix uploads to it. If one was made
+  # from the web UI already (which is what created the tag), this is a no-op.
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the version in Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - name: Ensure a draft release exists for the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --title "Kariz $GITHUB_REF_NAME" \
+              --notes "Build in progress…"
+          fi
+
   build:
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
@@ -32,13 +62,6 @@ jobs:
             cross: true
     steps:
       - uses: actions/checkout@v4
-      - name: Tag matches the version in Cargo.toml
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -68,22 +91,24 @@ jobs:
           cp -r configs systemd scripts assets "$name/"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kariz-${{ matrix.arch }}
-          path: |
-            kariz-*.tar.gz
-            kariz-*.tar.gz.sha256
+      # Upload the archive and its checksum to the release (a release asset, so the Actions
+      # artifact-storage quota does not apply). The publish job signs them afterwards.
+      - name: Upload the archive to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="kariz-$GITHUB_REF_NAME-${{ matrix.arch }}-linux"
+          gh release upload "$GITHUB_REF_NAME" --clobber "$name.tar.gz" "$name.tar.gz.sha256"
 
   publish:
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: kariz-*
-          merge-multiple: true
+      - name: Download the archives from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --pattern 'kariz-*.tar.gz' --pattern 'kariz-*.tar.gz.sha256'
       - name: Three archives, each with its checksum
         run: |
           ls -l kariz-*
@@ -118,7 +143,7 @@ jobs:
         run: |
           # A version with a dash (v0.8.0-beta) is a prerelease: GitHub's "latest release",
           # which `kariz-manager install` and `update` use, stays on the last stable one.
-          flags=()
-          case "$GITHUB_REF_NAME" in *-*) flags=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" --title "Kariz $GITHUB_REF_NAME" "${flags[@]}" \
-            --notes-file notes.md kariz-*.tar.gz kariz-*.tar.gz.sha256 kariz-*.tar.gz.sig
+          flags=(--draft=false)
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          gh release upload "$GITHUB_REF_NAME" --clobber kariz-*.tar.gz.sig
+          gh release edit "$GITHUB_REF_NAME" --title "Kariz $GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}"

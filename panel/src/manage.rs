@@ -102,6 +102,25 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
             tunnel.insert("icmp".into(), Value::Table(t));
         }
     }
+    if let Some(s) = spec.spoof.as_ref().filter(|s| !s.is_empty()) {
+        if spec.transport == "spoof" {
+            let mut t = Table::new();
+            if let Some(shape) = &s.shape {
+                t.insert("shape".into(), text(shape));
+            }
+            if !s.pool.is_empty() {
+                let pool = s.pool.iter().map(|p| text(p)).collect::<Vec<_>>();
+                t.insert("pool".into(), Value::Array(pool));
+            }
+            if let Some(peer) = &s.peer {
+                t.insert("peer".into(), text(peer));
+            }
+            if let Some(v) = s.manage_firewall {
+                t.insert("manage_firewall".into(), Value::Boolean(v));
+            }
+            tunnel.insert("spoof".into(), Value::Table(t));
+        }
+    }
     if let Some(h) = spec.helper.as_ref().filter(|h| !h.is_empty()) {
         if matches!(spec.transport.as_str(), "naive" | "xhttp" | "reality") {
             tunnel.insert("helper".into(), Value::Table(helper_table(h, text)));
@@ -416,7 +435,8 @@ fn plain_text(spec: &Spec) -> Result<()> {
 }
 
 /// The protocol the accepting side listens with, from the transport (for `l3`, from its
-/// carrier). `icmp` answers raw echoes and binds no port, so it has none.
+/// carrier). `icmp` answers raw echoes and `proto47` rides raw protocol 47, so they bind no
+/// port and have none.
 fn listen_proto(spec: &Spec) -> Option<&'static str> {
     let carrier = if spec.transport == "l3" {
         spec.l3.as_ref().map_or("udp", |l| l.carrier.as_str())
@@ -424,7 +444,7 @@ fn listen_proto(spec: &Spec) -> Option<&'static str> {
         spec.transport.as_str()
     };
     match carrier {
-        "icmp" => None,
+        "icmp" | "proto47" => None,
         "quic" | "kcp" | "udp" => Some("udp"),
         _ => Some("tcp"),
     }
@@ -626,6 +646,12 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
         }),
         icmp: c.tunnel.icmp.as_ref().map(|i| crate::wire::IcmpSpec {
             manage_firewall: Some(i.manage_firewall),
+        }),
+        spoof: c.tunnel.spoof.as_ref().map(|s| crate::wire::SpoofSpec {
+            shape: Some(s.shape.name().to_owned()),
+            pool: s.pool.clone(),
+            peer: s.peer.clone(),
+            manage_firewall: Some(s.manage_firewall),
         }),
         helper: c.tunnel.helper.as_ref().map(|h| {
             let path = |p: &Option<PathBuf>| {
@@ -1370,6 +1396,33 @@ mod tests {
         assert_eq!(got.forwards.len(), 1);
         assert!(got.token.is_none(), "the token is never handed back");
         assert_eq!(existing_token(&d.0.join("main.toml")), Some("a".repeat(48)));
+    }
+
+    #[test]
+    fn a_spoof_spec_renders_and_reads_back() {
+        let d = Dir::new();
+        let mut s = spec("spoofy");
+        s.transport = "spoof".into();
+        s.spoof = Some(crate::wire::SpoofSpec {
+            shape: Some("icmp".into()),
+            pool: vec!["203.0.113.10".into(), "203.0.113.0/30".into()],
+            peer: Some("198.51.100.9".into()),
+            manage_firewall: Some(true),
+        });
+        put(&d.0, &s).unwrap();
+        let got = get(&d.0, "spoofy").unwrap();
+        assert_eq!(got.transport, "spoof");
+        let spoof = got.spoof.expect("spoof table read back");
+        assert_eq!(spoof.shape.as_deref(), Some("icmp"));
+        assert_eq!(spoof.peer.as_deref(), Some("198.51.100.9"));
+        assert_eq!(
+            spoof.pool,
+            vec!["203.0.113.10".to_string(), "203.0.113.0/30".to_string()]
+        );
+        assert_eq!(spoof.manage_firewall, Some(true));
+        // The rendered file carries a [tunnel.spoof] table the core accepts.
+        let text = std::fs::read_to_string(d.0.join("spoofy.toml")).unwrap();
+        assert!(text.contains("[tunnel.spoof]"), "{text}");
     }
 
     #[test]

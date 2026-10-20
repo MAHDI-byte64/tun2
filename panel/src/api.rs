@@ -72,6 +72,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/bench", post(bench_start).get(bench_state))
         .route("/api/bench/stop", post(bench_stop))
         .route("/api/bench/last", get(bench_last))
+        .route("/api/iptest", post(iptest_run))
+        .route("/api/iptest/last", get(iptest_last))
         .route("/api/tunnels/speedtest", post(tunnel_speedtest))
         .route("/api/tunnels/cert", post(tunnel_cert))
         .route("/api/tunnels/speedtest/start", post(tunnel_speedtest_start))
@@ -1458,6 +1460,56 @@ async fn bench_last(
     }
 }
 
+/// Runs one IP spoof test from one server to another and returns the scored report.
+async fn iptest_run(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<crate::iptest::Ask>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let (from, to) = (body.from.clone(), body.to.clone());
+    match crate::iptest::run(&state.hub, body).await {
+        Ok(report) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!("ran an IP spoof test from {from} to {to}"),
+            );
+            reply(StatusCode::OK, json!({ "report": report }))
+        }
+        Err(e) => {
+            let why = format!("{e:#}");
+            match why.split(':').next().unwrap_or_default() {
+                "bad_input" | "same_server" | "not_ipv4" | "no_address" => {
+                    error(StatusCode::BAD_REQUEST, &why)
+                }
+                "offline" => error(StatusCode::CONFLICT, &why),
+                _ => internal(e),
+            }
+        }
+    }
+}
+
+/// The last IP spoof test between two servers (from, to), if there is one.
+async fn iptest_last(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PairQuery>,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers, false) {
+        return r;
+    }
+    match crate::iptest::last(&state.hub, &q.entry, &q.exit) {
+        Ok(t) => reply(StatusCode::OK, json!({ "iptest": t })),
+        Err(e) => internal(e),
+    }
+}
+
 #[derive(Deserialize)]
 struct ServerQuery {
     server: String,
@@ -1615,6 +1667,7 @@ async fn tunnel_speedtest(
         Err(e) => match format!("{e:#}").as_str() {
             "no_such_tunnel" => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
             "bad_name" => error(StatusCode::BAD_REQUEST, "bad_name"),
+            "l3_no_speedtest" => error(StatusCode::BAD_REQUEST, "l3_no_speedtest"),
             _ => internal(e),
         },
     }
@@ -1652,6 +1705,7 @@ async fn tunnel_speedtest_start(
         Err(e) => match format!("{e:#}").as_str() {
             "no_such_tunnel" => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
             "bad_name" => error(StatusCode::BAD_REQUEST, "bad_name"),
+            "l3_no_speedtest" => error(StatusCode::BAD_REQUEST, "l3_no_speedtest"),
             _ => internal(e),
         },
     }
@@ -1716,6 +1770,7 @@ async fn tunnel_speedtest_poll(
         Err(e) => match format!("{e:#}").as_str() {
             "no_such_tunnel" => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
             "bad_name" => error(StatusCode::BAD_REQUEST, "bad_name"),
+            "l3_no_speedtest" => error(StatusCode::BAD_REQUEST, "l3_no_speedtest"),
             _ => internal(e),
         },
     }

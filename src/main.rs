@@ -87,6 +87,70 @@ enum Command {
         #[command(subcommand)]
         command: HelperCommand,
     },
+    /// Find which forged source addresses survive the path to another server, for the
+    /// `spoof` transport's pool. Run `receiver` on the destination server and `sender` on
+    /// the source server (Linux, root). See `kariz spooftest --help`.
+    #[cfg(feature = "rawlink")]
+    Spooftest {
+        #[command(subcommand)]
+        command: SpooftestCommand,
+    },
+}
+
+/// Subcommands of `kariz spooftest`.
+#[cfg(feature = "rawlink")]
+#[derive(Subcommand)]
+enum SpooftestCommand {
+    /// Receive and tally probes on the destination server; prints which source addresses
+    /// got through. Start it just before the sender.
+    Receiver {
+        /// Address to receive on (`ip:port`); the port is used by the udp/tcp shapes.
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind: String,
+        /// Packet shape to expect: udp, tcp, icmp, gre, ipip or proto58.
+        #[arg(long, default_value = "udp")]
+        shape: String,
+        /// Seconds to capture (1-120).
+        #[arg(long, default_value_t = 10)]
+        seconds: u16,
+        /// Run id to accept (must match the sender).
+        #[arg(long, default_value_t = 1)]
+        run_id: u32,
+        /// Probes the sender emits per source (for scoring pass/fail).
+        #[arg(long, default_value_t = 20)]
+        expect: u16,
+        /// Acceptable loss as a percentage; a source passes at `100 - loss`% arrival.
+        #[arg(long, default_value_t = 20)]
+        loss: u8,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send probes from forged source addresses to the receiver's real address.
+    Sender {
+        /// The receiver's real address (`ip:port`).
+        #[arg(long)]
+        to: String,
+        /// Packet shape to probe with: udp, tcp, icmp, gre, ipip or proto58.
+        #[arg(long, default_value = "udp")]
+        shape: String,
+        /// Source addresses to forge: IPs, CIDR blocks or `a.b.c.d-e.f.g.h` ranges
+        /// (repeatable or comma-separated).
+        #[arg(long = "source", value_delimiter = ',', required = true)]
+        sources: Vec<String>,
+        /// Probes to send per source.
+        #[arg(long, default_value_t = 20)]
+        count: u16,
+        /// Delay between probes, in milliseconds.
+        #[arg(long, default_value_t = 5)]
+        interval: u16,
+        /// Run id (must match the receiver).
+        #[arg(long, default_value_t = 1)]
+        run_id: u32,
+        /// Print the summary as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands of `kariz helper`.
@@ -147,7 +211,113 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "helpers")]
         Command::Helper { command } => helper(command),
+        #[cfg(feature = "rawlink")]
+        Command::Spooftest { command } => spooftest(command),
     }
+}
+
+/// `kariz spooftest <receiver|sender>`: probe which forged source addresses get through.
+#[cfg(feature = "rawlink")]
+fn spooftest(command: SpooftestCommand) -> Result<()> {
+    use kariz::config::SpoofShape;
+    use kariz::spooftest::{self, ReceiverOptions, SenderOptions};
+
+    fn parse_shape(s: &str) -> Result<SpoofShape> {
+        toml::from_str::<ShapeHolder>(&format!("shape = \"{s}\"\n"))
+            .map(|h| h.shape)
+            .map_err(|_| {
+                anyhow::anyhow!("unknown shape {s:?}: use udp, tcp, icmp, gre, ipip or proto58")
+            })
+    }
+    #[derive(serde::Deserialize)]
+    struct ShapeHolder {
+        shape: SpoofShape,
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        match command {
+            SpooftestCommand::Receiver {
+                bind,
+                shape,
+                seconds,
+                run_id,
+                expect,
+                loss,
+                json,
+            } => {
+                let opts = ReceiverOptions {
+                    bind,
+                    shape: parse_shape(&shape)?,
+                    seconds: seconds.clamp(1, 120),
+                    run_id,
+                    expect,
+                    loss_pct: loss.min(100),
+                    interface: String::new(),
+                };
+                let report = spooftest::receiver(opts)
+                    .await
+                    .context("spoof test receiver failed")?;
+                if json {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else {
+                    println!(
+                        "spoof test ({}): {} of {} source(s) usable (>= {}% arrival)",
+                        report.shape,
+                        report.usable,
+                        report.seen,
+                        100u8.saturating_sub(report.loss_pct)
+                    );
+                    for r in &report.results {
+                        println!(
+                            "  {:<15} {:>3}/{:<3} {}",
+                            r.ip,
+                            r.received,
+                            report.expect,
+                            if r.ok { "ok" } else { "--" }
+                        );
+                    }
+                    if report.seen == 0 {
+                        println!("  (no probes arrived; the path may drop forged sources, or the sender did not run)");
+                    }
+                }
+                Ok(())
+            }
+            SpooftestCommand::Sender {
+                to,
+                shape,
+                sources,
+                count,
+                interval,
+                run_id,
+                json,
+            } => {
+                let opts = SenderOptions {
+                    to,
+                    shape: parse_shape(&shape)?,
+                    sources,
+                    count,
+                    interval_ms: interval,
+                    run_id,
+                    interface: String::new(),
+                };
+                let report = spooftest::sender(opts)
+                    .await
+                    .context("spoof test sender failed")?;
+                if json {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else {
+                    println!(
+                        "spoof test sender ({}): sent {} probe(s) across {} source(s), run {}",
+                        report.shape, report.sent, report.sources, report.run_id
+                    );
+                }
+                Ok(())
+            }
+        }
+    })
 }
 
 /// `kariz helper <install|status|uuid|reality-keys>`.

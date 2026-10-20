@@ -167,6 +167,43 @@ export type LinkTransport = "auto" | "tcpmux" | "kcp" | "wss" | "quic";
 /** How a private network's links are made. */
 export type LinkKind = "gre" | "vxlan";
 
+/** A request to probe which forged source addresses get from one server to another. */
+export interface IpTestAsk {
+  from: string;
+  to: string;
+  shape: string;
+  sources: string[];
+  port?: number;
+  count?: number;
+  loss?: number;
+}
+
+/** One forged source address's result in an IP spoof test. */
+export interface IpSourceResult {
+  ip: string;
+  received: number;
+  ok: boolean;
+}
+
+/** The scored report of an IP spoof test. */
+export interface IpReport {
+  run_id: number;
+  shape: string;
+  expect: number;
+  loss_pct: number;
+  results: IpSourceResult[];
+  usable: number;
+  seen: number;
+}
+
+/** A saved IP-test result for a (from, to) pair. */
+export interface IpSaved {
+  from: string;
+  to: string;
+  created: number;
+  report: IpReport;
+}
+
 /** Whether a benchmark path goes across a private network link (GRE or VXLAN). */
 export const isPrivatePath = (path: string) => path === "gre" || path === "vxlan";
 
@@ -355,6 +392,8 @@ export interface PairRequest {
   faketcp?: FaketcpSpec;
   /** icmp: the ICMP carrier knobs. */
   icmp?: IcmpSpec;
+  /** spoof: the source-spoofing carrier knobs (shape, forged-source pool). */
+  spoof?: SpoofSpec;
   /** naive / xhttp / reality: the managed-helper credentials (split per side by the panel). */
   helper?: HelperSpec;
   /** l3: the carrier the sealed GRE rides (`udp`, `quic`, `faketcp` or `icmp`). */
@@ -388,6 +427,18 @@ export interface FaketcpSpec {
 
 /** icmp: the ICMP-echo carrier knobs (`[tunnel.icmp]`). */
 export interface IcmpSpec {
+  manage_firewall?: boolean;
+}
+
+/** spoof: the source-spoofing carrier knobs (`[tunnel.spoof]`). */
+export interface SpoofSpec {
+  /** The on-wire packet shape: `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`. */
+  shape?: string;
+  /** The forged source addresses to rotate through (IPs, CIDR blocks or `a-b` ranges). */
+  pool?: string[];
+  /** The peer's real address (filled in by the panel for the accepting side). */
+  peer?: string;
+  /** Install and remove the best-effort iptables rules (RAII). */
   manage_firewall?: boolean;
 }
 
@@ -446,6 +497,7 @@ export interface Spec {
   stealth?: StealthSpec;
   faketcp?: FaketcpSpec;
   icmp?: IcmpSpec;
+  spoof?: SpoofSpec;
   helper?: HelperSpec;
   l3?: L3Spec;
 }
@@ -665,6 +717,9 @@ export const api = {
   benchState: (id: string) => call<Bench>("GET", `bench?id=${encodeURIComponent(id)}`),
   benchStop: (id: string) => call<object>("POST", "bench/stop", { id }),
   benchLast: (entry: string, exit: string) => call<{ bench: Bench | null }>("GET", `bench/last?entry=${encodeURIComponent(entry)}&exit=${encodeURIComponent(exit)}`),
+  ipTest: (body: IpTestAsk) => call<{ report: IpReport }>("POST", "iptest", body),
+  ipTestLast: (from: string, to: string) =>
+    call<{ iptest: IpSaved | null }>("GET", `iptest/last?entry=${encodeURIComponent(from)}&exit=${encodeURIComponent(to)}`),
   speedtestStart: (name: string, seconds: number, streams: number, udp: boolean) =>
     call<SpeedStart>("POST", "tunnels/speedtest/start", { name, seconds, streams, udp }),
   speedtestStop: (name: string, id: string) => call<{ ok: boolean }>("POST", "tunnels/speedtest/stop", { name, id }),

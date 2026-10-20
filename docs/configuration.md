@@ -129,6 +129,15 @@ The raw ICMP-echo carrier. Linux + root.
 |---|---|---|---|
 | `manage_firewall` | `true`, `false` | `true` | Install and remove the iptables rules that suppress the kernel's automatic echo replies (RAII). Off: the tunnel still runs but pays an extra uplink. |
 
+## `[tunnel.proto47]` (the `proto47` [l3] carrier)
+
+The raw IP protocol-47 / keyed-GRE carrier. Available only as an `[l3] carrier`, not as a
+standalone `[tunnel] transport`. Linux + root (CAP_NET_RAW).
+
+| Key | Values | Default | Notes |
+|---|---|---|---|
+| `manage_firewall` | `true`, `false` | `true` | Install and remove the best-effort `-p gre -j ACCEPT` iptables rule (RAII), so protocol 47 survives a default-DROP INPUT policy. Off: the tunnel still runs unless such a policy blocks it. |
+
 ## `[tunnel.helper]` (`naive`, `xhttp`, `reality`)
 
 Credentials and paths for a managed helper transport. Which keys are required depends on the
@@ -164,7 +173,7 @@ own session. Linux only, root. See [Transports](transports.md#l3--gre-direct-tun
 | `layer` | `3`, `2` | `3` | `3`: a TUN device carrying IP packets. `2`: a TAP device carrying Ethernet frames (an encrypted GRETAP). |
 | `local_ip` | CIDR, e.g. `10.10.0.1/30` | required for `layer = 3` | This end's address on the tunnel. Optional for `layer = 2`. |
 | `peer_ip` | IP, e.g. `10.10.0.2` | required for `layer = 3` | The peer's address on the tunnel. Optional for `layer = 2`. |
-| `carrier` | `udp`, `quic`, `faketcp`, `icmp` | required | The carrier the sealed GRE packets ride. Reliable carriers are rejected (TCP-over-TCP meltdown). |
+| `carrier` | `udp`, `quic`, `faketcp`, `icmp`, `proto47` | required | The carrier the sealed GRE packets ride. Reliable carriers are rejected (TCP-over-TCP meltdown). `proto47` is Linux + root and puts (encrypted) IP protocol 47 on the wire; see [Transports](transports.md#l3--gre-direct-tunnel). |
 | `gre_key` | a 32-bit number | `0` | RFC 2890 key; both ends compare it. Lets several logical tunnels share a carrier. |
 | `iface` | interface name | next free `kzN` | The device name to create. |
 | `mtu` | 576 - 1500 | `1400` | The TUN/TAP interface MTU. |

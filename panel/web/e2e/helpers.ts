@@ -18,8 +18,8 @@ export async function signIn(page: Page, opts: { lang?: "en" | "fa"; theme?: "ni
   await expect(page.locator("#app .rail")).toBeVisible({ timeout: 30_000 });
 }
 
-/** The pages by the order of the rail: map, servers, tunnels, networks, logs, settings. */
-export const PAGES = ["map", "servers", "tunnels", "networks", "logs", "settings"] as const;
+/** The pages by the order of the rail: map, servers, tunnels, networks, iptester, logs, settings. */
+export const PAGES = ["map", "servers", "tunnels", "networks", "iptester", "logs", "settings"] as const;
 
 export async function goTo(page: Page, name: (typeof PAGES)[number]) {
   const items = page.locator(".rail-item:not(.rail-extra)");

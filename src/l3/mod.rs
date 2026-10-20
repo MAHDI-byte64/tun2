@@ -4,9 +4,12 @@
 //!
 //! The packets are GRE-encapsulated ([`gre`], RFC 2784 + RFC 2890 key), sealed inside the
 //! tunnel's own authenticated, encrypted session ([`session`], reusing `crate::crypto` /
-//! `crate::channel`), and handed to an unreliable carrier (udp / quic / faketcp / icmp).
-//! There is no bare IP protocol 47 on the wire. TCP SYNs leaving a layer-3 interface have
-//! their MSS clamped ([`mss`]).
+//! `crate::channel`), and handed to an unreliable carrier (udp / quic / faketcp / icmp /
+//! proto47). With every carrier but `proto47` there is no bare IP protocol 47 on the wire —
+//! the sealed bytes ride the carrier's own framing. The `proto47` carrier does put protocol
+//! 47 on the wire (the sealed KCP packets are the payload of a keyed GRE packet), still
+//! encrypted and not interoperable with standard/kernel GRE. TCP SYNs leaving a layer-3
+//! interface have their MSS clamped ([`mss`]).
 //!
 //! Both directions: `mode = "listen"` waits for the inbound connection (the acceptor side),
 //! `mode = "dial"` reaches out, and either host may dial — the user's "direct and reverse"
@@ -20,6 +23,7 @@ pub mod session;
 pub mod tun;
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -28,6 +32,7 @@ use tracing::{info, warn};
 
 use crate::config::{Config, L3Carrier, L3Config, L3Mode, TransportKind};
 use crate::crypto::Crypto;
+use crate::stats::{Peer, Stats};
 use crate::transport::Settings;
 
 use session::{L3Dialer, L3Listener, L3Params, L3Session};
@@ -89,9 +94,12 @@ impl L3Runner {
         })
     }
 
-    /// Runs the tunnel until a fatal error.
-    pub async fn run(self) -> io::Result<()> {
+    /// Runs the tunnel until a fatal error. `stats` is the shared status the control socket
+    /// serves: the session coming up or failing is recorded on `stats.peer`, so `kariz
+    /// status` and the panel's "waiting for both sides" see this end connect.
+    pub async fn run(self, stats: Arc<Stats>) -> io::Result<()> {
         tun::host_supports_l3()?;
+        stats.set_active_transport(Some(self.carrier.name()));
         info!(
             mode = self.mode.name(),
             carrier = self.carrier.name(),
@@ -140,24 +148,27 @@ impl L3Runner {
             Some(forward::start(&self.ports, self.accept_udp, self.peer_ip.as_deref()).await?)
         };
 
+        let peer = stats.peer.clone();
         match self.mode {
-            L3Mode::Dial => self.run_dial(&device).await,
-            L3Mode::Listen => self.run_listen(&device).await,
+            L3Mode::Dial => self.run_dial(&device, &peer).await,
+            L3Mode::Listen => self.run_listen(&device, &peer).await,
         }
     }
 
     /// Dial side: keep a session up, reconnecting on failure and rekeying periodically.
-    async fn run_dial(&self, device: &TunDevice) -> io::Result<()> {
+    async fn run_dial(&self, device: &TunDevice, peer: &Arc<Peer>) -> io::Result<()> {
         let dialer = L3Dialer::new(&self.params, &self.addr)?;
         loop {
             match dialer.dial().await {
                 Ok(session) => {
+                    peer.link_up();
                     info!(peer = %self.addr, "l3 session established");
                     // The rekey timer ends the session so the next loop re-handshakes.
                     let _ = timeout(REKEY_INTERVAL, pump(device, &session, self.gre_key)).await;
                     info!("l3 session ended; re-handshaking");
                 }
                 Err(e) => {
+                    peer.failed(&e);
                     warn!(peer = %self.addr, error = %e, "l3 dial failed; retrying");
                     sleep(DIAL_BACKOFF).await;
                 }
@@ -167,12 +178,13 @@ impl L3Runner {
 
     /// Listen side: accept one peer at a time (a tunnel is point-to-point); when it ends,
     /// accept the next.
-    async fn run_listen(&self, device: &TunDevice) -> io::Result<()> {
+    async fn run_listen(&self, device: &TunDevice, peer: &Arc<Peer>) -> io::Result<()> {
         let listener = L3Listener::bind(&self.params, &self.addr).await?;
         info!(addr = ?listener.local_addr().ok(), "l3 listening");
         loop {
             match listener.accept().await {
                 Ok(session) => {
+                    peer.link_up();
                     info!("l3 session established");
                     if let Err(e) = pump(device, &session, self.gre_key).await {
                         warn!(error = %e, "l3 session ended");
@@ -184,6 +196,7 @@ impl L3Runner {
                     if e.kind() == io::ErrorKind::BrokenPipe {
                         return Err(e);
                     }
+                    peer.failed(&e);
                     warn!(error = %e, "l3 accept failed; waiting for the next peer");
                 }
             }
@@ -244,6 +257,7 @@ fn build_params(l3: &L3Config, token: &str, config: &Config) -> io::Result<L3Par
         L3Carrier::Quic => TransportKind::Quic,
         L3Carrier::Faketcp => TransportKind::Faketcp,
         L3Carrier::Icmp => TransportKind::Icmp,
+        L3Carrier::Proto47 => TransportKind::Proto47,
     };
     let synthetic = synthetic_config(kind, token, l3)?;
     let crypto = Crypto::new(token, config.tunnel.encryption).with_mux(true);
@@ -299,11 +313,31 @@ fn synthetic_config(kind: TransportKind, token: &str, l3: &L3Config) -> io::Resu
             ));
         }
     }
-    Config::parse(&toml).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:#}")))
+    // Parsed (not `Config::parse`d) so the standalone-transport validation does not apply: this
+    // is a fixed internal template built after the real `[l3]` config was already validated, and
+    // some carriers (e.g. `proto47`) are valid only here, not as a standalone `[tunnel]` transport.
+    toml::from_str(&toml).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:#}")))
 }
 
 /// Entry point dispatched from [`crate::run`] when `[l3]` is present.
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    L3Runner::from_config(&config)?.run().await?;
+    let runner = L3Runner::from_config(&config)?;
+    let stats = Stats::new(&config);
+
+    // Serve the control socket, exactly as the entry/exit modes do, so `kariz status` and the
+    // panel can read this end's connected / last-error state. Without it an l3 tunnel can be
+    // fully up yet report nothing, and the panel's "waiting for both sides to connect" times
+    // out even though the link is live. The `[l3]` tunnel leaves `[tunnel].transport` at its
+    // default (`tcp`), so the peer status is the non-mux kind, set by `Peer::link_up`.
+    #[cfg(unix)]
+    if let Some(socket) = config.control_socket() {
+        tokio::spawn(crate::control::serve(
+            socket,
+            None::<crate::control::NoOpen>,
+            stats.clone(),
+        ));
+    }
+
+    runner.run(stats).await?;
     Ok(())
 }

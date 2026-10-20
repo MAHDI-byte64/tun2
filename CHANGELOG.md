@@ -1,6 +1,52 @@
 # Changelog
 
-## 2.7.0 (unreleased)
+## 2.9.0 - 2026-10-20
+
+### Added
+
+- **`spoof` transport — mutual source-IP spoofing.** A new tunnel transport (the sixteenth)
+  that rides the KCP stack inside crafted packets whose **source IP is forged and rotated from
+  a pool**, so the traffic blends into ordinary background traffic and defeats stateful DPI.
+  Both ends forge their source and are told the other's real address, so it is strictly
+  point-to-point. The on-wire packet shape is chosen with `[tunnel.spoof] shape`: `udp`
+  (lowest overhead, the default), `tcp`, `icmp`, `gre`, `ipip` or `proto58`. Encryption is
+  mandatory, and mux, FEC and the KCP fast modes all apply, so with the `ultraspeed` profile
+  and the `udp` shape it runs at full tilt. Linux + root; `[tunnel.spoof] manage_firewall`
+  controls the best-effort iptables rules. It only works where the path does not filter
+  forged-source packets (no BCP38 / uRPF).
+- **IP spoof tester.** `kariz spooftest sender|receiver` and a panel **IP Tester** page probe
+  which forged source addresses survive the path between two servers (any shape, single IPs /
+  CIDR blocks / ranges, with a loss threshold), so a spoof tunnel's pool can be filled with
+  addresses that get through. The panel page copies the usable addresses straight into a pool.
+- The tunnel wizard gains a third connection kind, **source spoofing**, beside direct and
+  reverse: picking it swaps the transport tiles for the six spoof shapes and adds the
+  forged-source pool field. Both sides of a tunnel need this version for the `spoof` transport.
+
+## 2.8.0 - 2026-10-18
+
+### Added
+
+- **`proto47` l3 carrier** — the `[l3]` / GRE tunnel can now ride a raw IP protocol-47
+  (keyed-GRE) socket (`[l3] carrier = "proto47"`), beside `udp`, `quic`, `faketcp` and `icmp`.
+  Kariz's sealed, authenticated session is the GRE payload, so it stays encrypted end to end;
+  this is **not** bare cleartext GRE and is **not** interoperable with standard/kernel GRE. It
+  looks like protocol 47 on the wire, so it does **not** traverse NAT and does **not** evade a
+  DPI network — use it only on a trusted link where a proto-47 path or the lower overhead is
+  what you want. Linux + root; `[tunnel.proto47] manage_firewall` controls the best-effort
+  iptables rule that lets protocol 47 through a default-DROP policy.
+
+### Fixed
+
+- The `l3` / GRE direct tunnel now serves its control socket and reports the peer's
+  connected / last-error state, as the entry and exit modes do. Pairing an l3 tunnel from the
+  panel waits for both sides to report connected, but an l3 process served no status, so the
+  panel timed out ("the two sides did not connect in time") even when the link was up. It now
+  sees the tunnel connect — and shows the real reason when a side cannot.
+- The panel no longer offers its (mux-stream) speed test for an `l3` / GRE tunnel, which has
+  no stream path: it explains to measure throughput over the `kzN` interface instead (for
+  example iperf3 between the tunnel IPs), rather than failing with a confusing error.
+
+## 2.7.0 - 2026-10-18
 
 Nine new transports, from padded TCP to protocols that borrow a real HTTPS site, and a new
 **direct layer-3 / GRE tunnel** that carries whole IP packets (or Ethernet frames) between two

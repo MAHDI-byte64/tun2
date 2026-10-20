@@ -1,4 +1,4 @@
-import type { FaketcpSpec, HelperSpec, IcmpSpec, StealthSpec } from "./api";
+import type { FaketcpSpec, HelperSpec, IcmpSpec, SpoofSpec, StealthSpec } from "./api";
 import { useApp } from "./store";
 import { Icon } from "./ui";
 
@@ -108,6 +108,80 @@ export function IcmpOptions({ value, onChange }: { value: IcmpState; onChange: (
         <input type="checkbox" checked={value.manageFw} onChange={(e) => onChange({ ...value, manageFw: e.target.checked })} /> {t("ic.manageFw")}
       </label>
       <span className="help">{t("ic.manageFwHelp")}</span>
+    </div>
+  );
+}
+
+// ---- spoof ----
+
+export interface SpoofState {
+  /** The forged-source pool as the person types it (IPs/CIDRs/ranges, one per line or comma-separated). */
+  pool: string;
+  manageFw: boolean;
+}
+export const emptySpoof = (): SpoofState => ({ pool: "", manageFw: true });
+export const spoofFrom = (s?: SpoofSpec | null): SpoofState => ({
+  pool: (s?.pool ?? []).join("\n"),
+  manageFw: s?.manage_firewall ?? true,
+});
+
+/** Splits the pool text into entries (one per line, comma or whitespace separated). */
+export function parseSpoofPool(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((x) => x.trim())
+    .filter((x) => x.length > 0);
+}
+
+/** How many addresses a pool text expands to, for the hint (CIDR and ranges counted). */
+export function spoofPoolCount(text: string): number {
+  let n = 0;
+  for (const e of parseSpoofPool(text)) {
+    const cidr = e.match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/);
+    const range = e.match(/^(\d+\.\d+\.\d+\.\d+)\s*-\s*(\d+\.\d+\.\d+\.\d+)$/);
+    if (cidr) {
+      const bits = +cidr[2];
+      n += bits >= 31 ? 1 << (32 - bits) : (1 << (32 - bits)) - 2;
+    } else if (range) {
+      const lo = range[1].split(".").reduce((a, b) => a * 256 + +b, 0);
+      const hi = range[2].split(".").reduce((a, b) => a * 256 + +b, 0);
+      n += Math.max(0, hi - lo + 1);
+    } else {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+export const spoofOf = (s: SpoofState, shape: string, active: boolean): SpoofSpec | undefined =>
+  active ? { shape, pool: parseSpoofPool(s.pool), manage_firewall: s.manageFw } : undefined;
+
+export function SpoofOptions({ value, onChange }: { value: SpoofState; onChange: (v: SpoofState) => void }) {
+  const { t } = useApp();
+  const count = spoofPoolCount(value.pool);
+  return (
+    <div className="field">
+      <span className="label">{t("spf.title")}</span>
+      <div className="field">
+        <label htmlFor="sp-pool">{t("spf.pool")}</label>
+        <textarea
+          id="sp-pool"
+          className="text mono"
+          rows={4}
+          spellCheck={false}
+          placeholder={"203.0.113.10\n203.0.113.0/24\n198.51.100.1-198.51.100.9"}
+          value={value.pool}
+          onChange={(e) => onChange({ ...value, pool: e.target.value })}
+        />
+        <span className="help">{count > 0 ? t("spf.poolCount", { n: String(count) }) : t("spf.poolHelp")}</span>
+      </div>
+      <label className="check">
+        <input type="checkbox" checked={value.manageFw} onChange={(e) => onChange({ ...value, manageFw: e.target.checked })} /> {t("spf.manageFw")}
+      </label>
+      <span className="help">{t("spf.manageFwHelp")}</span>
+      <p className="help" style={{ marginTop: "var(--sp-3)" }}>
+        {t("spf.tip")}
+      </p>
     </div>
   );
 }
@@ -224,7 +298,7 @@ export function HelperFields({ transport, value, onChange }: { transport: string
 
 // ---- l3 / GRE ----
 
-export const L3_CARRIERS = ["udp", "quic", "faketcp", "icmp"] as const;
+export const L3_CARRIERS = ["udp", "quic", "faketcp", "icmp", "proto47"] as const;
 export interface L3State {
   carrier: string;
   layer: number;

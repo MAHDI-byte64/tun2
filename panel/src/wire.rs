@@ -104,6 +104,27 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sni: Option<String>,
     },
+    /// Receive and tally spoof-test probes of `shape` on this server for `seconds`, scoring
+    /// each forged source by arrival. The answer is the report. Run it just before the
+    /// sender on the other server. Only an agent of 2.9 or newer knows it.
+    IpTestReceiver {
+        shape: String,
+        bind: String,
+        seconds: u16,
+        run_id: u32,
+        expect: u16,
+        loss: u8,
+    },
+    /// Send spoof-test probes of `shape` from each forged source in `sources` to `to`
+    /// (the receiver's real address). Only an agent of 2.9 or newer knows it.
+    IpTestSender {
+        to: String,
+        shape: String,
+        sources: Vec<String>,
+        count: u16,
+        interval_ms: u16,
+        run_id: u32,
+    },
     /// A release is about to be sent (its three files and their sizes).
     UpdateBegin {
         version: String,
@@ -324,6 +345,11 @@ pub struct Spec {
     /// `icmp`: the ICMP carrier knobs (`[tunnel.icmp]`). 2.7 or newer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icmp: Option<IcmpSpec>,
+    /// `spoof`: the source-spoofing carrier knobs (`[tunnel.spoof]`), already resolved for
+    /// this side (the pool, the shape, and the peer's real address on the accepting side).
+    /// 2.9 or newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoof: Option<SpoofSpec>,
     /// `naive` / `xhttp` / `reality`: the managed-helper credentials (`[tunnel.helper]`),
     /// already split for this side (the acceptor keeps the server secrets, the dialer the
     /// client ones). 2.7 or newer.
@@ -392,6 +418,31 @@ impl IcmpSpec {
     }
 }
 
+/// `[tunnel.spoof]`: the source-spoofing carrier knobs (Linux, root). The `pool` and `peer`
+/// are resolved per side by the pair layer before this crosses the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpoofSpec {
+    /// The on-wire packet shape: `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+    /// The forged source addresses this side rotates through (IPs, CIDR blocks or ranges).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool: Vec<String>,
+    /// The peer's real address, needed by the accepting side to address its replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// Install and remove the best-effort iptables rules (RAII). Left out: on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manage_firewall: Option<bool>,
+}
+
+impl SpoofSpec {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// `[tunnel.helper]`: credentials and paths for a managed helper transport (`naive`,
 /// `xhttp`, `reality`), already filtered for one side. A certificate or key path must be
 /// one the manager made (see [`crate::manage::valid_cert_path`]); the agent reads no other.
@@ -453,7 +504,8 @@ impl HelperSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct L3Spec {
-    /// `udp`, `quic`, `faketcp` or `icmp`: the unreliable carrier the sealed GRE rides.
+    /// `udp`, `quic`, `faketcp`, `icmp` or `proto47`: the unreliable carrier the sealed GRE
+    /// rides.
     pub carrier: String,
     /// `3` (TUN, IP packets, the default) or `2` (TAP, Ethernet frames). Left out: 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -538,6 +590,28 @@ pub struct SpeedReply {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<kariz::speedtest::Report>,
+}
+
+/// The answer to [`Request::IpTestReceiver`]: the scored report, or why it could not run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IpTestReceiverReply {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<kariz::spooftest::Report>,
+}
+
+/// The answer to [`Request::IpTestSender`]: what was emitted, or why it could not run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IpTestSenderReply {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub sent: u64,
+    #[serde(default)]
+    pub sources: u32,
 }
 
 /// The answer to [`Request::TunnelCert`]: the files of the certificate, or why there are none.

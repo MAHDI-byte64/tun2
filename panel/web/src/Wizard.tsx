@@ -17,23 +17,27 @@ import { ProxyProtocol, proxyOf } from "./ProxyProtocol";
 import type { ProxyChoice } from "./ProxyProtocol";
 import { BenchPanel, benchLabel, isV6 } from "./Benchmark";
 import type { BenchChoice } from "./Benchmark";
-import { MUX_OPTIONAL, ROOT_ONLY, TRANSPORTS, joinTransport, transportLabel } from "./transport";
+import { MUX_OPTIONAL, ROOT_ONLY, SPOOF_SHAPES, TRANSPORTS, joinTransport, transportLabel } from "./transport";
 import {
   FaketcpOptions,
   HelperFields,
   IcmpOptions,
   L3Options,
   RootWarning,
+  SpoofOptions,
   StealthOptions,
   emptyFaketcp,
   emptyHelper,
   emptyIcmp,
   emptyL3,
+  emptySpoof,
   emptyStealth,
   faketcpOf,
   helperOf,
   icmpOf,
   l3Of,
+  parseSpoofPool,
+  spoofOf,
   stealthOf,
 } from "./TransportOptions";
 import { FIRST_TUNNEL_PORT, freeTunnelPort, hostOf, portOf, portsInUse } from "./ports";
@@ -104,6 +108,11 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const [exit, setExit] = useState("");
   const [mode, setMode] = useState("reverse");
   const [transport, setTransport] = useState<string>("tcp");
+  // Source spoofing is a third "connection kind" beside reverse/direct: when on, the tunnel
+  // transport is `spoof` and the tiles below pick its on-wire shape.
+  const [spoof, setSpoof] = useState(false);
+  const [spoofShape, setSpoofShape] = useState<string>("udp");
+  const [spoofS, setSpoofS] = useState(emptySpoof());
   const [muxOn, setMuxOn] = useState(true);
   const [profile, setProfile] = useState<string>("balanced");
   const [listenPort, setListenPort] = useState(String(FIRST_TUNNEL_PORT));
@@ -168,6 +177,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   // network of a GRE path, and the IPv6 address of an IPv6 path (or back to the IPv4 one from an IPv6 address).
   const applyBench = (c: BenchChoice) => {
     setMode(c.mode);
+    setSpoof(false);
     setTransport(c.transport === "tcpmux" ? "tcp" : c.transport);
     setMuxOn(true);
     setNetId(c.network ?? "");
@@ -184,10 +194,12 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const greLink = netId ? linkBetween(links, netId, entry, exit) : undefined;
   // The tunnel listens on the private address of the server that accepts it, in either mode.
   const greAddr = greLink ? (greLink.a === acceptor ? greLink.addr_a : greLink.addr_b) : "";
-  const udp = transport === "quic" || transport === "kcp" || transport === "udp";
-  const isWs = transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux";
-  const isL3 = transport === "l3";
-  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp"].includes(l3S.carrier));
+  // The transport the backend sees: `spoof` when the spoofing kind is on, else the picked one.
+  const tp = spoof ? "spoof" : transport;
+  const udp = !spoof && (transport === "quic" || transport === "kcp" || transport === "udp");
+  const isWs = !spoof && (transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux");
+  const isL3 = !spoof && transport === "l3";
+  const rootOnly = ROOT_ONLY.includes(tp) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
 
   // The accepting server's address, as the other one reaches it. A new tunnel starts from
   // the best guess (the address set for it, else the one the panel sees) until one is typed.
@@ -213,7 +225,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     entry,
     exit,
     mode,
-    transport: joinTransport(transport, muxOn).core,
+    transport: spoof ? "spoof" : joinTransport(transport, muxOn).core,
     profile,
     listen: `${listenHost}:${listenPort}`,
     dial: `${dialHost.includes(":") && !dialHost.startsWith("[") ? `[${dialHost}]` : dialHost}:${listenPort}`,
@@ -224,8 +236,8 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     // A server name typed for a self-signed certificate is not sent with a real one: the
     // other side checks a real one against the name it was issued for (tls_host).
     tls_sni: transport === "wss" && tls.mode === "self" && sni.trim() ? sni.trim() : undefined,
-    mux: muxSpecOf(mux, transport, muxOn),
-    encryption: cipherOf(enc, transport),
+    mux: muxSpecOf(mux, tp, muxOn),
+    encryption: cipherOf(enc, tp),
     quic_obfs: obfsOf(obfs, transport),
     max_conns_per_ip: perIpOf(perIp).value,
     udp_max_flows: protocol.includes("udp") ? udpFlowsOf(udpFlows).value : undefined,
@@ -236,6 +248,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     stealth: stealthOf(stealthS, transport),
     faketcp: faketcpOf(faketcpS, transport),
     icmp: icmpOf(icmpS, transport),
+    spoof: spoofOf(spoofS, spoofShape, spoof),
     helper: helperOf(helperS, transport),
     ...l3Of(l3S, transport),
     forwards: parsed.forwards,
@@ -255,7 +268,8 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
       if (isWs && !wsPath.startsWith("/")) return t("wz.wsPath");
       if (transport === "wss" && !tlsReady(tls)) return t("tls.needCert");
     }
-    if (s === 1 && !cipherReady(enc, transport, encAck)) return t("enc.needAck");
+    if (s === 1 && spoof && parseSpoofPool(spoofS.pool).length === 0) return t("spf.poolNeeded");
+    if (s === 1 && !cipherReady(enc, tp, encAck)) return t("enc.needAck");
     if (s === 1 && muxToSpec(mux).bad) return t(`mux.${muxToSpec(mux).bad}`) + ": " + t("mux.badValue");
     if (s === 3 && parsed.bad !== undefined) return parsed.bad ? t("wz.badPorts", { bit: parsed.bad }) : t("wz.ports");
     if (s === 3 && perIpOf(perIp).bad) return t("perip.bad");
@@ -415,7 +429,17 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                 </div>
                 <div className="tiles" role="radiogroup" aria-label={t("wz.q2")}>
                   {(["reverse", "direct"] as const).map((m) => (
-                    <button key={m} type="button" role="radio" aria-checked={mode === m} className="tile" onClick={() => setMode(m)}>
+                    <button
+                      key={m}
+                      type="button"
+                      role="radio"
+                      aria-checked={!spoof && mode === m}
+                      className="tile"
+                      onClick={() => {
+                        setSpoof(false);
+                        setMode(m);
+                      }}
+                    >
                       <span className="t1">{t(`wz.mode.${m}`)}</span>
                       <span className="t2">{t(`wz.mode.${m}.d`)}</span>
                       <span className="tick">
@@ -423,20 +447,37 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                       </span>
                     </button>
                   ))}
+                  <button key="spoof" type="button" role="radio" aria-checked={spoof} className="tile" onClick={() => setSpoof(true)}>
+                    <span className="t1">{t("wz.mode.spoof")}</span>
+                    <span className="t2">{t("wz.mode.spoof.d")}</span>
+                    <span className="tick">
+                      <Icon name="check" size={14} />
+                    </span>
+                  </button>
                 </div>
                 <h3 className="wz-q" style={{ marginTop: "var(--sp-6)", fontSize: "var(--fs-lg)" }}>
-                  {t("wz.transport")}
+                  {spoof ? t("wz.spoofShape") : t("wz.transport")}
                 </h3>
-                <div className="tiles" role="radiogroup" aria-label={t("wz.transport")}>
-                  {TRANSPORTS.map((x) => (
-                    <button key={x} type="button" role="radio" aria-checked={transport === x} className="tile" onClick={() => setTransport(x)}>
-                      <span className="t1 mono">{x}</span>
-                      <span className="t2">{t(`wz.tr.${x}`)}</span>
-                      <span className="tick">
-                        <Icon name="check" size={14} />
-                      </span>
-                    </button>
-                  ))}
+                <div className="tiles" role="radiogroup" aria-label={spoof ? t("wz.spoofShape") : t("wz.transport")}>
+                  {spoof
+                    ? SPOOF_SHAPES.map((x) => (
+                        <button key={x} type="button" role="radio" aria-checked={spoofShape === x} className="tile" onClick={() => setSpoofShape(x)}>
+                          <span className="t1 mono">{x}</span>
+                          <span className="t2">{t(`wz.shape.${x}`)}</span>
+                          <span className="tick">
+                            <Icon name="check" size={14} />
+                          </span>
+                        </button>
+                      ))
+                    : TRANSPORTS.map((x) => (
+                        <button key={x} type="button" role="radio" aria-checked={transport === x} className="tile" onClick={() => setTransport(x)}>
+                          <span className="t1 mono">{x}</span>
+                          <span className="t2">{t(`wz.tr.${x}`)}</span>
+                          <span className="tick">
+                            <Icon name="check" size={14} />
+                          </span>
+                        </button>
+                      ))}
                 </div>
                 <h3 className="wz-q" style={{ marginTop: "var(--sp-6)", fontSize: "var(--fs-lg)" }}>
                   {t("wz.profile")}
@@ -453,30 +494,35 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                   ))}
                 </div>
                 <div style={{ marginTop: "var(--sp-6)" }}>
-                  <EncryptionChoice value={enc} onChange={setEnc} transport={transport} ack={encAck} onAck={setEncAck} />
+                  <EncryptionChoice value={enc} onChange={setEnc} transport={tp} ack={encAck} onAck={setEncAck} />
                 </div>
-                {transport === "quic" && (
+                {!spoof && transport === "quic" && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
                     <QuicObfs value={obfs} onChange={setObfs} />
                   </div>
                 )}
                 {rootOnly && <RootWarning />}
-                {transport === "stealth" && (
+                {spoof && (
+                  <div style={{ marginTop: "var(--sp-5)" }}>
+                    <SpoofOptions value={spoofS} onChange={setSpoofS} />
+                  </div>
+                )}
+                {!spoof && transport === "stealth" && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
                     <StealthOptions value={stealthS} onChange={setStealthS} />
                   </div>
                 )}
-                {transport === "faketcp" && (
+                {!spoof && transport === "faketcp" && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
                     <FaketcpOptions value={faketcpS} onChange={setFaketcpS} />
                   </div>
                 )}
-                {transport === "icmp" && (
+                {!spoof && transport === "icmp" && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
                     <IcmpOptions value={icmpS} onChange={setIcmpS} />
                   </div>
                 )}
-                {["naive", "xhttp", "reality"].includes(transport) && (
+                {!spoof && ["naive", "xhttp", "reality"].includes(transport) && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
                     <HelperFields transport={transport} value={helperS} onChange={setHelperS} />
                   </div>
@@ -488,13 +534,13 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                 )}
                 {!isL3 && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
-                    <MuxToggle transport={transport} value={muxOn} onChange={setMuxOn} />
+                    <MuxToggle transport={tp} value={muxOn} onChange={setMuxOn} />
                   </div>
                 )}
-                {!isL3 && (muxOn || !MUX_OPTIONAL.includes(transport)) && (
+                {!isL3 && (muxOn || !MUX_OPTIONAL.includes(tp)) && (
                   <details className="adv">
                     <summary>{t("mux.title")}</summary>
-                    <MuxFields value={mux} onChange={setMux} profile={profile} transport={transport} />
+                    <MuxFields value={mux} onChange={setMux} profile={profile} transport={tp} />
                   </details>
                 )}
               </>

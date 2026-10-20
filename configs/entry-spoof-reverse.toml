@@ -1,0 +1,36 @@
+# Entry side (Iran), reverse mode, spoof transport: the KCP stack over a source-spoofing
+# raw-socket carrier. Both ends forge their source IP from a pool and rotate it per packet,
+# so the traffic blends into ordinary background traffic and defeats stateful DPI. Linux
+# only, and needs root (or CAP_NET_RAW). It only works where the network does not filter
+# forged-source packets (no BCP38 / uRPF on the path); use `kariz spooftest` or the panel's
+# IP Tester to find which source addresses get through. Encryption is mandatory.
+#
+# For the highest speed, use `profile = "ultraspeed"` and `shape = "udp"` (the lowest
+# overhead); mux and FEC ride the KCP stack, and mimalloc is built in.
+#
+# Pair: exit-spoof-reverse.toml.
+role = "entry"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "spoof"
+listen = "0.0.0.0:3080"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.spoof]
+shape = "udp"                       # udp | tcp | icmp | gre | ipip | proto58
+# The source addresses this side forges, rotated round-robin per packet. Each entry is a
+# single IP, a CIDR block or an inclusive a.b.c.d-e.f.g.h range (expanded, capped at 1024).
+pool = ["203.0.113.0/24"]
+# The accepting side cannot learn the dialer from the (forged) packets, so it is told the
+# dialer's real address here. The panel fills this in automatically.
+peer = "EXIT_SERVER_IP"
+manage_firewall = true             # install/remove the best-effort iptables rules (RAII)
+
+[[forward]]
+listen = "0.0.0.0:443"
+target = "127.0.0.1:443"
+
+[log]
+level = "info"
