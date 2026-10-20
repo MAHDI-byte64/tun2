@@ -652,6 +652,7 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
             pool: s.pool.clone(),
             peer: s.peer.clone(),
             manage_firewall: Some(s.manage_firewall),
+            ..Default::default()
         }),
         helper: c.tunnel.helper.as_ref().map(|h| {
             let path = |p: &Option<PathBuf>| {
@@ -1408,6 +1409,7 @@ mod tests {
             pool: vec!["203.0.113.10".into(), "203.0.113.0/30".into()],
             peer: Some("198.51.100.9".into()),
             manage_firewall: Some(true),
+            ..Default::default()
         });
         put(&d.0, &s).unwrap();
         let got = get(&d.0, "spoofy").unwrap();

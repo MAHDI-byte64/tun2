@@ -25,6 +25,8 @@ function reason(t: (k: string, v?: Record<string, string>) => string, error: str
       return t("ipt.senderErr", { why: error.slice(head.length + 1) });
     case "receiver":
       return t("ipt.receiverErr", { why: error.slice(head.length + 1) });
+    case "internal":
+      return t("ipt.failed");
     default:
       return error;
   }
@@ -91,7 +93,8 @@ export function IpTesterPage({ servers, loaded }: { servers: ServerInfo[]; loade
         to,
         shape,
         sources: parseSpoofPool(sources),
-        loss: Math.min(100, Math.max(0, +loss || 0)),
+        // Empty → let the server pick the default; an explicit 0 asks for strict 100% arrival.
+        loss: loss.trim() === "" ? undefined : Math.min(100, Math.max(0, Math.floor(+loss) || 0)),
       });
       setReport(r.report);
       setWhen(Math.floor(Date.now() / 1000));

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.9.1 - 2026-10-20
+
+### Fixed
+
+- **`spoof` transport now gives each server its own forged-source list.** The tunnel wizard
+  used to send a single pool to both ends, but an address that gets through from one side can
+  be dropped from the other (the two paths meet different BCP38/uRPF rules), so the two servers
+  must not share a list. The spoof wizard now shows one list per server (named after each
+  server), the pair layer gives each side its own `[tunnel.spoof] pool`, and both lists are
+  required. The on-wire per-side config is unchanged, so a 2.9.0 agent still runs these tunnels.
+- **IP Tester now shows why a run failed instead of a blank “internal”.** A sender/receiver
+  failure (no `CAP_NET_RAW`/root on an agent, a refused egress, an older agent) was collapsed
+  into a generic 500, so the page showed nothing useful; the real reason is now surfaced.
+- **IP Tester honours a 0% loss threshold.** An explicit `0` asked for strict 100% arrival but
+  was silently treated as the 20% default, which could mark a lossy source “usable”. The empty
+  field still means the default.
+
 ## 2.9.0 - 2026-10-20
 
 ### Added

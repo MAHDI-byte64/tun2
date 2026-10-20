@@ -434,8 +434,13 @@ export interface IcmpSpec {
 export interface SpoofSpec {
   /** The on-wire packet shape: `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`. */
   shape?: string;
-  /** The forged source addresses to rotate through (IPs, CIDR blocks or `a-b` ranges). */
+  /** This side's resolved forged-source list (IPs, CIDR blocks or `a-b` ranges). Set per
+   * side by the panel; on a wizard request the two servers' lists go in entry_pool/exit_pool. */
   pool?: string[];
+  /** Wizard-only: the entry server's forged-source list. */
+  entry_pool?: string[];
+  /** Wizard-only: the exit server's forged-source list. */
+  exit_pool?: string[];
   /** The peer's real address (filled in by the panel for the accepting side). */
   peer?: string;
   /** Install and remove the best-effort iptables rules (RAII). */

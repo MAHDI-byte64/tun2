@@ -418,17 +418,28 @@ impl IcmpSpec {
     }
 }
 
-/// `[tunnel.spoof]`: the source-spoofing carrier knobs (Linux, root). The `pool` and `peer`
-/// are resolved per side by the pair layer before this crosses the wire.
+/// `[tunnel.spoof]`: the source-spoofing carrier knobs (Linux, root). Each end forges its
+/// source from *its own* pool, so the two servers keep separate lists: the pair layer
+/// resolves `pool` (this side's list) and `peer` per side from the wizard's `entry_pool` /
+/// `exit_pool` before this crosses the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpoofSpec {
     /// The on-wire packet shape: `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<String>,
-    /// The forged source addresses this side rotates through (IPs, CIDR blocks or ranges).
+    /// The forged source addresses *this side* rotates through (IPs, CIDR blocks or ranges),
+    /// resolved per side by the pair layer. On a wizard request it is unused — the two
+    /// servers' lists travel in `entry_pool` / `exit_pool`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pool: Vec<String>,
+    /// Wizard-only: the entry server's forged-source list. The pair layer moves it into the
+    /// entry side's `pool` and drops it from the resolved per-side spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_pool: Vec<String>,
+    /// Wizard-only: the exit server's forged-source list (see `entry_pool`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_pool: Vec<String>,
     /// The peer's real address, needed by the accepting side to address its replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
