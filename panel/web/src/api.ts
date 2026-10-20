@@ -359,6 +359,9 @@ export interface PairRequest {
   exit: string;
   mode: string;
   transport: string;
+  /** Asymmetric transport: the receive (download, exit→entry) transport, when it differs from
+   * `transport` (the send / upload one). Omitted for a normal symmetric tunnel. */
+  recv_transport?: string;
   profile?: string;
   listen: string;
   dial: string;
@@ -432,8 +435,10 @@ export interface IcmpSpec {
 
 /** spoof: the source-spoofing carrier knobs (`[tunnel.spoof]`). */
 export interface SpoofSpec {
-  /** The on-wire packet shape: `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`. */
+  /** The on-wire packet shape this side forges: `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`. */
   shape?: string;
+  /** Asymmetric spoof: the shape this side receives, when it differs from `shape`. */
+  recv_shape?: string;
   /** This side's resolved forged-source list (IPs, CIDR blocks or `a-b` ranges). Set per
    * side by the panel; on a wizard request the two servers' lists go in entry_pool/exit_pool. */
   pool?: string[];
@@ -482,6 +487,8 @@ export interface Spec {
   role: string;
   mode: string;
   transport: string;
+  /** Asymmetric transport: the receive link's transport (per side, as resolved by the panel). */
+  recv_transport?: string;
   profile?: string;
   listen?: string;
   remote?: string;

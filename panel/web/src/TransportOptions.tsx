@@ -157,9 +157,16 @@ export function spoofPoolCount(text: string): number {
   return n;
 }
 
-export const spoofOf = (s: SpoofState, shape: string, active: boolean): SpoofSpec | undefined =>
+export const spoofOf = (s: SpoofState, shape: string, active: boolean, recvShape?: string): SpoofSpec | undefined =>
   active
-    ? { shape, entry_pool: parseSpoofPool(s.entryPool), exit_pool: parseSpoofPool(s.exitPool), manage_firewall: s.manageFw }
+    ? {
+        shape,
+        // Only when asymmetric and the two shapes differ (same shape is just symmetric).
+        recv_shape: recvShape && recvShape !== shape ? recvShape : undefined,
+        entry_pool: parseSpoofPool(s.entryPool),
+        exit_pool: parseSpoofPool(s.exitPool),
+        manage_firewall: s.manageFw,
+      }
     : undefined;
 
 export function SpoofOptions({
@@ -212,6 +219,75 @@ export function SpoofOptions({
       <p className="help" style={{ marginTop: "var(--sp-3)" }}>
         {t("spf.tip")}
       </p>
+    </div>
+  );
+}
+
+// ---- asymmetric (split) transport ----
+
+/** The beautiful two-direction picker shown when a tunnel rides a different transport (or
+ *  spoof shape) each way: a little flow diagram of the two servers and two colour-coded legs,
+ *  with a tile row to choose each direction's transport. */
+export function AsymmetricPicker({
+  options,
+  send,
+  recv,
+  onSend,
+  onRecv,
+  entryName,
+  exitName,
+  labelFor,
+}: {
+  options: readonly string[];
+  send: string;
+  recv: string;
+  onSend: (v: string) => void;
+  onRecv: (v: string) => void;
+  entryName: string;
+  exitName: string;
+  /** The human description for a transport/shape value (from i18n). */
+  labelFor: (x: string) => string;
+}) {
+  const { t } = useApp();
+  const tiles = (value: string, onChange: (v: string) => void, which: "send" | "recv") => (
+    <div className="tiles asym-tiles" role="radiogroup" aria-label={which === "send" ? t("asym.send.aria") : t("asym.recv.aria")}>
+      {options.map((x) => (
+        <button key={x} type="button" role="radio" aria-checked={value === x} className="tile" onClick={() => onChange(x)}>
+          <span className="t1 mono">{x}</span>
+          <span className="t2">{labelFor(x)}</span>
+          <span className="tick">
+            <Icon name="check" size={14} />
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+  return (
+    <div className="asym">
+      <div className="asym-flow" aria-hidden="true">
+        <div className="asym-leg">
+          <span className="asym-node">{entryName}</span>
+          <span className="asym-path send">
+            <span className="asym-tag mono">{send}</span>
+          </span>
+          <span className="asym-node">{exitName}</span>
+        </div>
+        <div className="asym-leg rev">
+          <span className="asym-node">{entryName}</span>
+          <span className="asym-path recv">
+            <span className="asym-tag mono">{recv}</span>
+          </span>
+          <span className="asym-node">{exitName}</span>
+        </div>
+      </div>
+      <div className="field">
+        <span className="asym-dir send">{t("asym.send", { from: entryName, to: exitName })}</span>
+        {tiles(send, onSend, "send")}
+      </div>
+      <div className="field">
+        <span className="asym-dir recv">{t("asym.recv", { from: exitName, to: entryName })}</span>
+        {tiles(recv, onRecv, "recv")}
+      </div>
     </div>
   );
 }
