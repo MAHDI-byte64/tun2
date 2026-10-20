@@ -99,10 +99,22 @@ pub async fn run(hub: &Hub, ask: Ask) -> Result<Report> {
         bail!("not_ipv4:{}", ask.to);
     }
 
-    let count = if ask.count == 0 { DEFAULT_COUNT } else { ask.count.min(1000) };
-    let loss = if ask.loss == 0 { DEFAULT_LOSS } else { ask.loss.min(100) };
+    let count = if ask.count == 0 {
+        DEFAULT_COUNT
+    } else {
+        ask.count.min(1000)
+    };
+    let loss = if ask.loss == 0 {
+        DEFAULT_LOSS
+    } else {
+        ask.loss.min(100)
+    };
     let port = if has_ports {
-        if ask.port == 0 { DEFAULT_PORT } else { ask.port }
+        if ask.port == 0 {
+            DEFAULT_PORT
+        } else {
+            ask.port
+        }
     } else {
         0
     };
@@ -152,7 +164,10 @@ pub async fn run(hub: &Hub, ask: Ask) -> Result<Report> {
     }
     let reply = recv_res.map_err(|e| anyhow::anyhow!("{e:#}"))?;
     if !reply.ok {
-        bail!("receiver:{}", reply.error.unwrap_or_else(|| "failed".into()));
+        bail!(
+            "receiver:{}",
+            reply.error.unwrap_or_else(|| "failed".into())
+        );
     }
     let mut report = reply
         .report
@@ -239,11 +254,13 @@ pub fn last(hub: &Hub, from: &str, to: &str) -> Result<Option<Saved>> {
         )
         .optional()?;
     Ok(row.and_then(|(created, text)| {
-        serde_json::from_str::<Report>(&text).ok().map(|report| Saved {
-            from: from.to_string(),
-            to: to.to_string(),
-            created,
-            report,
-        })
+        serde_json::from_str::<Report>(&text)
+            .ok()
+            .map(|report| Saved {
+                from: from.to_string(),
+                to: to.to_string(),
+                created,
+                report,
+            })
     }))
 }

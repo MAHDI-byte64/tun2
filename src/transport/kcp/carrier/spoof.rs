@@ -96,9 +96,7 @@ mod imp {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use etherparse::{
-        IpNumber, Ipv4Header, PacketBuilder, TcpOptionElement,
-    };
+    use etherparse::{IpNumber, Ipv4Header, PacketBuilder, TcpOptionElement};
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     use tokio::io::unix::AsyncFd;
     use tracing::{debug, warn};
@@ -199,7 +197,14 @@ mod imp {
 
         /// Builds the full IPv4 packet for this socket's shape into `out` (already cleared),
         /// from `src` to `dst:dport`, carrying `body` (`tag | dir | sealed`).
-        fn build_into(&self, out: &mut Vec<u8>, src: Ipv4Addr, dst: Ipv4Addr, dport: u16, body: &[u8]) {
+        fn build_into(
+            &self,
+            out: &mut Vec<u8>,
+            src: Ipv4Addr,
+            dst: Ipv4Addr,
+            dport: u16,
+            body: &[u8],
+        ) {
             match self.shape {
                 SpoofShape::Udp => {
                     PacketBuilder::ipv4(src.octets(), dst.octets(), TTL)
@@ -355,7 +360,13 @@ mod imp {
     /// Builds an IPv4 packet with the given protocol number carrying `body` into `out`
     /// (the `gre`, `ipip` and `proto58` shapes). The `IP_HDRINCL` socket recomputes the IP
     /// checksum and total length, but a correct header is built anyway.
-    fn build_raw_proto_into(out: &mut Vec<u8>, proto: u8, src: Ipv4Addr, dst: Ipv4Addr, body: &[u8]) {
+    fn build_raw_proto_into(
+        out: &mut Vec<u8>,
+        proto: u8,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        body: &[u8],
+    ) {
         let mut header = Ipv4Header::new(
             body.len() as u16,
             TTL,
@@ -365,9 +376,7 @@ mod imp {
         )
         .expect("a sealed KCP packet is far below the IPv4 payload limit");
         header.header_checksum = header.calc_header_checksum();
-        header
-            .write(out)
-            .expect("writing to a Vec cannot fail");
+        header.write(out).expect("writing to a Vec cannot fail");
         out.extend_from_slice(body);
     }
 
@@ -541,7 +550,11 @@ mod imp {
         let tag = format!("kariz-spoof-{}-{port}-{}", shape.name(), unique_suffix());
         let proto = shape.ip_protocol().to_string();
         let port_s = port.to_string();
-        let mut rules = vec![Rule::new("filter", "INPUT", &["-p", &proto, "-j", "ACCEPT"])];
+        let mut rules = vec![Rule::new(
+            "filter",
+            "INPUT",
+            &["-p", &proto, "-j", "ACCEPT"],
+        )];
         match shape {
             SpoofShape::Tcp => {
                 // No socket owns the port, so the kernel would RST every inbound segment
@@ -551,7 +564,14 @@ mod imp {
                     "filter",
                     "OUTPUT",
                     &[
-                        "-p", "tcp", "--sport", &port_s, "--tcp-flags", "RST", "RST", "-j",
+                        "-p",
+                        "tcp",
+                        "--sport",
+                        &port_s,
+                        "--tcp-flags",
+                        "RST",
+                        "RST",
+                        "-j",
                         "DROP",
                     ],
                 ));
@@ -573,7 +593,12 @@ mod imp {
                     "filter",
                     "OUTPUT",
                     &[
-                        "-p", "icmp", "--icmp-type", "port-unreachable", "-j", "DROP",
+                        "-p",
+                        "icmp",
+                        "--icmp-type",
+                        "port-unreachable",
+                        "-j",
+                        "DROP",
                     ],
                 ));
                 rules.push(Rule::new(
@@ -716,7 +741,11 @@ mod imp {
             .then(|| install_firewall(params.shape, local_port));
         if let Some(fw) = &firewall {
             if fw.is_installed() {
-                debug!(port = local_port, shape = params.shape.name(), "spoof: firewall rules installed");
+                debug!(
+                    port = local_port,
+                    shape = params.shape.name(),
+                    "spoof: firewall rules installed"
+                );
             } else {
                 warn!(port = local_port, "spoof: iptables rules not installed; the tunnel still runs unless a default-DROP policy blocks it");
             }

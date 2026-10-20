@@ -298,7 +298,11 @@ mod imp {
         let proto = (nix::libc::ETH_P_IP as u16).to_be();
         // SAFETY: a plain socket(2) call; the fd is adopted by OwnedFd on success.
         let fd = unsafe {
-            nix::libc::socket(nix::libc::AF_PACKET, nix::libc::SOCK_DGRAM, i32::from(proto))
+            nix::libc::socket(
+                nix::libc::AF_PACKET,
+                nix::libc::SOCK_DGRAM,
+                i32::from(proto),
+            )
         };
         if fd < 0 {
             return Err(map_perm(io::Error::last_os_error()));
@@ -364,7 +368,12 @@ mod imp {
     fn recv_once(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
         // SAFETY: `buf` is a valid writable slice for `buf.len()` bytes.
         let n = unsafe {
-            nix::libc::recv(fd, buf.as_mut_ptr().cast::<nix::libc::c_void>(), buf.len(), 0)
+            nix::libc::recv(
+                fd,
+                buf.as_mut_ptr().cast::<nix::libc::c_void>(),
+                buf.len(),
+                0,
+            )
         };
         if n < 0 {
             return Err(io::Error::last_os_error());

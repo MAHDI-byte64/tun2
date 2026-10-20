@@ -183,12 +183,7 @@ impl TransportKind {
     pub fn is_kcp_based(self) -> bool {
         matches!(
             self,
-            Self::Kcp
-                | Self::Udp
-                | Self::Faketcp
-                | Self::Icmp
-                | Self::Proto47
-                | Self::Spoof
+            Self::Kcp | Self::Udp | Self::Faketcp | Self::Icmp | Self::Proto47 | Self::Spoof
         )
     }
 
@@ -2743,8 +2738,9 @@ mod tests {
             ("proto58", SpoofShape::Proto58),
         ] {
             assert_eq!(shape.name(), name);
-            let parsed: SpoofShape =
-                toml::from_str(&format!("shape = \"{name}\"\n")).map(|c: SpoofConfig| c.shape).unwrap();
+            let parsed: SpoofShape = toml::from_str(&format!("shape = \"{name}\"\n"))
+                .map(|c: SpoofConfig| c.shape)
+                .unwrap();
             assert_eq!(parsed, shape);
         }
     }
