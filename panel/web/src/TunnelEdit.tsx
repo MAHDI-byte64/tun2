@@ -140,13 +140,14 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
           setTransport("tcp");
           setMuxOn((a.mux ?? b.mux)?.enabled ?? true);
           setSpoofShape(a.spoof?.shape ?? b.spoof?.shape ?? "udp");
-          setSpoofS(spoofFrom(a.spoof ?? b.spoof));
+          // a is the entry server's spec, b the exit's — each carries its own forged list.
+          setSpoofS(spoofFrom(a.spoof, b.spoof));
         } else {
           setSpoof(false);
           const split = splitTransport(a.transport, a.mux ?? b.mux);
           setTransport(split.transport);
           setMuxOn(split.mux);
-          setSpoofS(spoofFrom(a.spoof ?? b.spoof));
+          setSpoofS(spoofFrom(a.spoof, b.spoof));
         }
         setProfile(a.profile ?? "balanced");
         setLoadedHost(hostOf(acc.listen));
@@ -276,7 +277,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     if (!dialHost.trim() && !netId) return t("wz.dial", { server: serverName(acceptor), other: serverName(dialer) });
     if (isWs && !wsPath.startsWith("/")) return t("wz.wsPath");
     if (transport === "wss" && !tlsReady(tls)) return t("tls.needCert");
-    if (spoof && parseSpoofPool(spoofS.pool).length === 0) return t("spf.poolNeeded");
+    if (spoof && (parseSpoofPool(spoofS.entryPool).length === 0 || parseSpoofPool(spoofS.exitPool).length === 0)) return t("spf.poolNeeded");
     if (!cipherReady(enc, tp, encAck)) return t("enc.needAck");
     if (parsed.bad !== undefined) return parsed.bad ? t("wz.badPorts", { bit: parsed.bad }) : t("wz.ports");
     if (muxSpec.bad) return `${t(`mux.${muxSpec.bad}`)}: ${t("mux.badValue")}`;
@@ -381,7 +382,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
             <EncryptionChoice value={enc} onChange={setEnc} transport={tp} ack={encAck} onAck={setEncAck} />
             {!spoof && transport === "quic" && <QuicObfs value={obfs} onChange={setObfs} />}
             {rootOnly && <RootWarning />}
-            {spoof && <SpoofOptions value={spoofS} onChange={setSpoofS} />}
+            {spoof && <SpoofOptions value={spoofS} onChange={setSpoofS} entryName={serverName(entry)} exitName={serverName(exit)} />}
             {!spoof && transport === "stealth" && <StealthOptions value={stealthS} onChange={setStealthS} />}
             {!spoof && transport === "faketcp" && <FaketcpOptions value={faketcpS} onChange={setFaketcpS} />}
             {!spoof && transport === "icmp" && <IcmpOptions value={icmpS} onChange={setIcmpS} />}

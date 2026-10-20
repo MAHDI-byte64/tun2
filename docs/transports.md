@@ -250,9 +250,12 @@ panel fills in automatically).
     TCP segment like `faketcp`), `icmp` (an echo), or the raw IP protocols `gre` (47), `ipip` (4)
     and `proto58` (58). Both ends must use the same shape. Match it to whatever the path lets
     through.
-  - `pool` — the source addresses to forge: a list of single IPs, CIDR blocks (`203.0.113.0/24`)
-    or inclusive ranges (`a.b.c.d-e.f.g.h`), expanded and de-duplicated (capped at 1024). Each
-    side keeps its own pool.
+  - `pool` — the source addresses *this server* forges: a list of single IPs, CIDR blocks
+    (`203.0.113.0/24`) or inclusive ranges (`a.b.c.d-e.f.g.h`), expanded and de-duplicated
+    (capped at 1024). **Each server keeps its own pool, and the two must not share addresses**:
+    an address that gets through from one side can be dropped from the other (the two paths hit
+    different BCP38/uRPF rules), so test and fill each side's pool separately. In the panel the
+    spoof wizard shows one list per server for exactly this reason.
   - `peer` — the peer's real address (the accepting side needs it to reply).
   - `manage_firewall` — install/remove the best-effort `iptables` rules (RAII) that keep the
     carrier's packets flowing and suppress the kernel's stray replies to the forged packets.
@@ -269,7 +272,9 @@ two servers (or driven from the panel's **IP Tester** page):
 - On the source server: `kariz spooftest sender --to DEST_IP:44300 --shape udp --source 203.0.113.0/24`.
 
 The receiver prints which forged sources arrived and which met the loss threshold; put the
-usable ones in the tunnel's `[tunnel.spoof] pool`.
+usable ones in the **sender server's** `[tunnel.spoof] pool` (the side that forged them). Run it
+once per direction — the sender's usable list fills that sender's pool, and the other direction
+fills the other server's pool.
 
 ## Managed helper transports: `naive`, `xhttp`, `reality`
 
