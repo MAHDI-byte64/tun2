@@ -37,6 +37,13 @@ const ICONS: Record<string, ReactNode> = {
       <path d="M6 16.5c4 3.2 8 3.2 12 0" strokeDasharray="2.2 2.2" />
     </>
   ),
+  iptester: (
+    <>
+      <circle cx="12" cy="12" r="7.5" />
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3" />
+    </>
+  ),
   settings: (
     <>
       <path d="M4 7h10M18 7h2M4 17h2M10 17h10" />

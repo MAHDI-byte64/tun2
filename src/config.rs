@@ -12,6 +12,7 @@
 //! * `direct`: entry dials exit (exit listens on `tunnel.listen`).
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -94,6 +95,13 @@ pub enum TransportKind {
     /// as an `[l3]` carrier, never as a standalone `[tunnel] transport` (validation rejects
     /// that): the sealed KCP packets ride as the payload of a keyed GRE packet.
     Proto47,
+    /// The source-spoofing carrier (Linux, root). The KCP stack ridden inside crafted
+    /// packets whose source IP is forged and rotated from a pool, for mutual IP spoofing
+    /// that blends into real traffic and evades stateful DPI. The on-wire packet shape is
+    /// chosen with `[tunnel.spoof] shape` (`udp`, `tcp`, `icmp`, `gre`, `ipip` or
+    /// `proto58`). Both ends forge their source; each is told the other's real address.
+    /// Encryption is mandatory.
+    Spoof,
     /// A managed sing-box naive inbound/outbound carrying the tunnel.
     Naive,
     /// A managed Xray VLESS-over-XHTTP (HTTP/2) tunnel with TLS.
@@ -119,6 +127,7 @@ impl TransportKind {
             Self::Faketcp => "faketcp",
             Self::Icmp => "icmp",
             Self::Proto47 => "proto47",
+            Self::Spoof => "spoof",
             Self::Naive => "naive",
             Self::Xhttp => "xhttp",
             Self::Reality => "reality",
@@ -146,6 +155,7 @@ impl TransportKind {
                 | Self::Faketcp
                 | Self::Icmp
                 | Self::Proto47
+                | Self::Spoof
                 | Self::Naive
                 | Self::Xhttp
                 | Self::Reality
@@ -173,8 +183,13 @@ impl TransportKind {
     pub fn is_kcp_based(self) -> bool {
         matches!(
             self,
-            Self::Kcp | Self::Udp | Self::Faketcp | Self::Icmp | Self::Proto47
+            Self::Kcp | Self::Udp | Self::Faketcp | Self::Icmp | Self::Proto47 | Self::Spoof
         )
+    }
+
+    /// The source-spoofing carrier (`transport = "spoof"`).
+    pub fn is_spoof(self) -> bool {
+        matches!(self, Self::Spoof)
     }
 
     /// A managed external-helper transport (`naive`, `xhttp`, `reality`).
@@ -303,6 +318,9 @@ pub struct TunnelConfig {
     pub icmp: Option<IcmpConfig>,
     /// Only for the `[l3]` carrier `proto47`.
     pub proto47: Option<Proto47Config>,
+    /// Only for `spoof`: the on-wire packet shape, the forged source-IP pool and the
+    /// peer's real address.
+    pub spoof: Option<SpoofConfig>,
     /// Only for the managed helper transports `naive`, `xhttp` and `reality`.
     pub helper: Option<HelperConfig>,
     /// Transports the tunnel falls back to, in order, when the primary one cannot be
@@ -574,6 +592,210 @@ impl Default for Proto47Config {
             manage_firewall: true,
         }
     }
+}
+
+/// The on-wire packet shape the `spoof` carrier crafts around each sealed KCP packet. Both
+/// ends must choose the same shape. The sealed payload is always Kariz's encrypted,
+/// authenticated framing; the shape only decides what the forged packet looks like to the
+/// network, so a path can be matched to whatever it lets through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpoofShape {
+    /// A UDP datagram (realistic source/destination ports). The default.
+    #[default]
+    Udp,
+    /// A crafted TCP segment, like `faketcp` but with a forged source (realistic
+    /// seq/ack/window/flags).
+    Tcp,
+    /// An ICMP echo request carrying the sealed packet in its data.
+    Icmp,
+    /// A raw IP protocol-47 (GRE-numbered) packet.
+    Gre,
+    /// A raw IP protocol-4 (IP-in-IP-numbered) packet.
+    Ipip,
+    /// A raw IP protocol-58 (ICMPv6-numbered) packet, carried over IPv4.
+    Proto58,
+}
+
+impl SpoofShape {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::Icmp => "icmp",
+            Self::Gre => "gre",
+            Self::Ipip => "ipip",
+            Self::Proto58 => "proto58",
+        }
+    }
+
+    /// Parses a shape name (`udp`, `tcp`, `icmp`, `gre`, `ipip`, `proto58`), case-sensitive.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "udp" => Self::Udp,
+            "tcp" => Self::Tcp,
+            "icmp" => Self::Icmp,
+            "gre" => Self::Gre,
+            "ipip" => Self::Ipip,
+            "proto58" => Self::Proto58,
+            _ => return None,
+        })
+    }
+
+    /// The IP protocol number this shape puts on the wire.
+    pub fn ip_protocol(self) -> u8 {
+        match self {
+            Self::Udp => 17,
+            Self::Tcp => 6,
+            Self::Icmp => 1,
+            Self::Ipip => 4,
+            Self::Gre => 47,
+            Self::Proto58 => 58,
+        }
+    }
+
+    /// Shapes that address a destination port (and so can share a host by port).
+    pub fn has_ports(self) -> bool {
+        matches!(self, Self::Udp | Self::Tcp)
+    }
+}
+
+/// `[tunnel.spoof]`: the source-spoofing carrier (Linux, root). Both ends forge their
+/// source IP and must be told the other's real address, so neither side learns the peer
+/// from the (forged) packets. All keys optional except, in practice, a non-empty `pool`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpoofConfig {
+    /// The on-wire packet shape (`udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`).
+    #[serde(default)]
+    pub shape: SpoofShape,
+    /// The pool of source addresses to forge, rotated round-robin per packet. Each entry is
+    /// a single IPv4 address (`203.0.113.7`), a CIDR block (`203.0.113.0/24`) or an
+    /// inclusive range (`203.0.113.1-203.0.113.9`). Expanded and de-duplicated at load,
+    /// capped at [`SPOOF_POOL_MAX`] addresses. Both ends keep their own pool.
+    #[serde(default)]
+    pub pool: Vec<String>,
+    /// The peer's real address, which the forged packets never reveal. The dialing side
+    /// already has it as `remote`; the accepting side needs it here to address its replies.
+    /// `host:port` or a bare host; the port defaults to the tunnel's own.
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// Override the auto-detected egress interface (for virtualised networks), like
+    /// `[tunnel.faketcp]`.
+    #[serde(default)]
+    pub interface: String,
+    /// Install and remove the best-effort iptables rules that keep the carrier's packets
+    /// flowing under a default-DROP policy and suppress the kernel's stray replies (RAII).
+    #[serde(default = "default_true")]
+    pub manage_firewall: bool,
+}
+
+impl Default for SpoofConfig {
+    fn default() -> Self {
+        Self {
+            shape: SpoofShape::default(),
+            pool: Vec::new(),
+            peer: None,
+            interface: String::new(),
+            manage_firewall: true,
+        }
+    }
+}
+
+/// The largest forged-source pool the carrier will expand to; a wide CIDR is capped here.
+pub const SPOOF_POOL_MAX: usize = 1024;
+
+impl SpoofConfig {
+    /// Expands the `pool` entries (single IPs, CIDR blocks, inclusive ranges) into a
+    /// de-duplicated, order-preserving list of IPv4 addresses, capped at
+    /// [`SPOOF_POOL_MAX`]. See [`expand_ipv4_specs`].
+    pub fn expand_pool(&self) -> Result<Vec<Ipv4Addr>> {
+        expand_ipv4_specs(&self.pool, SPOOF_POOL_MAX)
+    }
+}
+
+/// Expands a list of address specs (single IPs, CIDR blocks, `a.b.c.d-e.f.g.h` ranges) into
+/// a de-duplicated, order-preserving list of usable IPv4 addresses, capped at `cap`. Rejects
+/// a malformed entry or a multicast/broadcast/unspecified address. Shared by the spoof
+/// pool and the `kariz spooftest` source list.
+pub fn expand_ipv4_specs(entries: &[String], cap: usize) -> Result<Vec<Ipv4Addr>> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        for ip in parse_pool_entry(entry.trim())? {
+            if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+                bail!("{ip} is not a usable source address");
+            }
+            if seen.insert(ip) {
+                out.push(ip);
+                if out.len() >= cap {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parses one spoof-pool entry into the addresses it names: a single address, a CIDR block
+/// (`a.b.c.d/len`, host addresses only) or an inclusive range (`a.b.c.d-e.f.g.h`).
+fn parse_pool_entry(entry: &str) -> Result<Vec<Ipv4Addr>> {
+    if entry.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some((base, len)) = entry.split_once('/') {
+        let base: Ipv4Addr = base
+            .trim()
+            .parse()
+            .with_context(|| format!("tunnel.spoof.pool: {entry:?} is not a valid CIDR"))?;
+        let len: u32 = len
+            .trim()
+            .parse()
+            .with_context(|| format!("tunnel.spoof.pool: {entry:?} has a bad prefix length"))?;
+        if len > 32 {
+            bail!("tunnel.spoof.pool: {entry:?} prefix length must be 0-32");
+        }
+        let base = u32::from(base);
+        let (start, count) = if len == 32 {
+            (base, 1u64)
+        } else {
+            let mask = u32::MAX << (32 - len);
+            let network = base & mask;
+            let size = 1u64 << (32 - len);
+            // Skip the network and broadcast addresses for a real subnet.
+            if size >= 2 {
+                (network + 1, size - 2)
+            } else {
+                (network, size)
+            }
+        };
+        let count = count.min(SPOOF_POOL_MAX as u64);
+        return Ok((0..count)
+            .map(|i| Ipv4Addr::from(start.wrapping_add(i as u32)))
+            .collect());
+    }
+    if let Some((lo, hi)) = entry.split_once('-') {
+        let lo: Ipv4Addr = lo
+            .trim()
+            .parse()
+            .with_context(|| format!("tunnel.spoof.pool: {entry:?} has a bad range start"))?;
+        let hi: Ipv4Addr = hi
+            .trim()
+            .parse()
+            .with_context(|| format!("tunnel.spoof.pool: {entry:?} has a bad range end"))?;
+        let (lo, hi) = (u32::from(lo), u32::from(hi));
+        if hi < lo {
+            bail!("tunnel.spoof.pool: {entry:?} range end is before its start");
+        }
+        let count = ((hi - lo) as u64 + 1).min(SPOOF_POOL_MAX as u64);
+        return Ok((0..count)
+            .map(|i| Ipv4Addr::from(lo.wrapping_add(i as u32)))
+            .collect());
+    }
+    let ip: Ipv4Addr = entry
+        .parse()
+        .with_context(|| format!("tunnel.spoof.pool: {entry:?} is not a valid IPv4 address"))?;
+    Ok(vec![ip])
 }
 
 /// `[tunnel.helper]`: credentials and paths for a managed helper transport (`naive`,
@@ -1378,6 +1600,7 @@ impl Config {
             TransportKind::Faketcp if !cfg!(feature = "rawlink") => Some("faketcp"),
             TransportKind::Icmp if !cfg!(feature = "rawlink") => Some("icmp"),
             TransportKind::Proto47 if !cfg!(feature = "rawlink") => Some("proto47"),
+            TransportKind::Spoof if !cfg!(feature = "rawlink") => Some("spoof"),
             TransportKind::Naive if !cfg!(feature = "helpers") => Some("naive"),
             TransportKind::Xhttp if !cfg!(feature = "helpers") => Some("xhttp"),
             TransportKind::Reality if !cfg!(feature = "helpers") => Some("reality"),
@@ -1515,6 +1738,7 @@ impl Config {
         self.validate_faketcp()?;
         self.validate_icmp()?;
         self.validate_proto47()?;
+        self.validate_spoof()?;
         self.validate_helper()?;
         self.validate_udp()?;
         self.validate_fallback()
@@ -1900,6 +2124,50 @@ impl Config {
         // has no place on a normal tunnel.
         if self.tunnel.proto47.is_some() {
             bail!("[tunnel.proto47] is only used with the [l3] carrier \"proto47\"");
+        }
+        Ok(())
+    }
+
+    fn validate_spoof(&self) -> Result<()> {
+        let is_spoof = self.tunnel.transport == TransportKind::Spoof;
+        if self.tunnel.spoof.is_some() && !is_spoof {
+            bail!("[tunnel.spoof] is only used with transport = \"spoof\"");
+        }
+        if !is_spoof {
+            return Ok(());
+        }
+        // spoof carries the KCP stack inside crafted packets with no transport crypto of
+        // its own, so the tunnel's own encryption is mandatory.
+        if self.tunnel.encryption == Encryption::None {
+            bail!("transport = \"spoof\" requires encryption; set tunnel.encryption");
+        }
+        let spoof = self.tunnel.spoof.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "transport = \"spoof\" needs a [tunnel.spoof] table (at least shape and pool)"
+            )
+        })?;
+        // The forged-source pool must name at least one usable address, or there is nothing
+        // to spoof. Expansion also rejects malformed or unusable entries.
+        let pool = spoof.expand_pool()?;
+        if pool.is_empty() {
+            bail!(
+                "tunnel.spoof.pool must list at least one source address to forge \
+                 (an IP, a CIDR block or an a.b.c.d-e.f.g.h range)"
+            );
+        }
+        if !spoof.interface.is_empty()
+            && (spoof.interface.len() > 15
+                || !spoof.interface.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            bail!("tunnel.spoof.interface must be a short interface name");
+        }
+        // The accepting side cannot learn the dialer's real address from the (forged)
+        // packets, so it must be told it; the dialing side already has it as `remote`.
+        if self.is_acceptor() && spoof.peer.is_none() && self.tunnel.remote.is_none() {
+            bail!(
+                "transport = \"spoof\" on the accepting side needs the peer's real address: \
+                 set tunnel.spoof.peer (the panel fills this in automatically)"
+            );
         }
         Ok(())
     }
@@ -2335,6 +2603,146 @@ mod tests {
     fn rejects_unknown_fields() {
         let text = entry_reverse().replace("mode = \"reverse\"", "mode = \"reverse\"\ntypo = 1");
         assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn parses_spoof_entry_reverse() {
+        let text = format!(
+            r#"
+            role = "entry"
+            mode = "reverse"
+            [tunnel]
+            transport = "spoof"
+            listen = "0.0.0.0:3080"
+            token = "{TOKEN}"
+            [tunnel.spoof]
+            shape = "udp"
+            pool = ["203.0.113.10", "203.0.113.11", "203.0.113.0/30"]
+            peer = "198.51.100.7:3080"
+            [[forward]]
+            listen = "0.0.0.0:443"
+            target = "127.0.0.1:443"
+            "#
+        );
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.tunnel.transport, TransportKind::Spoof);
+        let spoof = c.tunnel.spoof.as_ref().unwrap();
+        assert_eq!(spoof.shape, SpoofShape::Udp);
+        // Two singles plus the two host addresses of 203.0.113.0/30 (.1 and .2).
+        let pool = spoof.expand_pool().unwrap();
+        assert_eq!(
+            pool,
+            vec![
+                Ipv4Addr::new(203, 0, 113, 10),
+                Ipv4Addr::new(203, 0, 113, 11),
+                Ipv4Addr::new(203, 0, 113, 1),
+                Ipv4Addr::new(203, 0, 113, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn spoof_requires_non_empty_pool() {
+        let text = format!(
+            r#"
+            role = "entry"
+            mode = "reverse"
+            [tunnel]
+            transport = "spoof"
+            listen = "0.0.0.0:3080"
+            token = "{TOKEN}"
+            [tunnel.spoof]
+            shape = "tcp"
+            peer = "198.51.100.7:3080"
+            [[forward]]
+            listen = "0.0.0.0:443"
+            target = "127.0.0.1:443"
+            "#
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("pool"), "{err}");
+    }
+
+    #[test]
+    fn spoof_rejects_encryption_none() {
+        let text = format!(
+            r#"
+            role = "entry"
+            mode = "reverse"
+            [tunnel]
+            transport = "spoof"
+            listen = "0.0.0.0:3080"
+            token = "{TOKEN}"
+            encryption = "none"
+            [tunnel.spoof]
+            pool = ["203.0.113.10"]
+            peer = "198.51.100.7:3080"
+            [[forward]]
+            listen = "0.0.0.0:443"
+            target = "127.0.0.1:443"
+            "#
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("requires encryption"), "{err}");
+    }
+
+    #[test]
+    fn spoof_table_without_transport_is_rejected() {
+        let text = format!(
+            r#"
+            role = "entry"
+            mode = "reverse"
+            [tunnel]
+            transport = "tcp"
+            listen = "0.0.0.0:3080"
+            token = "{TOKEN}"
+            [tunnel.spoof]
+            pool = ["203.0.113.10"]
+            [[forward]]
+            listen = "0.0.0.0:443"
+            target = "127.0.0.1:443"
+            "#
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("[tunnel.spoof]"), "{err}");
+    }
+
+    #[test]
+    fn spoof_pool_rejects_bad_entries() {
+        let cfg = SpoofConfig {
+            pool: vec!["not-an-ip".into()],
+            ..SpoofConfig::default()
+        };
+        assert!(cfg.expand_pool().is_err());
+        let cfg = SpoofConfig {
+            pool: vec!["203.0.113.0/40".into()],
+            ..SpoofConfig::default()
+        };
+        assert!(cfg.expand_pool().is_err());
+        // A range expands inclusively.
+        let cfg = SpoofConfig {
+            pool: vec!["10.0.0.1-10.0.0.3".into()],
+            ..SpoofConfig::default()
+        };
+        assert_eq!(cfg.expand_pool().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn spoof_shape_names_round_trip() {
+        for (name, shape) in [
+            ("udp", SpoofShape::Udp),
+            ("tcp", SpoofShape::Tcp),
+            ("icmp", SpoofShape::Icmp),
+            ("gre", SpoofShape::Gre),
+            ("ipip", SpoofShape::Ipip),
+            ("proto58", SpoofShape::Proto58),
+        ] {
+            assert_eq!(shape.name(), name);
+            let parsed: SpoofShape = toml::from_str(&format!("shape = \"{name}\"\n"))
+                .map(|c: SpoofConfig| c.shape)
+                .unwrap();
+            assert_eq!(parsed, shape);
+        }
     }
 
     #[test]

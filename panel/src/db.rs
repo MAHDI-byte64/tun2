@@ -157,6 +157,14 @@ const MIGRATIONS: &[&str] = &[
          SELECT count(*) FROM servers o
          WHERE o.created < servers.created OR (o.created = servers.created AND o.id < servers.id)
      );",
+    // 17: the last IP spoof-test result for a (from, to) server pair; `result` is a JSON blob.
+    "CREATE TABLE ip_tests (
+         src TEXT NOT NULL,
+         dst TEXT NOT NULL,
+         created INTEGER NOT NULL,
+         result TEXT NOT NULL,
+         PRIMARY KEY (src, dst)
+     );",
 ];
 
 /// A shared handle to the database. SQLite calls are short, so one connection behind a

@@ -16,18 +16,20 @@ import { ProxyProtocol, proxyFromSpec, proxyOf } from "./ProxyProtocol";
 import type { ProxyChoice } from "./ProxyProtocol";
 import { GreChoice, linkWithAddress } from "./GreChoice";
 import { useNetworks } from "./Networks";
-import { MUX_OPTIONAL, ROOT_ONLY, TRANSPORTS, joinTransport, splitTransport } from "./transport";
+import { MUX_OPTIONAL, ROOT_ONLY, SPOOF_SHAPES, TRANSPORTS, joinTransport, splitTransport } from "./transport";
 import {
   FaketcpOptions,
   HelperFields,
   IcmpOptions,
   L3Options,
   RootWarning,
+  SpoofOptions,
   StealthOptions,
   emptyFaketcp,
   emptyHelper,
   emptyIcmp,
   emptyL3,
+  emptySpoof,
   emptyStealth,
   faketcpFrom,
   faketcpOf,
@@ -37,6 +39,9 @@ import {
   icmpOf,
   l3From,
   l3Of,
+  parseSpoofPool,
+  spoofFrom,
+  spoofOf,
   stealthFrom,
   stealthOf,
 } from "./TransportOptions";
@@ -54,6 +59,9 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const [blocked, setBlocked] = useState(false);
   const [mode, setMode] = useState("reverse");
   const [transport, setTransport] = useState("tcp");
+  const [spoof, setSpoof] = useState(false);
+  const [spoofShape, setSpoofShape] = useState("udp");
+  const [spoofS, setSpoofS] = useState(emptySpoof());
   const [muxOn, setMuxOn] = useState(true);
   const [profile, setProfile] = useState("balanced");
   const [listenHost, setListenHost] = useState("0.0.0.0");
@@ -96,9 +104,10 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const acceptor = mode === "reverse" ? entry : exit;
   const dialer = mode === "reverse" ? exit : entry;
   const parsed = useMemo(() => parsePorts(ports, protocol, target.trim() || "127.0.0.1"), [ports, protocol, target]);
-  const isWs = transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux";
-  const isL3 = transport === "l3";
-  const rootOnly = ROOT_ONLY.includes(transport) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
+  const tp = spoof ? "spoof" : transport;
+  const isWs = !spoof && (transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux");
+  const isL3 = !spoof && transport === "l3";
+  const rootOnly = ROOT_ONLY.includes(tp) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
   const choices = (() => {
     const s = servers.find((x) => x.id === acceptor);
     return s ? addressesOf(s) : [];
@@ -126,9 +135,19 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
         const acc = a.mode === "reverse" ? a : b;
         const dia = a.mode === "reverse" ? b : a;
         setMode(a.mode);
-        const split = splitTransport(a.transport, a.mux ?? b.mux);
-        setTransport(split.transport);
-        setMuxOn(split.mux);
+        if (a.transport === "spoof") {
+          setSpoof(true);
+          setTransport("tcp");
+          setMuxOn((a.mux ?? b.mux)?.enabled ?? true);
+          setSpoofShape(a.spoof?.shape ?? b.spoof?.shape ?? "udp");
+          setSpoofS(spoofFrom(a.spoof ?? b.spoof));
+        } else {
+          setSpoof(false);
+          const split = splitTransport(a.transport, a.mux ?? b.mux);
+          setTransport(split.transport);
+          setMuxOn(split.mux);
+          setSpoofS(spoofFrom(a.spoof ?? b.spoof));
+        }
         setProfile(a.profile ?? "balanced");
         setLoadedHost(hostOf(acc.listen));
         setListenHost(hostOf(acc.listen) || "0.0.0.0");
@@ -195,7 +214,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     entry,
     exit,
     mode,
-    transport: joinTransport(transport, muxOn).core,
+    transport: spoof ? "spoof" : joinTransport(transport, muxOn).core,
     profile,
     listen: `${listenHost}:${listenPort}`,
     dial: `${dialHost.includes(":") && !dialHost.startsWith("[") ? `[${dialHost}]` : dialHost}:${listenPort}`,
@@ -204,8 +223,8 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     ws_path: isWs ? wsPath : undefined,
     ws_host: isWs && wsHost.trim() ? wsHost.trim() : undefined,
     tls_sni: transport === "wss" && tls.mode === "self" && sni.trim() ? sni.trim() : undefined,
-    mux: muxSpecOf(mux, transport, muxOn),
-    encryption: cipherOf(enc, transport),
+    mux: muxSpecOf(mux, tp, muxOn),
+    encryption: cipherOf(enc, tp),
     quic_obfs: obfsOf(obfs, transport),
     max_conns_per_ip: perIpOf(perIp).value,
     udp_max_flows: protocol.includes("udp") ? udpFlowsOf(udpFlows).value : undefined,
@@ -216,6 +235,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     stealth: stealthOf(stealthS, transport),
     faketcp: faketcpOf(faketcpS, transport),
     icmp: icmpOf(icmpS, transport),
+    spoof: spoofOf(spoofS, spoofShape, spoof),
     helper: helperOf(helperS, transport),
     ...l3Of(l3S, transport),
     rotate: rotate ? true : undefined,
@@ -242,6 +262,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   useEffect(() => {
     if (!preset || presetDone || !initial || blocked) return;
     setMode(preset.mode);
+    setSpoof(false);
     setTransport(preset.transport === "tcpmux" ? "tcp" : preset.transport);
     setMuxOn(true);
     chooseNetwork(preset.network ?? "");
@@ -255,7 +276,8 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     if (!dialHost.trim() && !netId) return t("wz.dial", { server: serverName(acceptor), other: serverName(dialer) });
     if (isWs && !wsPath.startsWith("/")) return t("wz.wsPath");
     if (transport === "wss" && !tlsReady(tls)) return t("tls.needCert");
-    if (!cipherReady(enc, transport, encAck)) return t("enc.needAck");
+    if (spoof && parseSpoofPool(spoofS.pool).length === 0) return t("spf.poolNeeded");
+    if (!cipherReady(enc, tp, encAck)) return t("enc.needAck");
     if (parsed.bad !== undefined) return parsed.bad ? t("wz.badPorts", { bit: parsed.bad }) : t("wz.ports");
     if (muxSpec.bad) return `${t(`mux.${muxSpec.bad}`)}: ${t("mux.badValue")}`;
     if (perIpOf(perIp).bad) return t("perip.bad");
@@ -331,25 +353,39 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
             <legend>{t("te.how")}</legend>
             <div className="field">
               <span className="label">{t("wz.q2")}</span>
-              <Seg value={mode} options={[["reverse", t("wz.mode.reverse")], ["direct", t("wz.mode.direct")]]} onChange={setMode} />
-              <span className="help">{t(`wz.mode.${mode}.d`)}</span>
+              <Seg
+                value={spoof ? "spoof" : mode}
+                options={[["reverse", t("wz.mode.reverse")], ["direct", t("wz.mode.direct")], ["spoof", t("wz.mode.spoof")]]}
+                onChange={(v) => {
+                  if (v === "spoof") setSpoof(true);
+                  else {
+                    setSpoof(false);
+                    setMode(v);
+                  }
+                }}
+              />
+              <span className="help">{t(spoof ? "wz.mode.spoof.d" : `wz.mode.${mode}.d`)}</span>
             </div>
             <div className="field">
-              <span className="label">{t("wz.transport")}</span>
-              {choose(TRANSPORTS, transport, setTransport, (x) => [x, t(`wz.tr.${x}`)])}
-              {joinTransport(transport, muxOn).core !== tunnel.transport && <span className="help warn-text">{t("te.transportChange")}</span>}
+              <span className="label">{spoof ? t("wz.spoofShape") : t("wz.transport")}</span>
+              {spoof
+                ? choose(SPOOF_SHAPES, spoofShape, setSpoofShape, (x) => [x, t(`wz.shape.${x}`)])
+                : choose(TRANSPORTS, transport, setTransport, (x) => [x, t(`wz.tr.${x}`)])}
+              {!spoof && joinTransport(transport, muxOn).core !== tunnel.transport && <span className="help warn-text">{t("te.transportChange")}</span>}
+              {spoof && tunnel.transport !== "spoof" && <span className="help warn-text">{t("te.transportChange")}</span>}
             </div>
             <div className="field">
               <span className="label">{t("wz.profile")}</span>
               {choose(PROFILES, profile, setProfile, (x) => [t(`wz.pf.${x}`), t(`wz.pf.${x}.d`)])}
             </div>
-            <EncryptionChoice value={enc} onChange={setEnc} transport={transport} ack={encAck} onAck={setEncAck} />
-            {transport === "quic" && <QuicObfs value={obfs} onChange={setObfs} />}
+            <EncryptionChoice value={enc} onChange={setEnc} transport={tp} ack={encAck} onAck={setEncAck} />
+            {!spoof && transport === "quic" && <QuicObfs value={obfs} onChange={setObfs} />}
             {rootOnly && <RootWarning />}
-            {transport === "stealth" && <StealthOptions value={stealthS} onChange={setStealthS} />}
-            {transport === "faketcp" && <FaketcpOptions value={faketcpS} onChange={setFaketcpS} />}
-            {transport === "icmp" && <IcmpOptions value={icmpS} onChange={setIcmpS} />}
-            {["naive", "xhttp", "reality"].includes(transport) && <HelperFields transport={transport} value={helperS} onChange={setHelperS} />}
+            {spoof && <SpoofOptions value={spoofS} onChange={setSpoofS} />}
+            {!spoof && transport === "stealth" && <StealthOptions value={stealthS} onChange={setStealthS} />}
+            {!spoof && transport === "faketcp" && <FaketcpOptions value={faketcpS} onChange={setFaketcpS} />}
+            {!spoof && transport === "icmp" && <IcmpOptions value={icmpS} onChange={setIcmpS} />}
+            {!spoof && ["naive", "xhttp", "reality"].includes(transport) && <HelperFields transport={transport} value={helperS} onChange={setHelperS} />}
             {isL3 && <L3Options value={l3S} onChange={setL3S} />}
           </fieldset>
 
@@ -459,8 +495,8 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
           {!isL3 && (
             <fieldset className="card edit-sec" disabled={running || op?.state === "done"}>
               <legend>{t("mux.title")}</legend>
-              <MuxToggle transport={transport} value={muxOn} onChange={setMuxOn} />
-              {(muxOn || !MUX_OPTIONAL.includes(transport)) && <MuxFields value={mux} onChange={setMux} profile={profile} transport={transport} />}
+              <MuxToggle transport={tp} value={muxOn} onChange={setMuxOn} />
+              {(muxOn || !MUX_OPTIONAL.includes(tp)) && <MuxFields value={mux} onChange={setMux} profile={profile} transport={tp} />}
             </fieldset>
           )}
 

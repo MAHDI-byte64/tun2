@@ -15,6 +15,7 @@ pub mod db;
 pub mod history;
 pub mod http;
 pub mod hub;
+pub mod iptest;
 pub mod join;
 pub mod manage;
 pub mod net;

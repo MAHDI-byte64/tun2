@@ -1,0 +1,19 @@
+# Exit side (abroad), reverse mode, spoof transport. Linux + root. It dials the entry's real
+# address and forges its own source from the pool below; the entry replies to this side's
+# real address (which it is told as `spoof.peer`). Pair: entry-spoof-reverse.toml.
+role = "exit"
+mode = "reverse"
+profile = "balanced"
+
+[tunnel]
+transport = "spoof"
+remote = "ENTRY_SERVER_IP:3080"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.spoof]
+shape = "udp"                       # must match the entry side
+pool = ["198.51.100.0/24"]         # the source addresses this side forges
+manage_firewall = true
+
+[log]
+level = "info"

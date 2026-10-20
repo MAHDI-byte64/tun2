@@ -5,8 +5,8 @@ import { useApp } from "./store";
 import { CHANNEL_URL, ChannelLink, Copyright, Icon, useFocusTrap } from "./ui";
 import logo from "./logo.svg";
 
-export type PageId = "map" | "servers" | "tunnels" | "networks" | "logs" | "settings";
-export const PAGES: PageId[] = ["map", "servers", "tunnels", "networks", "logs", "settings"];
+export type PageId = "map" | "servers" | "tunnels" | "networks" | "iptester" | "logs" | "settings";
+export const PAGES: PageId[] = ["map", "servers", "tunnels", "networks", "iptester", "logs", "settings"];
 
 /** Whether the panel answers: `at` is when it last did. */
 export interface Live {
