@@ -603,7 +603,7 @@ impl Default for Proto47Config {
 /// ends must choose the same shape. The sealed payload is always Kariz's encrypted,
 /// authenticated framing; the shape only decides what the forged packet looks like to the
 /// network, so a path can be matched to whatever it lets through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpoofShape {
     /// A UDP datagram (realistic source/destination ports). The default.
@@ -700,26 +700,33 @@ pub const SPOOF_POOL_MAX: usize = 1024;
 impl SpoofConfig {
     /// Expands the `pool` entries (single IPs, CIDR blocks, inclusive ranges) into a
     /// de-duplicated, order-preserving list of IPv4 addresses, capped at
-    /// [`SPOOF_POOL_MAX`]. Rejects a malformed entry, a multicast/broadcast/unspecified
-    /// address and the capped overflow is silently truncated (a warning is the caller's).
+    /// [`SPOOF_POOL_MAX`]. See [`expand_ipv4_specs`].
     pub fn expand_pool(&self) -> Result<Vec<Ipv4Addr>> {
-        let mut out: Vec<Ipv4Addr> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for entry in &self.pool {
-            for ip in parse_pool_entry(entry.trim())? {
-                if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
-                    bail!("tunnel.spoof.pool: {ip} is not a usable source address");
-                }
-                if seen.insert(ip) {
-                    out.push(ip);
-                    if out.len() >= SPOOF_POOL_MAX {
-                        return Ok(out);
-                    }
+        expand_ipv4_specs(&self.pool, SPOOF_POOL_MAX)
+    }
+}
+
+/// Expands a list of address specs (single IPs, CIDR blocks, `a.b.c.d-e.f.g.h` ranges) into
+/// a de-duplicated, order-preserving list of usable IPv4 addresses, capped at `cap`. Rejects
+/// a malformed entry or a multicast/broadcast/unspecified address. Shared by the spoof
+/// pool and the `kariz spooftest` source list.
+pub fn expand_ipv4_specs(entries: &[String], cap: usize) -> Result<Vec<Ipv4Addr>> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        for ip in parse_pool_entry(entry.trim())? {
+            if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+                bail!("{ip} is not a usable source address");
+            }
+            if seen.insert(ip) {
+                out.push(ip);
+                if out.len() >= cap {
+                    return Ok(out);
                 }
             }
         }
-        Ok(out)
     }
+    Ok(out)
 }
 
 /// Parses one spoof-pool entry into the addresses it names: a single address, a CIDR block
