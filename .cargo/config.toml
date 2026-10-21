@@ -1,0 +1,10 @@
+# The published x86_64 binaries must run on any 64-bit Intel/AMD CPU, including older servers
+# without AVX2 (for example Ivy Bridge Xeons such as the E5-2600 v2 series). Pin the compiler to
+# the baseline `x86-64` target so it never emits AVX2/BMI/FMA on an unguarded path. The crypto
+# libraries (ring, blake3, …) still pick AES-NI/AVX2 at run time through their own CPU detection,
+# so this costs no real throughput. ARM targets are built via `cross` and are not affected.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64"]
