@@ -483,9 +483,6 @@ fn serve(config: Config, config_path: &std::path::Path) -> Result<()> {
             kariz_bin: std::env::current_exe()?.with_file_name("kariz"),
         });
         tokio::spawn(hub.clone().run_local());
-        // Put the panel's outbound proxy (if any is set) into effect before anything dials
-        // out, so the reverse links and release downloads go through it from the start.
-        kariz_panel::proxy::Settings::load(&db).apply();
         // The servers the panel connects to (reverse) are dialed whether or not it takes
         // agents itself.
         hub.start_reverse_links();

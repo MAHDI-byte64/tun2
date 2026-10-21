@@ -101,17 +101,10 @@ test("the transport chooser gives one answer at a time", async ({ page }) => {
   await open(page, "/docs/how-it-works/");
   const box = page.locator("[data-chooser]");
   await expect(box.locator(".verdict:visible")).toHaveCount(1);
-  // The network fights back: the evasion verdict stands on its own.
-  await box.locator('[data-q="blocked"]').getByLabel("Yes").check();
-  await expect(box.locator(".verdict:visible")).toHaveCount(1);
-  await expect(box.locator(".verdict:visible code").first()).toHaveText("reality");
-  // Not blocked, a CDN in between.
-  await box.locator('[data-q="blocked"]').getByLabel("No").check();
-  await box.locator('[data-q="cdn"]').getByLabel("Yes").check();
+  await box.getByLabel("Yes").first().check(); // a CDN in between
   await expect(box.locator(".verdict:visible")).toHaveCount(1);
   await expect(box.locator(".verdict:visible code").first()).toHaveText("wss");
-  // No CDN, UDP works, lossy, no games.
-  await box.locator('[data-q="cdn"]').getByLabel("No").check();
+  await box.getByLabel("No").first().check(); // no CDN, UDP works, lossy, no games
   await expect(box.locator(".verdict:visible code").first()).toHaveText("kcp");
 });
 

@@ -40,33 +40,6 @@ In the menu choose **3** (Install the web panel here) and open the link it print
 The rest of this page is the same thing by hand, for a server without the panel or to see what
 the panel writes.
 
-### No internet on the server? (offline install)
-
-The manager installs offline too, and still checks the release's signature. On a machine that
-does have internet, download three files for the server's CPU from
-[Releases](https://github.com/MAHDI-byte64/tun2/releases):
-
-```
-kariz-<version>-<arch>-linux.tar.gz
-kariz-<version>-<arch>-linux.tar.gz.sha256
-kariz-<version>-<arch>-linux.tar.gz.sig
-```
-
-(`arch` is `x86_64`, `aarch64` or `armv7`; `uname -m` on the server tells.) Copy all three,
-plus `scripts/kariz.sh`, to the server, then run either:
-
-```bash
-sudo ./kariz.sh install --archive kariz-<version>-<arch>-linux.tar.gz
-# or, with the archive sitting next to the script, /root, or the current folder:
-sudo ./kariz.sh install --offline
-```
-
-The archive carries both the core and the panel, so `panel install` and the menu work the same
-afterwards. The checksum and signature are verified exactly as for an online install, so nothing
-is trusted that a download would not be. (Signature-checking needs `openssl`, which is already on
-almost every server.) The interactive menu's **Install** also falls back to a copied-over archive
-automatically when it cannot reach GitHub.
-
 ## 1. Install
 
 Download the static Linux binary for your CPU (`x86_64`, `aarch64` or `armv7`; `uname -m`

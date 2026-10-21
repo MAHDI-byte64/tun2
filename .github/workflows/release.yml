@@ -77,13 +77,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - if: ${{ !matrix.cross }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p kariz -p kariz-panel
-        env:
-          # Keep the x86_64 release compatible with any 64-bit Intel/AMD CPU (no AVX2/BMI/FMA
-          # on unguarded paths), so it runs on older servers such as Ivy Bridge Xeons (E5 v2).
-          # Crypto still uses AES-NI/AVX2 at run time via its own detection, so throughput on
-          # modern servers is unchanged. Set here (not just in .cargo/config.toml) so it wins
-          # over any RUSTFLAGS the runner environment might carry.
-          RUSTFLAGS: "-C target-cpu=x86-64"
       - if: ${{ matrix.cross }}
         uses: taiki-e/install-action@v2
         with:

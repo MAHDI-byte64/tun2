@@ -94,11 +94,8 @@ pub struct Proto47Params {
 /// Per-tunnel parameters of the source-spoofing carrier.
 #[derive(Debug, Clone)]
 pub struct SpoofParams {
-    /// The on-wire packet shape this side *forges* (udp, tcp, icmp, gre, ipip or proto58).
+    /// The on-wire packet shape (udp, tcp, icmp, gre, ipip or proto58).
     pub shape: SpoofShape,
-    /// The on-wire packet shape this side *expects to receive*. Equal to `shape` for a normal
-    /// (symmetric) spoof tunnel; different when the two directions use different shapes.
-    pub recv_shape: SpoofShape,
     /// The forged source addresses, rotated round-robin per packet. Never empty for a real
     /// tunnel (validation requires at least one); an empty pool makes `open_*` fail.
     pub pool: Arc<Vec<Ipv4Addr>>,
@@ -140,7 +137,6 @@ impl Carrier {
                     .and_then(ipv4_of_addr);
                 Self::Spoof(SpoofParams {
                     shape: cfg.shape,
-                    recv_shape: cfg.recv_shape.unwrap_or(cfg.shape),
                     pool: Arc::new(pool),
                     cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     tag: [tagk[0], tagk[1], tagk[2], tagk[3]],

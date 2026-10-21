@@ -22,7 +22,6 @@ pub mod net;
 pub mod netops;
 pub mod networks;
 pub mod pair;
-pub mod proxy;
 pub mod reverse;
 pub mod schedule;
 pub mod sign;

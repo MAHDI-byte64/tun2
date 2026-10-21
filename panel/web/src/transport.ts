@@ -24,11 +24,6 @@ export const TRANSPORTS = [
  *  spoofing" connection kind is picked, these replace the transport tiles below. */
 export const SPOOF_SHAPES = ["udp", "icmp", "proto58", "tcp", "ipip", "gre"] as const;
 
-/** The transports that can be a half of an asymmetric (different-each-way) tunnel. Only the
- *  plain stream transports qualify: a KCP-based or QUIC link cannot be driven one direction
- *  only. For a spoof tunnel the two halves are SPOOF_SHAPES instead. */
-export const SPLIT_TRANSPORTS = ["tcp", "ws", "wss"] as const;
-
 /** Transports that need root (raw sockets or a TUN device). The wizard warns when one is picked. */
 export const ROOT_ONLY = ["faketcp", "icmp", "l3", "spoof"];
 

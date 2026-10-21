@@ -108,21 +108,6 @@ A notice appears in the top bar when a newer release is out. **Settings, Updates
 release notes and two buttons: update the panel, and update the servers (one at a time, each
 checked, and put back if it does not come up). The panel never updates by itself.
 
-## 9. Proxy
-
-When the panel's own server cannot reach the other servers (or the internet) directly, **Settings,
-Proxy** sends its outbound connections through a SOCKS5 proxy. Give the proxy's address (and a
-username/password if it needs them) and pick what goes through it:
-
-- **Server connections** — how the panel reaches the other servers and manages the tunnels. This
-  only affects servers the panel *dials* (reverse links); when an agent dials the panel instead,
-  nothing on the panel side is proxied. Because SOCKS5 carries only TCP, a proxied link uses the
-  TCP transports (`tcpmux`, `wss`) and not the UDP ones (`kcp`, `quic`).
-- **Panel internet** — the panel's release downloads when updating.
-
-Changing the proxy takes effect at once; the password is kept in the panel and never shown again.
-(The Telegram bot has its own separate proxy under *Settings, Telegram*.)
-
 ## Handy things
 
 - **Ctrl+K** opens a search for pages, commands and tunnels (type a tunnel's name to open it).

@@ -58,11 +58,6 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
     if !is_l3 {
         tunnel.insert("transport".into(), text(&spec.transport));
     }
-    // Asymmetric transport: the receive link's transport (the core derives its port as the
-    // primary + 1).
-    if let Some(recv) = spec.recv_transport.as_deref().filter(|r| !r.is_empty()) {
-        tunnel.insert("recv_transport".into(), text(recv));
-    }
     if let Some(cipher) = spec.encryption.as_deref().filter(|c| *c != "auto") {
         tunnel.insert("encryption".into(), text(cipher));
     }
@@ -112,9 +107,6 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
             let mut t = Table::new();
             if let Some(shape) = &s.shape {
                 t.insert("shape".into(), text(shape));
-            }
-            if let Some(recv_shape) = &s.recv_shape {
-                t.insert("recv_shape".into(), text(recv_shape));
             }
             if !s.pool.is_empty() {
                 let pool = s.pool.iter().map(|p| text(p)).collect::<Vec<_>>();
@@ -335,15 +327,9 @@ fn is_acceptor(spec: &Spec) -> bool {
     )
 }
 
-/// Whether this spec uses `wss` on either direction — the primary transport or, for an
-/// asymmetric tunnel, the receive link. Both need the TLS material.
-fn uses_wss(spec: &Spec) -> bool {
-    spec.transport == "wss" || spec.recv_transport.as_deref() == Some("wss")
-}
-
 /// The certificate and key of a listening wss side, beside its config.
 fn cert_files(dir: &Path, spec: &Spec) -> Option<(PathBuf, PathBuf)> {
-    if !(uses_wss(spec) && is_acceptor(spec)) {
+    if !(spec.transport == "wss" && is_acceptor(spec)) {
         return None;
     }
     if let Some(own) = own_cert(spec) {
@@ -581,7 +567,6 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
         role: role_name(c.role).to_owned(),
         mode: mode_name(c.mode).to_owned(),
         transport,
-        recv_transport: c.tunnel.recv_transport.map(|k| k.name().to_owned()),
         profile: Some(c.profile.name().to_owned()),
         listen,
         remote,
@@ -664,7 +649,6 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
         }),
         spoof: c.tunnel.spoof.as_ref().map(|s| crate::wire::SpoofSpec {
             shape: Some(s.shape.name().to_owned()),
-            recv_shape: s.recv_shape.map(|r| r.name().to_owned()),
             pool: s.pool.clone(),
             peer: s.peer.clone(),
             manage_firewall: Some(s.manage_firewall),
@@ -1413,27 +1397,6 @@ mod tests {
         assert_eq!(got.forwards.len(), 1);
         assert!(got.token.is_none(), "the token is never handed back");
         assert_eq!(existing_token(&d.0.join("main.toml")), Some("a".repeat(48)));
-    }
-
-    #[test]
-    fn an_asymmetric_wss_receive_link_gets_its_cert() {
-        // entry/reverse is the acceptor. A tcp send link with a wss receive link must still make
-        // the self-signed certificate (so it returns a pin for the dialer) and render the TLS
-        // block; before the fix the cert was only made when the primary transport was wss.
-        let d = Dir::new();
-        let mut s = spec("asym-wss");
-        s.transport = "tcp".into();
-        s.recv_transport = Some("wss".into());
-        let pin = put(&d.0, &s).unwrap();
-        assert!(
-            pin.is_some(),
-            "a listening wss receive link should produce a pin"
-        );
-        let toml = std::fs::read_to_string(d.0.join("asym-wss.toml")).unwrap();
-        assert!(toml.contains("[tunnel.tls]"), "missing tls block:\n{toml}");
-        assert!(toml.contains(r#"recv_transport = "wss""#), "{toml}");
-        let got = get(&d.0, "asym-wss").unwrap();
-        assert_eq!(got.recv_transport.as_deref(), Some("wss"));
     }
 
     #[test]
