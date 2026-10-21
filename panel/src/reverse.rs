@@ -211,7 +211,8 @@ impl Hub {
                     !via_proxy
                         || matches!(
                             k,
-                            kariz::config::TransportKind::Tcpmux | kariz::config::TransportKind::Wss
+                            kariz::config::TransportKind::Tcpmux
+                                | kariz::config::TransportKind::Wss
                         )
                 })
                 .collect();

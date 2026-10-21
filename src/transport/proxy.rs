@@ -74,10 +74,7 @@ impl Socks5 {
     /// tunnelled stream. `wait` bounds the whole exchange.
     pub async fn connect(&self, target: &str, wait: Duration) -> io::Result<TcpStream> {
         timeout(wait, self.handshake(target)).await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "socks5 proxy connect timed out",
-            )
+            io::Error::new(io::ErrorKind::TimedOut, "socks5 proxy connect timed out")
         })?
     }
 
@@ -187,7 +184,8 @@ mod tests {
             let mut g = [0u8; 3];
             c.read_exact(&mut g).await.unwrap();
             assert_eq!(&g[..2], &[0x05, 0x01]);
-            c.write_all(&[0x05, 0x00]).await.unwrap(); // no-auth
+            // Offer no-auth.
+            c.write_all(&[0x05, 0x00]).await.unwrap();
             // CONNECT request: ver, cmd, rsv, atyp(domain), len, host, port.
             let mut h = [0u8; 5];
             c.read_exact(&mut h).await.unwrap();

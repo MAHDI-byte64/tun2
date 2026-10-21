@@ -12,11 +12,11 @@ pub mod kcp;
 #[cfg(not(feature = "kcp"))]
 #[path = "kcp_disabled.rs"]
 pub mod kcp;
+pub mod proxy;
 #[cfg(feature = "quic")]
 pub mod quic;
 #[cfg(feature = "quic")]
 mod quic_obfs;
-pub mod proxy;
 pub mod split;
 pub mod tcp;
 pub mod tls;

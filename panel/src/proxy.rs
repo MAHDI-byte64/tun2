@@ -128,9 +128,17 @@ impl Settings {
     /// link dialer, and the internet proxy into [`internet_proxy`]. Call at startup and after
     /// every change.
     pub fn apply(&self) {
-        let links = if self.server_links { self.socks5() } else { None };
+        let links = if self.server_links {
+            self.socks5()
+        } else {
+            None
+        };
         kariz::transport::proxy::set_link_proxy(links);
-        let internet = if self.panel_internet { self.url() } else { None };
+        let internet = if self.panel_internet {
+            self.url()
+        } else {
+            None
+        };
         if let Ok(mut g) = INTERNET_PROXY.write() {
             *g = internet;
         }
