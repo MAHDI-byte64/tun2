@@ -193,10 +193,16 @@ async fn build_exit(
                 connections = mux.connections,
                 "exit: reverse mode with mux, keeping sessions to the entry side"
             );
+            let recv = config.recv_link_dial();
             let dialer = Arc::new(if config.tunnel.transport == TransportKind::Auto {
                 Dial::auto(transport, &config.tunnel.token, remote, tuning)?
             } else {
-                Dial::one(transport, remote, tuning)?
+                Dial::One(crate::transport::split::dialer(
+                    transport,
+                    remote,
+                    recv.as_ref().map(|(k, a)| (*k, a.as_str())),
+                    tuning,
+                )?)
             });
             for _ in 0..mux.connections {
                 let (exit, dialer) = (exit.clone(), dialer.clone());
@@ -233,7 +239,13 @@ async fn build_exit(
                 pool = config.tunnel.pool,
                 "exit: reverse mode, connecting to the entry side"
             );
-            let dialer = Arc::new(Dialer::new(transport, remote, tuning)?);
+            let recv = config.recv_link_dial();
+            let dialer = Arc::new(crate::transport::split::dialer(
+                transport,
+                remote,
+                recv.as_ref().map(|(k, a)| (*k, a.as_str())),
+                tuning,
+            )?);
             for _ in 0..config.tunnel.pool {
                 tasks.spawn(pool_worker(exit.clone(), dialer.clone()));
             }
@@ -243,13 +255,19 @@ async fn build_exit(
             let listeners = if config.tunnel.transport == TransportKind::Auto {
                 auto::bind_all(transport, &config.tunnel.token, addr, tuning).await?
             } else {
+                let recv = config.recv_link_listen();
                 vec![(
                     "",
-                    Listener::bind(transport, addr, tuning)
-                        .await
-                        .with_context(|| {
-                            format!("failed to listen for tunnel connections on {addr}")
-                        })?,
+                    crate::transport::split::listener(
+                        transport,
+                        addr,
+                        recv.as_ref().map(|(k, a)| (*k, a.as_str())),
+                        tuning,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to listen for tunnel connections on {addr}")
+                    })?,
                 )]
             };
             info!(

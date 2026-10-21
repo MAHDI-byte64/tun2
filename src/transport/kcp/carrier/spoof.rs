@@ -133,7 +133,11 @@ mod imp {
     pub(in crate::transport::kcp) struct SpoofSocket {
         recv: AsyncFd<OwnedFd>,
         send: Socket,
+        /// The shape this end forges on its sends.
         shape: SpoofShape,
+        /// The shape this end accepts on receive (equal to `shape` unless the tunnel is
+        /// asymmetric, where each direction uses a different shape).
+        recv_shape: SpoofShape,
         pool: Arc<Vec<Ipv4Addr>>,
         cursor: Arc<AtomicUsize>,
         tag: [u8; 4],
@@ -282,11 +286,11 @@ mod imp {
         /// is this tunnel's shape, tag and (inbound) direction, else `None`.
         fn match_packet<'a>(&self, pkt: &'a [u8]) -> Option<&'a [u8]> {
             let (ihl, proto) = ip_header(pkt)?;
-            if proto != self.shape.ip_protocol() {
+            if proto != self.recv_shape.ip_protocol() {
                 return None;
             }
             let rest = pkt.get(ihl..)?;
-            let body = match self.shape {
+            let body = match self.recv_shape {
                 SpoofShape::Udp => {
                     // UDP: src port (0..2), dst port (2..4), len (4..6), payload (8..).
                     if rest.len() < 8 {
@@ -546,15 +550,54 @@ mod imp {
 
     /// Installs the best-effort iptables rules that keep the carrier's packets flowing under
     /// a default-DROP policy and suppress the kernel's stray replies to our forged packets.
-    fn install_firewall(shape: SpoofShape, port: u16) -> FirewallRules {
-        let tag = format!("kariz-spoof-{}-{port}-{}", shape.name(), unique_suffix());
-        let proto = shape.ip_protocol().to_string();
+    fn install_firewall(
+        send_shape: SpoofShape,
+        recv_shape: SpoofShape,
+        port: u16,
+    ) -> FirewallRules {
+        let tag = if send_shape == recv_shape {
+            format!(
+                "kariz-spoof-{}-{port}-{}",
+                send_shape.name(),
+                unique_suffix()
+            )
+        } else {
+            format!(
+                "kariz-spoof-{}-{}-{port}-{}",
+                send_shape.name(),
+                recv_shape.name(),
+                unique_suffix()
+            )
+        };
         let port_s = port.to_string();
-        let mut rules = vec![Rule::new(
-            "filter",
-            "INPUT",
-            &["-p", &proto, "-j", "ACCEPT"],
-        )];
+        let mut rules = Vec::new();
+        // Accept inbound packets of each direction's protocol (they are the same for a normal
+        // symmetric tunnel).
+        let mut protos = vec![send_shape.ip_protocol()];
+        if recv_shape.ip_protocol() != send_shape.ip_protocol() {
+            protos.push(recv_shape.ip_protocol());
+        }
+        for proto in protos {
+            rules.push(Rule::new(
+                "filter",
+                "INPUT",
+                &["-p", &proto.to_string(), "-j", "ACCEPT"],
+            ));
+        }
+        // Suppress the kernel's stray replies for each shape in use.
+        let mut shapes = vec![send_shape];
+        if recv_shape != send_shape {
+            shapes.push(recv_shape);
+        }
+        for shape in shapes {
+            shape_suppression_rules(&mut rules, shape, &port_s);
+        }
+        FirewallRules::install(tag, rules)
+    }
+
+    /// Adds the per-shape rules that keep a forged `shape` flowing: drop the RST/ICMP the
+    /// kernel would send for the unowned port, and keep conntrack off our stateless packets.
+    fn shape_suppression_rules(rules: &mut Vec<Rule>, shape: SpoofShape, port_s: &str) {
         match shape {
             SpoofShape::Tcp => {
                 // No socket owns the port, so the kernel would RST every inbound segment
@@ -567,7 +610,7 @@ mod imp {
                         "-p",
                         "tcp",
                         "--sport",
-                        &port_s,
+                        port_s,
                         "--tcp-flags",
                         "RST",
                         "RST",
@@ -578,12 +621,12 @@ mod imp {
                 rules.push(Rule::new(
                     "raw",
                     "PREROUTING",
-                    &["-p", "tcp", "--dport", &port_s, "-j", "NOTRACK"],
+                    &["-p", "tcp", "--dport", port_s, "-j", "NOTRACK"],
                 ));
                 rules.push(Rule::new(
                     "raw",
                     "OUTPUT",
-                    &["-p", "tcp", "--sport", &port_s, "-j", "NOTRACK"],
+                    &["-p", "tcp", "--sport", port_s, "-j", "NOTRACK"],
                 ));
             }
             SpoofShape::Udp => {
@@ -604,7 +647,7 @@ mod imp {
                 rules.push(Rule::new(
                     "raw",
                     "PREROUTING",
-                    &["-p", "udp", "--dport", &port_s, "-j", "NOTRACK"],
+                    &["-p", "udp", "--dport", port_s, "-j", "NOTRACK"],
                 ));
             }
             SpoofShape::Icmp => {
@@ -617,7 +660,6 @@ mod imp {
             }
             SpoofShape::Gre | SpoofShape::Ipip | SpoofShape::Proto58 => {}
         }
-        FirewallRules::install(tag, rules)
     }
 
     /// A random, non-zero 16-bit value (ICMP echo id / ISN helper).
@@ -738,7 +780,7 @@ mod imp {
         let send = send_socket(dscp, mark_of(params.tag), buffer)?;
         let firewall = params
             .manage_firewall
-            .then(|| install_firewall(params.shape, local_port));
+            .then(|| install_firewall(params.shape, params.recv_shape, local_port));
         if let Some(fw) = &firewall {
             if fw.is_installed() {
                 debug!(
@@ -755,6 +797,7 @@ mod imp {
             recv: AsyncFd::new(recv)?,
             send,
             shape: params.shape,
+            recv_shape: params.recv_shape,
             pool: params.pool.clone(),
             cursor: params.cursor.clone(),
             tag: params.tag,

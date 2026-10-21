@@ -276,6 +276,40 @@ usable ones in the **sender server's** `[tunnel.spoof] pool` (the side that forg
 once per direction — the sender's usable list fills that sender's pool, and the other direction
 fills the other server's pool.
 
+## Asymmetric transport: a different transport each way
+
+A tunnel can ride **one transport out and a different one back**, useful where upload and
+download are filtered differently (a common asymmetry on filtered paths). Set
+`[tunnel] recv_transport` to the receive direction's transport; `transport` is then the send
+direction only. The tunnel opens **two paired connections** — the dialer writes on one and reads
+from the other, the acceptor mirrors it — joined into one logical stream, so the handshake,
+encryption and mux all work exactly as on a normal tunnel. It always muxes over that one pair.
+
+- **Only the stream transports** `tcp`, `ws` and `wss` can be a half, and the two must differ. A
+  KCP-based transport (`kcp`, `udp`, `faketcp`, `icmp`) or `quic` cannot be split — a link driven
+  one direction only would stall or half-close. For a `spoof` tunnel, use the per-shape form
+  below instead of `recv_transport`.
+- `transport` carries the **dialer → acceptor** direction and `recv_transport` the
+  **acceptor → dialer** one. The receive link listens/dials on the primary port **+ 1** by
+  default; set `recv_listen` / `recv_remote` to override.
+- Shared options apply to whichever direction uses them: `[tunnel.ws]` for a `ws`/`wss` half,
+  `[tunnel.tls]` for the `wss` one.
+- **Both servers need 2.10 or newer.** In the panel the tunnel wizard has a "different transport
+  each way" switch (for every connection kind), which picks the send and receive transport
+  separately.
+
+```toml
+# Acceptor side: ws in, tcp back out.
+[tunnel]
+transport = "ws"            # dialer → acceptor
+recv_transport = "tcp"      # acceptor → dialer (listens on the primary port + 1)
+listen = "0.0.0.0:3080"
+```
+
+For **`spoof`**, asymmetry is per on-wire shape rather than per transport: set
+`[tunnel.spoof] recv_shape` to forge one shape and accept another (one KCP session, no second
+connection). The two sides mirror each other, which the panel sets up automatically.
+
 ## Managed helper transports: `naive`, `xhttp`, `reality`
 
 These three run a **managed external helper** (NaiveProxy / sing-box, or Xray) on each side,

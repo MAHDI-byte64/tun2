@@ -58,6 +58,11 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
     if !is_l3 {
         tunnel.insert("transport".into(), text(&spec.transport));
     }
+    // Asymmetric transport: the receive link's transport (the core derives its port as the
+    // primary + 1).
+    if let Some(recv) = spec.recv_transport.as_deref().filter(|r| !r.is_empty()) {
+        tunnel.insert("recv_transport".into(), text(recv));
+    }
     if let Some(cipher) = spec.encryption.as_deref().filter(|c| *c != "auto") {
         tunnel.insert("encryption".into(), text(cipher));
     }
@@ -107,6 +112,9 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
             let mut t = Table::new();
             if let Some(shape) = &s.shape {
                 t.insert("shape".into(), text(shape));
+            }
+            if let Some(recv_shape) = &s.recv_shape {
+                t.insert("recv_shape".into(), text(recv_shape));
             }
             if !s.pool.is_empty() {
                 let pool = s.pool.iter().map(|p| text(p)).collect::<Vec<_>>();
@@ -567,6 +575,7 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
         role: role_name(c.role).to_owned(),
         mode: mode_name(c.mode).to_owned(),
         transport,
+        recv_transport: c.tunnel.recv_transport.map(|k| k.name().to_owned()),
         profile: Some(c.profile.name().to_owned()),
         listen,
         remote,
@@ -649,6 +658,7 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
         }),
         spoof: c.tunnel.spoof.as_ref().map(|s| crate::wire::SpoofSpec {
             shape: Some(s.shape.name().to_owned()),
+            recv_shape: s.recv_shape.map(|r| r.name().to_owned()),
             pool: s.pool.clone(),
             peer: s.peer.clone(),
             manage_firewall: Some(s.manage_firewall),

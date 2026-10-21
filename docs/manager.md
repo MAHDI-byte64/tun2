@@ -45,7 +45,13 @@ Other ways to install:
 ```bash
 kariz-manager install --version v1.0.0        # a specific release
 kariz-manager install --binary ./kariz        # a binary you built yourself
+kariz-manager install --archive kariz-v1.0.0-x86_64-linux.tar.gz   # offline: a release .tar.gz on disk
+kariz-manager install --offline               # offline: a copied-over archive found automatically
 ```
+
+For a server with no internet, see the offline-install steps in
+[Getting started](getting-started.md#no-internet-on-the-server-offline-install): the checksum and
+signature are checked the same way, so an offline install is no less safe.
 
 ## The usual path
 

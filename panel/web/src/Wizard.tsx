@@ -17,10 +17,11 @@ import { ProxyProtocol, proxyOf } from "./ProxyProtocol";
 import type { ProxyChoice } from "./ProxyProtocol";
 import { BenchPanel, benchLabel, isV6 } from "./Benchmark";
 import type { BenchChoice } from "./Benchmark";
-import { MUX_OPTIONAL, ROOT_ONLY, SPOOF_SHAPES, TRANSPORTS, joinTransport, transportLabel } from "./transport";
+import { MUX_OPTIONAL, ROOT_ONLY, SPLIT_TRANSPORTS, SPOOF_SHAPES, TRANSPORTS, joinTransport, transportLabel } from "./transport";
 import {
   FaketcpOptions,
   HelperFields,
+  AsymmetricPicker,
   IcmpOptions,
   L3Options,
   RootWarning,
@@ -113,6 +114,11 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const [spoof, setSpoof] = useState(false);
   const [spoofShape, setSpoofShape] = useState<string>("udp");
   const [spoofS, setSpoofS] = useState(emptySpoof());
+  // Asymmetric transport: a different transport (or spoof shape) each way. `transport` /
+  // `spoofShape` are then the send (entry→exit) half, and these are the receive (exit→entry) one.
+  const [asym, setAsym] = useState(false);
+  const [recvTransport, setRecvTransport] = useState<string>("tcp");
+  const [spoofRecvShape, setSpoofRecvShape] = useState<string>("tcp");
   const [muxOn, setMuxOn] = useState(true);
   const [profile, setProfile] = useState<string>("balanced");
   const [listenPort, setListenPort] = useState(String(FIRST_TUNNEL_PORT));
@@ -178,6 +184,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const applyBench = (c: BenchChoice) => {
     setMode(c.mode);
     setSpoof(false);
+    setAsym(false);
     setTransport(c.transport === "tcpmux" ? "tcp" : c.transport);
     setMuxOn(true);
     setNetId(c.network ?? "");
@@ -197,7 +204,11 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   // The transport the backend sees: `spoof` when the spoofing kind is on, else the picked one.
   const tp = spoof ? "spoof" : transport;
   const udp = !spoof && (transport === "quic" || transport === "kcp" || transport === "udp");
-  const isWs = !spoof && (transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux");
+  // Either direction being a WebSocket transport needs the ws path; either being wss needs TLS.
+  const wsName = (x: string) => x === "ws" || x === "wss" || x === "wsmux" || x === "wssmux";
+  const splittable = (x: string) => (SPLIT_TRANSPORTS as readonly string[]).includes(x);
+  const isWs = !spoof && (wsName(transport) || (asym && wsName(recvTransport)));
+  const usesWss = !spoof && (transport === "wss" || (asym && recvTransport === "wss"));
   const isL3 = !spoof && transport === "l3";
   const rootOnly = ROOT_ONLY.includes(tp) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
 
@@ -225,7 +236,10 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     entry,
     exit,
     mode,
-    transport: spoof ? "spoof" : joinTransport(transport, muxOn).core,
+    // Asymmetric sends the base transport (tcp/ws/wss) and muxes over the combined stream;
+    // a symmetric tcp tunnel still folds mux into the `tcpmux` name.
+    transport: spoof ? "spoof" : asym ? transport : joinTransport(transport, muxOn).core,
+    recv_transport: asym && !spoof ? recvTransport : undefined,
     profile,
     listen: `${listenHost}:${listenPort}`,
     dial: `${dialHost.includes(":") && !dialHost.startsWith("[") ? `[${dialHost}]` : dialHost}:${listenPort}`,
@@ -235,20 +249,21 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     ws_host: isWs && wsHost.trim() ? wsHost.trim() : undefined,
     // A server name typed for a self-signed certificate is not sent with a real one: the
     // other side checks a real one against the name it was issued for (tls_host).
-    tls_sni: transport === "wss" && tls.mode === "self" && sni.trim() ? sni.trim() : undefined,
-    mux: muxSpecOf(mux, tp, muxOn),
+    tls_sni: usesWss && tls.mode === "self" && sni.trim() ? sni.trim() : undefined,
+    // Asymmetric rides one combined connection, so it always muxes over it.
+    mux: muxSpecOf(mux, tp, asym ? true : muxOn),
     encryption: cipherOf(enc, tp),
     quic_obfs: obfsOf(obfs, transport),
     max_conns_per_ip: perIpOf(perIp).value,
     udp_max_flows: protocol.includes("udp") ? udpFlowsOf(udpFlows).value : undefined,
     proxy_protocol: proxyOf(proxy, protocol),
-    tls_cert: transport === "wss" && tls.mode === "real" && tls.cert ? tls.cert : undefined,
-    tls_key: transport === "wss" && tls.mode === "real" && tls.key ? tls.key : undefined,
-    tls_host: transport === "wss" && tls.mode === "real" && tls.cert && tls.host ? tls.host : undefined,
+    tls_cert: usesWss && tls.mode === "real" && tls.cert ? tls.cert : undefined,
+    tls_key: usesWss && tls.mode === "real" && tls.key ? tls.key : undefined,
+    tls_host: usesWss && tls.mode === "real" && tls.cert && tls.host ? tls.host : undefined,
     stealth: stealthOf(stealthS, transport),
     faketcp: faketcpOf(faketcpS, transport),
     icmp: icmpOf(icmpS, transport),
-    spoof: spoofOf(spoofS, spoofShape, spoof),
+    spoof: spoofOf(spoofS, spoofShape, spoof, asym ? spoofRecvShape : undefined),
     helper: helperOf(helperS, transport),
     ...l3Of(l3S, transport),
     forwards: parsed.forwards,
@@ -270,6 +285,9 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     }
     if (s === 1 && spoof && (parseSpoofPool(spoofS.entryPool).length === 0 || parseSpoofPool(spoofS.exitPool).length === 0))
       return t("spf.poolNeeded");
+    // Asymmetric: the two directions must differ, else it is just a normal symmetric tunnel.
+    if (s === 1 && asym && !spoof && recvTransport === transport) return t("asym.needDiffer");
+    if (s === 1 && asym && spoof && spoofRecvShape === spoofShape) return t("asym.needDiffer");
     if (s === 1 && !cipherReady(enc, tp, encAck)) return t("enc.needAck");
     if (s === 1 && muxToSpec(mux).bad) return t(`mux.${muxToSpec(mux).bad}`) + ": " + t("mux.badValue");
     if (s === 3 && parsed.bad !== undefined) return parsed.bad ? t("wz.badPorts", { bit: parsed.bad }) : t("wz.ports");
@@ -456,30 +474,72 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                     </span>
                   </button>
                 </div>
-                <h3 className="wz-q" style={{ marginTop: "var(--sp-6)", fontSize: "var(--fs-lg)" }}>
-                  {spoof ? t("wz.spoofShape") : t("wz.transport")}
-                </h3>
-                <div className="tiles" role="radiogroup" aria-label={spoof ? t("wz.spoofShape") : t("wz.transport")}>
-                  {spoof
-                    ? SPOOF_SHAPES.map((x) => (
-                        <button key={x} type="button" role="radio" aria-checked={spoofShape === x} className="tile" onClick={() => setSpoofShape(x)}>
-                          <span className="t1 mono">{x}</span>
-                          <span className="t2">{t(`wz.shape.${x}`)}</span>
-                          <span className="tick">
-                            <Icon name="check" size={14} />
-                          </span>
-                        </button>
-                      ))
-                    : TRANSPORTS.map((x) => (
-                        <button key={x} type="button" role="radio" aria-checked={transport === x} className="tile" onClick={() => setTransport(x)}>
-                          <span className="t1 mono">{x}</span>
-                          <span className="t2">{t(`wz.tr.${x}`)}</span>
-                          <span className="tick">
-                            <Icon name="check" size={14} />
-                          </span>
-                        </button>
-                      ))}
+                <div className="wz-trhead">
+                  <h3 className="wz-q" style={{ margin: 0, fontSize: "var(--fs-lg)" }}>
+                    {asym ? t("asym.pick") : spoof ? t("wz.spoofShape") : t("wz.transport")}
+                  </h3>
+                  <label className="check asym-toggle">
+                    <button
+                      type="button"
+                      role="switch"
+                      className="switch"
+                      aria-checked={asym}
+                      aria-label={t("asym.toggle")}
+                      onClick={() => {
+                        const on = !asym;
+                        setAsym(on);
+                        if (on) {
+                          setMuxOn(true);
+                          if (!spoof) {
+                            const send = splittable(transport) ? transport : "ws";
+                            setTransport(send);
+                            setRecvTransport(send === "tcp" ? "ws" : "tcp");
+                          } else if (spoofRecvShape === spoofShape) {
+                            setSpoofRecvShape(spoofShape === "tcp" ? "udp" : "tcp");
+                          }
+                        }
+                      }}
+                    />
+                    {t("asym.toggle")}
+                  </label>
                 </div>
+                <p className="help" style={{ margin: "0 0 var(--sp-3)" }}>
+                  {t("asym.hint")}
+                </p>
+                {asym ? (
+                  <AsymmetricPicker
+                    options={spoof ? SPOOF_SHAPES : SPLIT_TRANSPORTS}
+                    send={spoof ? spoofShape : transport}
+                    recv={spoof ? spoofRecvShape : recvTransport}
+                    onSend={spoof ? setSpoofShape : setTransport}
+                    onRecv={spoof ? setSpoofRecvShape : setRecvTransport}
+                    entryName={serverName(entry)}
+                    exitName={serverName(exit)}
+                    labelFor={(x) => t(spoof ? `wz.shape.${x}` : `wz.tr.${x}`)}
+                  />
+                ) : (
+                  <div className="tiles" role="radiogroup" aria-label={spoof ? t("wz.spoofShape") : t("wz.transport")}>
+                    {spoof
+                      ? SPOOF_SHAPES.map((x) => (
+                          <button key={x} type="button" role="radio" aria-checked={spoofShape === x} className="tile" onClick={() => setSpoofShape(x)}>
+                            <span className="t1 mono">{x}</span>
+                            <span className="t2">{t(`wz.shape.${x}`)}</span>
+                            <span className="tick">
+                              <Icon name="check" size={14} />
+                            </span>
+                          </button>
+                        ))
+                      : TRANSPORTS.map((x) => (
+                          <button key={x} type="button" role="radio" aria-checked={transport === x} className="tile" onClick={() => setTransport(x)}>
+                            <span className="t1 mono">{x}</span>
+                            <span className="t2">{t(`wz.tr.${x}`)}</span>
+                            <span className="tick">
+                              <Icon name="check" size={14} />
+                            </span>
+                          </button>
+                        ))}
+                  </div>
+                )}
                 <h3 className="wz-q" style={{ marginTop: "var(--sp-6)", fontSize: "var(--fs-lg)" }}>
                   {t("wz.profile")}
                 </h3>

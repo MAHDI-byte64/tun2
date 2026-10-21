@@ -16,13 +16,14 @@ import { ProxyProtocol, proxyFromSpec, proxyOf } from "./ProxyProtocol";
 import type { ProxyChoice } from "./ProxyProtocol";
 import { GreChoice, linkWithAddress } from "./GreChoice";
 import { useNetworks } from "./Networks";
-import { MUX_OPTIONAL, ROOT_ONLY, SPOOF_SHAPES, TRANSPORTS, joinTransport, splitTransport } from "./transport";
+import { MUX_OPTIONAL, ROOT_ONLY, SPLIT_TRANSPORTS, SPOOF_SHAPES, TRANSPORTS, joinTransport, splitTransport } from "./transport";
 import {
   FaketcpOptions,
   HelperFields,
   IcmpOptions,
   L3Options,
   RootWarning,
+  AsymmetricPicker,
   SpoofOptions,
   StealthOptions,
   emptyFaketcp,
@@ -62,6 +63,9 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const [spoof, setSpoof] = useState(false);
   const [spoofShape, setSpoofShape] = useState("udp");
   const [spoofS, setSpoofS] = useState(emptySpoof());
+  const [asym, setAsym] = useState(false);
+  const [recvTransport, setRecvTransport] = useState("tcp");
+  const [spoofRecvShape, setSpoofRecvShape] = useState("tcp");
   const [muxOn, setMuxOn] = useState(true);
   const [profile, setProfile] = useState("balanced");
   const [listenHost, setListenHost] = useState("0.0.0.0");
@@ -105,7 +109,10 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const dialer = mode === "reverse" ? exit : entry;
   const parsed = useMemo(() => parsePorts(ports, protocol, target.trim() || "127.0.0.1"), [ports, protocol, target]);
   const tp = spoof ? "spoof" : transport;
-  const isWs = !spoof && (transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux");
+  const wsName = (x: string) => x === "ws" || x === "wss" || x === "wsmux" || x === "wssmux";
+  const splittable = (x: string) => (SPLIT_TRANSPORTS as readonly string[]).includes(x);
+  const isWs = !spoof && (wsName(transport) || (asym && wsName(recvTransport)));
+  const usesWss = !spoof && (transport === "wss" || (asym && recvTransport === "wss"));
   const isL3 = !spoof && transport === "l3";
   const rootOnly = ROOT_ONLY.includes(tp) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
   const choices = (() => {
@@ -139,11 +146,28 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
           setSpoof(true);
           setTransport("tcp");
           setMuxOn((a.mux ?? b.mux)?.enabled ?? true);
+          // a is the entry server's spec: its `shape` is the upload (entry→exit) shape and
+          // `recv_shape`, if set, the download one — so the tunnel is asymmetric.
+          const rs = a.spoof?.recv_shape ?? b.spoof?.recv_shape;
           setSpoofShape(a.spoof?.shape ?? b.spoof?.shape ?? "udp");
+          setAsym(!!rs);
+          if (rs) setSpoofRecvShape(rs);
           // a is the entry server's spec, b the exit's — each carries its own forged list.
+          setSpoofS(spoofFrom(a.spoof, b.spoof));
+        } else if (a.recv_transport) {
+          // Asymmetric: link A = `transport`, link B = `recv_transport`. Map the two links back
+          // to the user's send (entry→exit) / receive (exit→entry) by who dials.
+          setSpoof(false);
+          setAsym(true);
+          setMuxOn(true);
+          const [send, recv] =
+            a.mode === "reverse" ? [a.recv_transport, a.transport] : [a.transport, a.recv_transport];
+          setTransport(send);
+          setRecvTransport(recv);
           setSpoofS(spoofFrom(a.spoof, b.spoof));
         } else {
           setSpoof(false);
+          setAsym(false);
           const split = splitTransport(a.transport, a.mux ?? b.mux);
           setTransport(split.transport);
           setMuxOn(split.mux);
@@ -215,7 +239,8 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     entry,
     exit,
     mode,
-    transport: spoof ? "spoof" : joinTransport(transport, muxOn).core,
+    transport: spoof ? "spoof" : asym ? transport : joinTransport(transport, muxOn).core,
+    recv_transport: asym && !spoof ? recvTransport : undefined,
     profile,
     listen: `${listenHost}:${listenPort}`,
     dial: `${dialHost.includes(":") && !dialHost.startsWith("[") ? `[${dialHost}]` : dialHost}:${listenPort}`,
@@ -223,20 +248,20 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     pool,
     ws_path: isWs ? wsPath : undefined,
     ws_host: isWs && wsHost.trim() ? wsHost.trim() : undefined,
-    tls_sni: transport === "wss" && tls.mode === "self" && sni.trim() ? sni.trim() : undefined,
-    mux: muxSpecOf(mux, tp, muxOn),
+    tls_sni: usesWss && tls.mode === "self" && sni.trim() ? sni.trim() : undefined,
+    mux: muxSpecOf(mux, tp, asym ? true : muxOn),
     encryption: cipherOf(enc, tp),
     quic_obfs: obfsOf(obfs, transport),
     max_conns_per_ip: perIpOf(perIp).value,
     udp_max_flows: protocol.includes("udp") ? udpFlowsOf(udpFlows).value : undefined,
     proxy_protocol: proxyOf(proxy, protocol),
-    tls_cert: transport === "wss" && tls.mode === "real" && tls.cert ? tls.cert : undefined,
-    tls_key: transport === "wss" && tls.mode === "real" && tls.key ? tls.key : undefined,
-    tls_host: transport === "wss" && tls.mode === "real" && tls.cert && tls.host ? tls.host : undefined,
+    tls_cert: usesWss && tls.mode === "real" && tls.cert ? tls.cert : undefined,
+    tls_key: usesWss && tls.mode === "real" && tls.key ? tls.key : undefined,
+    tls_host: usesWss && tls.mode === "real" && tls.cert && tls.host ? tls.host : undefined,
     stealth: stealthOf(stealthS, transport),
     faketcp: faketcpOf(faketcpS, transport),
     icmp: icmpOf(icmpS, transport),
-    spoof: spoofOf(spoofS, spoofShape, spoof),
+    spoof: spoofOf(spoofS, spoofShape, spoof, asym ? spoofRecvShape : undefined),
     helper: helperOf(helperS, transport),
     ...l3Of(l3S, transport),
     rotate: rotate ? true : undefined,
@@ -278,6 +303,8 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     if (isWs && !wsPath.startsWith("/")) return t("wz.wsPath");
     if (transport === "wss" && !tlsReady(tls)) return t("tls.needCert");
     if (spoof && (parseSpoofPool(spoofS.entryPool).length === 0 || parseSpoofPool(spoofS.exitPool).length === 0)) return t("spf.poolNeeded");
+    if (asym && !spoof && recvTransport === transport) return t("asym.needDiffer");
+    if (asym && spoof && spoofRecvShape === spoofShape) return t("asym.needDiffer");
     if (!cipherReady(enc, tp, encAck)) return t("enc.needAck");
     if (parsed.bad !== undefined) return parsed.bad ? t("wz.badPorts", { bit: parsed.bad }) : t("wz.ports");
     if (muxSpec.bad) return `${t(`mux.${muxSpec.bad}`)}: ${t("mux.badValue")}`;
@@ -368,11 +395,53 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
               <span className="help">{t(spoof ? "wz.mode.spoof.d" : `wz.mode.${mode}.d`)}</span>
             </div>
             <div className="field">
-              <span className="label">{spoof ? t("wz.spoofShape") : t("wz.transport")}</span>
-              {spoof
-                ? choose(SPOOF_SHAPES, spoofShape, setSpoofShape, (x) => [x, t(`wz.shape.${x}`)])
-                : choose(TRANSPORTS, transport, setTransport, (x) => [x, t(`wz.tr.${x}`)])}
-              {!spoof && joinTransport(transport, muxOn).core !== tunnel.transport && <span className="help warn-text">{t("te.transportChange")}</span>}
+              <div className="wz-trhead" style={{ marginTop: 0 }}>
+                <span className="label" style={{ margin: 0 }}>
+                  {asym ? t("asym.pick") : spoof ? t("wz.spoofShape") : t("wz.transport")}
+                </span>
+                <label className="check asym-toggle">
+                  <button
+                    type="button"
+                    role="switch"
+                    className="switch"
+                    aria-checked={asym}
+                    aria-label={t("asym.toggle")}
+                    onClick={() => {
+                      const on = !asym;
+                      setAsym(on);
+                      if (on) {
+                        setMuxOn(true);
+                        if (!spoof) {
+                          const send = splittable(transport) ? transport : "ws";
+                          setTransport(send);
+                          setRecvTransport(send === "tcp" ? "ws" : "tcp");
+                        } else if (spoofRecvShape === spoofShape) {
+                          setSpoofRecvShape(spoofShape === "tcp" ? "udp" : "tcp");
+                        }
+                      }
+                    }}
+                  />
+                  {t("asym.toggle")}
+                </label>
+              </div>
+              <span className="help">{t("asym.hint")}</span>
+              {asym ? (
+                <AsymmetricPicker
+                  options={spoof ? SPOOF_SHAPES : SPLIT_TRANSPORTS}
+                  send={spoof ? spoofShape : transport}
+                  recv={spoof ? spoofRecvShape : recvTransport}
+                  onSend={spoof ? setSpoofShape : setTransport}
+                  onRecv={spoof ? setSpoofRecvShape : setRecvTransport}
+                  entryName={serverName(entry)}
+                  exitName={serverName(exit)}
+                  labelFor={(x) => t(spoof ? `wz.shape.${x}` : `wz.tr.${x}`)}
+                />
+              ) : spoof ? (
+                choose(SPOOF_SHAPES, spoofShape, setSpoofShape, (x) => [x, t(`wz.shape.${x}`)])
+              ) : (
+                choose(TRANSPORTS, transport, setTransport, (x) => [x, t(`wz.tr.${x}`)])
+              )}
+              {!spoof && !asym && joinTransport(transport, muxOn).core !== tunnel.transport && <span className="help warn-text">{t("te.transportChange")}</span>}
               {spoof && tunnel.transport !== "spoof" && <span className="help warn-text">{t("te.transportChange")}</span>}
             </div>
             <div className="field">

@@ -398,6 +398,7 @@ fn check_ok(config: &Config) -> serde_json::Value {
         "mode": mode_name(config.mode),
         "profile": config.profile.name(),
         "transport": config.tunnel.transport.name(),
+        "recv_transport": config.tunnel.recv_transport.map(|t| t.name()),
         "listen": config.tunnel.listen,
         "remote": config.tunnel.remote,
         "mux": config.mux().enabled,
@@ -616,6 +617,10 @@ fn print_summary(config: &Config) {
     println!("  mode      : {}", mode_name(config.mode));
     println!("  profile   : {}", config.profile.name());
     println!("  transport : {}", config.tunnel.transport.name());
+    if let Some(recv) = config.tunnel.recv_transport {
+        // Asymmetric: send over `transport`, receive over `recv_transport`.
+        println!("  receive   : {} (asymmetric)", recv.name());
+    }
     if let Some(listen) = &config.tunnel.listen {
         println!("  listen    : {listen}");
     }

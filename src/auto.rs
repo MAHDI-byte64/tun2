@@ -102,10 +102,6 @@ pub enum Dial {
 }
 
 impl Dial {
-    pub fn one(settings: &Settings, addr: &str, tuning: &Tuning) -> io::Result<Self> {
-        Ok(Self::One(Dialer::new(settings, addr, tuning)?))
-    }
-
     pub fn auto(base: &Settings, token: &str, addr: &str, tuning: &Tuning) -> io::Result<Self> {
         let mut dialers = Vec::new();
         for kind in KINDS {

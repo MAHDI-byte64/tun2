@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.10.0 - 2026-10-21
+
+### Added
+
+- **Asymmetric (split) transport — a different transport each way.** A tunnel can now send over
+  one transport and receive over another, carried as two paired connections joined into one
+  logical stream, for paths that filter upload and download differently. Set `[tunnel]
+  recv_transport` (one of `tcp`, `ws`, `wss`, different from `transport`); the receive link uses
+  the primary listen/dial port + 1 by default (`recv_listen` / `recv_remote` to override).
+  Encryption, mux and the handshake ride the combined stream unchanged, and it always muxes over
+  the one pair. For a `spoof` tunnel the asymmetry is per on-wire shape instead — `[tunnel.spoof]
+  recv_shape` forges one shape and accepts another over the single KCP session. The tunnel wizard
+  gains a **"different transport each way"** switch for every connection kind (direct, reverse,
+  source spoofing), with a two-direction picker and a flow diagram. Both servers need 2.10.
+- **Outbound SOCKS5 proxy for the panel.** Settings → Proxy lets the panel reach out through a
+  SOCKS5 proxy, with a selectable scope: **server connections** (the panel's reverse-mode dials
+  to the other servers and the tunnel management on those links — kept to the TCP transports
+  `tcpmux`/`wss`, since SOCKS5 cannot carry UDP) and/or **panel internet** (release downloads for
+  updating). Optional username/password; the password is kept in the panel and never shown again.
+  Changing it rebuilds the reverse links so the new route takes effect at once.
+- **Offline install in the manager script.** `kariz-manager install --archive FILE` installs from
+  a release `.tar.gz` already on disk, and `--offline` finds a copied-over
+  `kariz-*-<arch>-linux.tar.gz` (next to the script, in the current folder, `/root` or
+  `/opt/kariz`) on its own; the interactive **Install** also falls back to a local archive when it
+  cannot reach GitHub. The checksum and signature are verified exactly as for a download, so an
+  air-gapped install is no less safe.
+
+### Changed
+
+- The panel **IP Tester** presents its results as a scorecard (usable / arrived / tested) with a
+  colour-coded per-source arrival meter, instead of a plain table.
+
 ## 2.9.1 - 2026-10-20
 
 ### Fixed

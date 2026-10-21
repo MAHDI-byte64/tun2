@@ -1,0 +1,18 @@
+# Exit side (abroad), direct mode, asymmetric transport. It accepts the `ws` send link on 3080
+# and the `tcp` return link on 3081 (the primary port + 1, derived automatically). The two
+# directions must use different transports, from tcp/ws/wss. Pair: entry-asym.toml.
+role = "exit"
+mode = "direct"
+profile = "balanced"
+
+[tunnel]
+transport = "ws"                    # send direction (entry → exit), accepted here
+recv_transport = "tcp"             # receive direction (exit → entry); listens on 3081
+listen = "0.0.0.0:3080"
+token = "CHANGE-ME-run-kariz-token"
+
+[tunnel.ws]
+path = "/stream"
+
+[log]
+level = "info"

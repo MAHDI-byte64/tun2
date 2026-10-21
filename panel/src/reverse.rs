@@ -201,12 +201,27 @@ impl Hub {
             let Some(target) = self.reverse_of(&server) else {
                 return;
             };
+            // A SOCKS5 proxy carries only TCP, so when the panel dials through one the link
+            // stays on the TCP transports (`tcpmux`, `wss`); `kcp`/`quic` (UDP) are left out.
+            let via_proxy = kariz::transport::proxy::link_proxy().is_some();
             let kinds: Vec<_> = kariz::link::LINK_TRANSPORTS
                 .into_iter()
                 .filter(|k| !matches!(target.transport.as_deref(), Some(t) if t != k.name()))
+                .filter(|k| {
+                    !via_proxy
+                        || matches!(
+                            k,
+                            kariz::config::TransportKind::Tcpmux
+                                | kariz::config::TransportKind::Wss
+                        )
+                })
                 .collect();
             let Some(&kind) = kinds.get(at % kinds.len().max(1)) else {
-                warn!(server = %server, "no link transport to dial this server with");
+                if via_proxy {
+                    warn!(server = %server, "the panel proxy carries only TCP, but this server's link transport is UDP; cannot dial it through the proxy");
+                } else {
+                    warn!(server = %server, "no link transport to dial this server with");
+                }
                 return;
             };
             match self.reverse_once(&server, &target, kind).await {

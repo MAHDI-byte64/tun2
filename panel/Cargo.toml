@@ -1,6 +1,6 @@
 [package]
 name = "kariz-panel"
-version = "2.9.1"
+version = "2.10.0"
 edition = "2021"
 rust-version = "1.80"
 description = "The Kariz web panel: sign-in, servers, tunnels, live monitoring."

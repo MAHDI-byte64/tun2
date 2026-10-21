@@ -293,6 +293,22 @@ pub struct TunnelConfig {
     pub listen: Option<String>,
     /// Address of the other side (exit in reverse mode, entry in direct mode).
     pub remote: Option<String>,
+    /// Asymmetric transport: when set, the tunnel uses two separate connections — `transport`
+    /// carries the dialer→acceptor direction and `recv_transport` the acceptor→dialer one, so
+    /// the two directions can ride different transports (for example `ws` out and `tcp` back).
+    /// Only the stream transports (`tcp`, `ws`, `wss`) are allowed here; `None` is the normal
+    /// symmetric tunnel. For `spoof`, asymmetry is per-shape instead (see `[tunnel.spoof]
+    /// recv_shape`), so this stays unset.
+    #[serde(default)]
+    pub recv_transport: Option<TransportKind>,
+    /// The `recv_transport` link's listen address (acceptor side). Defaults to `listen`'s host
+    /// with its port + 1 when left out.
+    #[serde(default)]
+    pub recv_listen: Option<String>,
+    /// The `recv_transport` link's address of the other side (dialer side). Defaults to
+    /// `remote`'s host with its port + 1 when left out.
+    #[serde(default)]
+    pub recv_remote: Option<String>,
     /// Shared secret. Both sides must use the same value.
     pub token: String,
     /// Reverse mode only: idle tunnel connections the exit keeps open towards the entry.
@@ -666,9 +682,15 @@ impl SpoofShape {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpoofConfig {
-    /// The on-wire packet shape (`udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`).
+    /// The on-wire packet shape this side *forges* (`udp`, `tcp`, `icmp`, `gre`, `ipip` or
+    /// `proto58`). With `recv_shape` set it is the send shape only.
     #[serde(default)]
     pub shape: SpoofShape,
+    /// Asymmetric spoof: the shape this side *expects to receive*, when it differs from the
+    /// one it sends. `None` means symmetric (receive the same shape it sends). The two sides
+    /// mirror each other — one end's `shape` is the other end's `recv_shape`.
+    #[serde(default)]
+    pub recv_shape: Option<SpoofShape>,
     /// The pool of source addresses to forge, rotated round-robin per packet. Each entry is
     /// a single IPv4 address (`203.0.113.7`), a CIDR block (`203.0.113.0/24`) or an
     /// inclusive range (`203.0.113.1-203.0.113.9`). Expanded and de-duplicated at load,
@@ -694,6 +716,7 @@ impl Default for SpoofConfig {
     fn default() -> Self {
         Self {
             shape: SpoofShape::default(),
+            recv_shape: None,
             pool: Vec::new(),
             peer: None,
             interface: String::new(),
@@ -1741,7 +1764,106 @@ impl Config {
         self.validate_spoof()?;
         self.validate_helper()?;
         self.validate_udp()?;
+        self.validate_asymmetric()?;
         self.validate_fallback()
+    }
+
+    /// Asymmetric transport (`tunnel.recv_transport`): the two directions ride different
+    /// transports over two paired connections. Only the stream transports (`tcp`, `ws`,
+    /// `wss`) are allowed on each side, and the two must differ (a symmetric tunnel is the
+    /// normal case). `spoof` asymmetry is per-shape (`[tunnel.spoof] recv_shape`) and must
+    /// not use this field.
+    fn validate_asymmetric(&self) -> Result<()> {
+        let Some(recv) = self.tunnel.recv_transport else {
+            if self.tunnel.recv_listen.is_some() || self.tunnel.recv_remote.is_some() {
+                bail!(
+                    "tunnel.recv_listen / tunnel.recv_remote are only used together with \
+                     tunnel.recv_transport"
+                );
+            }
+            return Ok(());
+        };
+        let send = self.tunnel.transport;
+        let ok = |k: TransportKind| {
+            matches!(
+                k,
+                TransportKind::Tcp | TransportKind::Ws | TransportKind::Wss
+            )
+        };
+        if !ok(send) || !ok(recv) {
+            bail!(
+                "asymmetric transport supports only tcp, ws and wss on each side \
+                 (transport = {:?}, recv_transport = {:?})",
+                send.name(),
+                recv.name()
+            );
+        }
+        if send == recv {
+            bail!(
+                "tunnel.recv_transport must differ from tunnel.transport; drop it for a normal \
+                 symmetric tunnel"
+            );
+        }
+        // Each link needs its own address. The recv link derives port + 1 from the primary
+        // one when its own is not given, so the primary address (checked above) must carry a
+        // port we can bump.
+        let base = if self.is_acceptor() {
+            self.tunnel
+                .recv_listen
+                .is_none()
+                .then_some(self.tunnel.listen.as_deref())
+                .flatten()
+        } else {
+            self.tunnel
+                .recv_remote
+                .is_none()
+                .then_some(self.tunnel.remote.as_deref())
+                .flatten()
+        };
+        if let Some(addr) = base {
+            if bump_port(addr).is_none() {
+                bail!(
+                    "asymmetric transport needs a port on {addr:?} to derive the second link's \
+                     port, or set tunnel.recv_listen / tunnel.recv_remote explicitly"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The acceptor's listen address for the `recv_transport` link: `recv_listen`, else the
+    /// primary `listen` host with its port + 1.
+    pub fn recv_listen_addr(&self) -> Option<String> {
+        self.tunnel
+            .recv_listen
+            .clone()
+            .or_else(|| self.tunnel.listen.as_deref().and_then(bump_port))
+    }
+
+    /// The dialer's address of the other side for the `recv_transport` link: `recv_remote`,
+    /// else the primary `remote` host with its port + 1.
+    pub fn recv_remote_addr(&self) -> Option<String> {
+        self.tunnel
+            .recv_remote
+            .clone()
+            .or_else(|| self.tunnel.remote.as_deref().and_then(bump_port))
+    }
+
+    /// Whether this tunnel rides two different transports (asymmetric / split transport).
+    pub fn is_asymmetric(&self) -> bool {
+        self.tunnel.recv_transport.is_some()
+    }
+
+    /// The receive link to dial (its transport and address) for an asymmetric tunnel, else
+    /// `None`. Pass to [`crate::transport::split::dialer`].
+    pub fn recv_link_dial(&self) -> Option<(TransportKind, String)> {
+        Some((self.tunnel.recv_transport?, self.recv_remote_addr()?))
+    }
+
+    /// The receive link to listen on (its transport and address) for an asymmetric tunnel,
+    /// else `None`. Pass to [`crate::transport::split::listener`].
+    pub fn recv_link_listen(&self) -> Option<(TransportKind, String)> {
+        Some((self.tunnel.recv_transport?, self.recv_listen_addr()?))
     }
 
     fn validate_kcp(&self) -> Result<()> {
@@ -2533,6 +2655,22 @@ pub fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
+/// Returns `addr` with its port increased by one, keeping the host part (supports a bracketed
+/// IPv6 host). Used to derive the second link's address for an asymmetric tunnel when its own
+/// is not given. `None` when `addr` has no parseable `:port` or the port is already 65535.
+pub fn bump_port(addr: &str) -> Option<String> {
+    let addr = addr.trim();
+    let (host, port) = addr.rsplit_once(':')?;
+    // Reject an IPv6 address with no port (e.g. "::1"): a real host:port either is not bare
+    // IPv6 or carries brackets. A bracketed host keeps its brackets in `host`.
+    if host.contains(':') && !host.ends_with(']') {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    let next = port.checked_add(1)?;
+    Some(format!("{host}:{next}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2560,6 +2698,48 @@ mod tests {
         assert!(c.is_acceptor());
         assert_eq!(c.profile, Profile::Balanced);
         assert_eq!(c.forward.len(), 1);
+    }
+
+    #[test]
+    fn bump_port_increments_the_port() {
+        assert_eq!(bump_port("1.2.3.4:3080").as_deref(), Some("1.2.3.4:3081"));
+        assert_eq!(bump_port("[::1]:3080").as_deref(), Some("[::1]:3081"));
+        assert_eq!(bump_port("1.2.3.4"), None);
+        assert_eq!(bump_port("1.2.3.4:65535"), None);
+    }
+
+    #[test]
+    fn asymmetric_transport_validates_and_derives_the_second_port() {
+        // ws out, tcp back: accepted, and the receive link's listen port derives to +1.
+        let text = format!(
+            r#"
+            role = "entry"
+            mode = "reverse"
+            [tunnel]
+            transport = "ws"
+            recv_transport = "tcp"
+            listen = "0.0.0.0:3080"
+            token = "{TOKEN}"
+            [[forward]]
+            listen = "0.0.0.0:443"
+            target = "127.0.0.1:443"
+            "#
+        );
+        let c = Config::parse(&text).unwrap();
+        assert!(c.is_asymmetric());
+        assert_eq!(c.recv_listen_addr().as_deref(), Some("0.0.0.0:3081"));
+        assert_eq!(c.recv_link_listen().unwrap().0, TransportKind::Tcp);
+
+        // A KCP-based transport is not allowed as a split half.
+        let bad = text.replace(r#"recv_transport = "tcp""#, r#"recv_transport = "kcp""#);
+        assert!(Config::parse(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("asymmetric"));
+
+        // The same transport both ways is rejected (that is a normal symmetric tunnel).
+        let same = text.replace(r#"transport = "ws""#, r#"transport = "tcp""#);
+        assert!(Config::parse(&same).is_err());
     }
 
     #[test]

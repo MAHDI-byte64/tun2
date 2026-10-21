@@ -290,6 +290,11 @@ pub struct Spec {
     pub listen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Asymmetric transport: the receive link's transport (acceptor→dialer), when the tunnel
+    /// uses a different transport each way. The receive link's address is the primary port + 1
+    /// (the core derives it). `None` is a normal symmetric tunnel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_transport: Option<String>,
     /// Sent when a tunnel is made or its token changes; `None` keeps the one in the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -425,9 +430,14 @@ impl IcmpSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpoofSpec {
-    /// The on-wire packet shape: `udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`.
+    /// The on-wire packet shape *this side forges*: `udp`, `tcp`, `icmp`, `gre`, `ipip` or
+    /// `proto58`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<String>,
+    /// Asymmetric spoof: the shape this side *receives*, when it differs from `shape`. `None`
+    /// is symmetric. The two sides mirror each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_shape: Option<String>,
     /// The forged source addresses *this side* rotates through (IPs, CIDR blocks or ranges),
     /// resolved per side by the pair layer. On a wizard request it is unused — the two
     /// servers' lists travel in `entry_pool` / `exit_pool`.
