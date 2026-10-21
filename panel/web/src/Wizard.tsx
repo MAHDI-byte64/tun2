@@ -281,7 +281,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
       if (!/^\d{1,5}$/.test(listenPort) || +listenPort < 1 || +listenPort > 65535) return t("wz.port", { server: serverName(acceptor) });
       if (!dialHost.trim() && !netId) return t("wz.dial", { server: serverName(acceptor), other: serverName(dialer) });
       if (isWs && !wsPath.startsWith("/")) return t("wz.wsPath");
-      if (transport === "wss" && !tlsReady(tls)) return t("tls.needCert");
+      if (usesWss && !tlsReady(tls)) return t("tls.needCert");
     }
     if (s === 1 && spoof && (parseSpoofPool(spoofS.entryPool).length === 0 || parseSpoofPool(spoofS.exitPool).length === 0))
       return t("spf.poolNeeded");
@@ -441,7 +441,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                       c.mode === mode &&
                       (isPrivatePath(c.path) ? c.network === netId : !netId) &&
                       (c.path === "ipv6") === (!netId && isV6(dialHost)) &&
-                      !c.sni === !(transport === "wss" && sni)
+                      !c.sni === !(usesWss && sni)
                     }
                     onApply={applyBench}
                   />
@@ -677,7 +677,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                       <span className="help">{t("wz.wsHostHelp")}</span>
                     </div>
                   )}
-                  {transport === "wss" && (
+                  {usesWss && (
                     <div style={{ gridColumn: "1 / -1" }}>
                       <TlsChoice
                         value={tls}
@@ -691,7 +691,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                       />
                     </div>
                   )}
-                  {transport === "wss" && tls.mode === "self" && (
+                  {usesWss && tls.mode === "self" && (
                     <div className="field">
                       <label htmlFor="wz-sni">{t("wz.sni")}</label>
                       <input className="text mono" id="wz-sni" dir="ltr" value={sni} placeholder="www.example.com" onChange={(e) => setSni(e.target.value.trim())} />

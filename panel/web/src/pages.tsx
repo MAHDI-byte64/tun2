@@ -1197,7 +1197,7 @@ function LoginLink() {
         {t("set.linkMake")}
       </button>
       {url && (
-        <div style={{ width: "100%" }}>
+        <div style={{ width: "100%", minWidth: 0 }}>
           <CodeBlock text={url} />
           <span className="countdown">{left > 0 ? t("set.linkValid", { m: digitsOf(mmss) }) : t("set.linkExpired")}</span>
         </div>

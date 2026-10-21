@@ -119,7 +119,11 @@ impl Settings {
         let creds = if self.username.is_empty() {
             String::new()
         } else {
-            format!("{}:{}@", self.username, self.password)
+            format!(
+                "{}:{}@",
+                pct_encode(&self.username),
+                pct_encode(&self.password)
+            )
         };
         Some(format!("socks5://{creds}{}", self.addr))
     }
@@ -168,16 +172,41 @@ pub fn internet_proxy() -> Option<String> {
     INTERNET_PROXY.read().ok().and_then(|g| g.clone())
 }
 
-/// `host:port` with a real port and a plausible host (no spaces, not too long).
+/// `host:port` with a real port and a plausible host (no spaces, not too long). An IPv6 host
+/// must be bracketed (`[::1]:1080`): an unbracketed one is ambiguous with the port separator and
+/// would break both the `ureq` proxy URL and the SOCKS5 dial, so it is rejected.
 fn valid_host_port(v: &str) -> bool {
-    let Some((host, port)) = v.rsplit_once(':') else {
-        return false;
+    let (host, port) = match v.strip_prefix('[') {
+        Some(rest) => match rest.split_once("]:") {
+            Some(hp) => hp,
+            None => return false,
+        },
+        None => match v.rsplit_once(':') {
+            // A bare colon-bearing host is an unbracketed IPv6: reject it.
+            Some((host, _)) if host.contains(':') => return false,
+            Some(hp) => hp,
+            None => return false,
+        },
     };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
     !host.is_empty()
         && host.len() <= 100
         && !host.contains(char::is_whitespace)
         && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
+/// Percent-encodes a proxy username or password for use in a `socks5://user:pass@host` URL, so
+/// a `:`, `@`, `/` or other special character does not break the URL's own structure.
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -292,9 +321,29 @@ mod tests {
     fn host_port_accepts_ipv4_and_bracketed_ipv6() {
         assert!(valid_host_port("1.2.3.4:1080"));
         assert!(valid_host_port("[::1]:1080"));
+        assert!(valid_host_port("[2001:db8::1]:1080"));
         assert!(valid_host_port("proxy.local:1080"));
         assert!(!valid_host_port("1.2.3.4"));
         assert!(!valid_host_port("1.2.3.4:0"));
         assert!(!valid_host_port("1.2.3.4:99999"));
+        // An unbracketed IPv6 is ambiguous with the port separator: rejected.
+        assert!(!valid_host_port("2001:db8::1:1080"));
+        assert!(!valid_host_port("::1:1080"));
+    }
+
+    #[test]
+    fn the_url_percent_encodes_special_characters_in_credentials() {
+        let s = Settings {
+            username: "u:ser".into(),
+            password: "p@ss/1".into(),
+            addr: "[2001:db8::1]:1080".into(),
+            ..enabled()
+        };
+        // The ':' and '@' in the credentials are encoded so they do not break the URL, and the
+        // bracketed IPv6 host is carried through verbatim.
+        assert_eq!(
+            s.url().unwrap(),
+            "socks5://u%3Aser:p%40ss%2F1@[2001:db8::1]:1080"
+        );
     }
 }
