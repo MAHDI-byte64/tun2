@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.10.2 - 2026-10-21
+
+### Fixed
+
+- **The x86_64 binaries run on older CPUs again.** The 2.10.1 release build emitted AVX2
+  instructions that CPUs without AVX2 (for example Ivy Bridge Xeons such as the E5-2600 v2
+  series) cannot execute, so `kariz` and `kariz-panel` crashed on start with an illegal
+  instruction (`SIGILL`, `status=4/ILL`). The x86_64 release is now pinned to the baseline
+  `x86-64` target so it runs on any 64-bit Intel/AMD CPU. The crypto libraries still select
+  AES-NI/AVX2 at run time through their own CPU detection, so throughput on modern servers is
+  unchanged.
+
 ## 2.10.1 - 2026-10-21
 
 ### Fixed
