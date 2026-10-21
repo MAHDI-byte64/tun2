@@ -162,6 +162,8 @@ input.text.search { min-height: 40px; background: var(--card); }
   text-align: left;
   white-space: pre;
   overflow-x: auto;
+  max-width: 100%;
+  min-width: 0;
 }
 [dir="rtl"] .code { padding-inline-end: var(--sp-4); padding-right: 56px; }
 .code .k { color: var(--accent); }
@@ -901,7 +903,10 @@ label.sp-opt { display: inline-flex; align-items: center; gap: var(--sp-2); min-
 .set-row > * { min-width: 0; }
 .set-row h3 { margin: 0; font-size: var(--fs-md); font-weight: 600; }
 .set-row p { margin: 4px 0 0; font-size: var(--fs-sm); color: var(--text-3); }
-.set-row .ctl { display: grid; gap: var(--sp-3); align-content: start; justify-items: start; }
+/* A single column capped at the cell width (minmax(0, …)): without the 0 minimum the column
+   grows to fit non-wrapping content like a long login URL and the control overflows the card. */
+.set-row .ctl { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-3); align-content: start; justify-items: start; }
+.set-row .ctl > * { min-width: 0; max-width: 100%; }
 .set-row .ctl > .text, .set-row .ctl > .select, .set-row .ctl > .code { justify-self: stretch; }
 
 .session { display: grid; grid-template-columns: 1fr auto; gap: 2px var(--sp-4); align-items: center; padding: var(--sp-3) 0; border-bottom: var(--hairline) solid var(--line); width: 100%; }

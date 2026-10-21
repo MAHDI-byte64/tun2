@@ -2123,8 +2123,11 @@ impl Config {
     }
 
     fn validate_tls(&self) -> Result<()> {
-        // `wss`/`wssmux` as the primary or as a fallback candidate uses the table.
+        // `wss`/`wssmux` as the primary, the asymmetric receive link, or a fallback candidate
+        // uses the table. (With asymmetric transport the user-facing wss direction can be the
+        // receive link, which still binds/dials with the same cert and pin.)
         let wss = self.tunnel.transport.is_wss()
+            || self.tunnel.recv_transport.is_some_and(|k| k.is_wss())
             || self.tunnel.fallback_transports.iter().any(|k| k.is_wss());
         let tls = match (&self.tunnel.tls, wss) {
             (Some(_), false) => {
@@ -2740,6 +2743,53 @@ mod tests {
         // The same transport both ways is rejected (that is a normal symmetric tunnel).
         let same = text.replace(r#"transport = "ws""#, r#"transport = "tcp""#);
         assert!(Config::parse(&same).is_err());
+    }
+
+    #[test]
+    fn asymmetric_wss_on_the_receive_link_uses_the_tls_cert() {
+        // entry/reverse is the acceptor. The receive link is wss, so the TLS cert must be
+        // accepted (and required) even though the primary `transport` is not wss — before the
+        // fix the cert was rejected as "only used with wss" and the tunnel could not start.
+        let with_cert = format!(
+            r#"
+            role = "entry"
+            mode = "reverse"
+            [tunnel]
+            transport = "ws"
+            recv_transport = "wss"
+            listen = "0.0.0.0:3080"
+            token = "{TOKEN}"
+            [tunnel.tls]
+            cert = "/etc/kariz/t.crt"
+            key = "/etc/kariz/t.key"
+            [[forward]]
+            listen = "0.0.0.0:443"
+            target = "127.0.0.1:443"
+            "#
+        );
+        assert!(
+            Config::parse(&with_cert).is_ok(),
+            "{:?}",
+            Config::parse(&with_cert).err()
+        );
+
+        // The listening wss side still needs the cert: without it, the config is rejected.
+        let no_cert = format!(
+            r#"
+            role = "entry"
+            mode = "reverse"
+            [tunnel]
+            transport = "ws"
+            recv_transport = "wss"
+            listen = "0.0.0.0:3080"
+            token = "{TOKEN}"
+            [[forward]]
+            listen = "0.0.0.0:443"
+            target = "127.0.0.1:443"
+            "#
+        );
+        let err = Config::parse(&no_cert).unwrap_err().to_string();
+        assert!(err.contains("wss"), "{err}");
     }
 
     #[test]

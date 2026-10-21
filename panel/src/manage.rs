@@ -335,9 +335,15 @@ fn is_acceptor(spec: &Spec) -> bool {
     )
 }
 
+/// Whether this spec uses `wss` on either direction — the primary transport or, for an
+/// asymmetric tunnel, the receive link. Both need the TLS material.
+fn uses_wss(spec: &Spec) -> bool {
+    spec.transport == "wss" || spec.recv_transport.as_deref() == Some("wss")
+}
+
 /// The certificate and key of a listening wss side, beside its config.
 fn cert_files(dir: &Path, spec: &Spec) -> Option<(PathBuf, PathBuf)> {
-    if !(spec.transport == "wss" && is_acceptor(spec)) {
+    if !(uses_wss(spec) && is_acceptor(spec)) {
         return None;
     }
     if let Some(own) = own_cert(spec) {
@@ -1407,6 +1413,27 @@ mod tests {
         assert_eq!(got.forwards.len(), 1);
         assert!(got.token.is_none(), "the token is never handed back");
         assert_eq!(existing_token(&d.0.join("main.toml")), Some("a".repeat(48)));
+    }
+
+    #[test]
+    fn an_asymmetric_wss_receive_link_gets_its_cert() {
+        // entry/reverse is the acceptor. A tcp send link with a wss receive link must still make
+        // the self-signed certificate (so it returns a pin for the dialer) and render the TLS
+        // block; before the fix the cert was only made when the primary transport was wss.
+        let d = Dir::new();
+        let mut s = spec("asym-wss");
+        s.transport = "tcp".into();
+        s.recv_transport = Some("wss".into());
+        let pin = put(&d.0, &s).unwrap();
+        assert!(
+            pin.is_some(),
+            "a listening wss receive link should produce a pin"
+        );
+        let toml = std::fs::read_to_string(d.0.join("asym-wss.toml")).unwrap();
+        assert!(toml.contains("[tunnel.tls]"), "missing tls block:\n{toml}");
+        assert!(toml.contains(r#"recv_transport = "wss""#), "{toml}");
+        let got = get(&d.0, "asym-wss").unwrap();
+        assert_eq!(got.recv_transport.as_deref(), Some("wss"));
     }
 
     #[test]

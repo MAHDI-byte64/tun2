@@ -116,6 +116,19 @@ impl Settings {
             ..self.clone()
         }
     }
+
+    /// The same settings with WebSocket `early_data` turned off. An asymmetric tunnel's ws/wss
+    /// legs cannot use it: the acceptor only ever reads the send link (and the dialer only ever
+    /// reads the receive link), so the HTTP 101 that `early_data` holds back until the first
+    /// write is never flushed and the handshake deadlocks. The correlation id a split link
+    /// sends first is tiny, so losing the one saved round trip does not matter.
+    pub fn without_early_data(&self) -> Self {
+        let mut s = self.clone();
+        if let Some(ws) = s.ws.as_mut() {
+            ws.early_data = false;
+        }
+        s
+    }
 }
 
 pub enum Listener {

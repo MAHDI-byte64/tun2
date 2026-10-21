@@ -301,7 +301,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     if (!/^\d{1,5}$/.test(listenPort) || +listenPort < 1 || +listenPort > 65535) return t("wz.port", { server: serverName(acceptor) });
     if (!dialHost.trim() && !netId) return t("wz.dial", { server: serverName(acceptor), other: serverName(dialer) });
     if (isWs && !wsPath.startsWith("/")) return t("wz.wsPath");
-    if (transport === "wss" && !tlsReady(tls)) return t("tls.needCert");
+    if (usesWss && !tlsReady(tls)) return t("tls.needCert");
     if (spoof && (parseSpoofPool(spoofS.entryPool).length === 0 || parseSpoofPool(spoofS.exitPool).length === 0)) return t("spf.poolNeeded");
     if (asym && !spoof && recvTransport === transport) return t("asym.needDiffer");
     if (asym && spoof && spoofRecvShape === spoofShape) return t("asym.needDiffer");
@@ -497,12 +497,12 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
                   <span className="help">{t("wz.wsHostHelp")}</span>
                 </div>
               )}
-              {transport === "wss" && (
+              {usesWss && (
                 <div style={{ gridColumn: "1 / -1" }}>
                   <TlsChoice value={tls} onChange={setTls} server={acceptor} serverName={serverName(acceptor)} onHost={(h) => setDialHost(h)} />
                 </div>
               )}
-              {transport === "wss" && tls.mode === "self" && (
+              {usesWss && tls.mode === "self" && (
                 <div className="field">
                   <label htmlFor="te-sni">{t("wz.sni")}</label>
                   <input className="text mono" id="te-sni" dir="ltr" value={sni} placeholder="www.example.com" onChange={(e) => setSni(e.target.value.trim())} />

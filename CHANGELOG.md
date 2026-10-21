@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.10.1 - 2026-10-21
+
+### Fixed
+
+- **Asymmetric transport with `wss` on the receive direction now works.** The TLS certificate
+  was dropped when `wss` was the receive link rather than the primary transport, so the tunnel
+  could not start: core `validate_tls`, the panel's config rendering and the wizard/edit TLS UI
+  now all recognise `wss` on either direction. (Both servers still need 2.10.)
+- **Asymmetric `ws`/`wss` links no longer deadlock with `early_data`.** A split tunnel's handshake
+  hung when `[tunnel.ws] early_data` was on, because the one-way links never flushed the held-back
+  HTTP 101; `early_data` is now turned off on a split tunnel's ws/wss legs (the first bytes it
+  sends are tiny, so the saved round trip did not matter).
+- **Asymmetric `ws`/`wss` links answer WebSocket control frames.** Each leg's otherwise-idle
+  direction is now serviced in the background, so a `ping` from a CDN or reverse proxy is answered
+  and a close is noticed; a plain `tcp` leg needs nothing and is untouched.
+- **The one-time login link displays correctly.** A long login URL overflowed its settings cell
+  and spilled past the card; the control column is now capped so the URL scrolls within it.
+- **The panel proxy accepts IPv6 and special characters.** An IPv6 proxy address must now be
+  bracketed (`[::1]:1080`), and a username or password with a `:`/`@`/`/` is percent-encoded in
+  the internet-scope proxy URL, so neither breaks the connection.
+
 ## 2.10.0 - 2026-10-21
 
 ### Added
