@@ -7,7 +7,7 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scripts/kariz.sh)
 #
 # Without arguments it opens a menu. The same actions as commands (see `help`):
-#   kariz-manager install [--version vX.Y.Z] [--binary PATH]
+#   kariz-manager install [--version vX.Y.Z] [--binary PATH] [--archive FILE] [--offline]
 #   kariz-manager update | uninstall [--yes]
 #   kariz-manager panel install [--domain D | --ip ADDRESS] | link | password | status | logs | uninstall
 #   kariz-manager panel cert [--domain D | --ip ADDRESS]   change the domain or address of the panel
@@ -606,15 +606,81 @@ sync_manager() {
     fi
 }
 
+# Installs Kariz (and the web panel, when the archive carries it) from a release archive
+# already on disk — for a server with no internet. $1 is the `.tar.gz`; its `.sha256` (and,
+# from 0.11, its `.sig`) must be next to it. The checksum and signature are checked exactly as
+# for a download, so an offline install is no less safe than an online one.
+install_from_archive() {
+    local file=$1
+    [[ -s "$file" ]] || die "No archive at $file."
+    local dir base name version a tmp
+    dir=$(cd "$(dirname "$file")" && pwd) || die "Cannot read the folder of $file."
+    base=$(basename "$file")
+    name=${base%.tar.gz}
+    [[ "$name" != "$base" ]] ||
+        die "$base is not a Kariz release archive (expected kariz-VERSION-ARCH-linux.tar.gz)."
+    a=$(arch)
+    [[ "$name" == *"-$a-linux" ]] ||
+        die "$base is not built for this CPU ($a): copy over the -$a-linux archive instead."
+    [[ -s "$dir/$base.sha256" ]] ||
+        die "The checksum is missing: expected $base.sha256 next to the archive."
+    version=$(sed -n 's/^kariz-v\{0,1\}\([0-9][0-9.]*\).*/\1/p' <<<"$name")
+    # An unparsable name is treated as a current release, so a missing signature stops it.
+    version=${version:-9999}
+    tmp=$(mktemp -d)
+    if ! { cp "$file" "$tmp/$base" && cp "$dir/$base.sha256" "$tmp/$base.sha256"; }; then
+        rm -rf "$tmp"
+        die "Could not read the archive and its checksum."
+    fi
+    [[ -s "$dir/$base.sig" ]] && cp "$dir/$base.sig" "$tmp/$base.sig"
+    if ! (cd "$tmp" && sha256sum -c --quiet "$base.sha256"); then
+        rm -rf "$tmp"
+        die "Checksum mismatch: $base does not match its .sha256 (damaged or the wrong file)."
+    fi
+    verify_signature "$tmp" "$name" "$version"
+    if ! tar -xzf "$tmp/$base" -C "$tmp"; then
+        rm -rf "$tmp"
+        die "Could not unpack $base."
+    fi
+    [[ -x "$tmp/$name/kariz" ]] ||
+        { rm -rf "$tmp"; die "The archive does not contain the kariz program."; }
+    install -m 0755 "$tmp/$name/kariz" "$BIN"
+    # Releases from 0.8 carry the web panel and its agent in the same archive.
+    if [[ -f "$tmp/$name/kariz-panel" ]]; then
+        install -m 0755 "$tmp/$name/kariz-panel" "$PANEL_BIN"
+    fi
+    rm -rf "$tmp"
+    ok "Installed from $base (offline)."
+}
+
+# Prints a local release archive for this CPU — kariz-*-<arch>-linux.tar.gz that has its
+# .sha256 next to it — looked for in the current folder, next to this script, /root and
+# /opt/kariz; the newest version when there is more than one. Nothing when none is found.
+find_local_archive() {
+    local a self dir f
+    a=$(arch)
+    self=$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)
+    {
+        for dir in "$PWD" ${self:+"$(dirname "$self")"} /root /opt/kariz; do
+            [[ -d "$dir" ]] || continue
+            for f in "$dir"/kariz-*-"$a"-linux.tar.gz; do
+                [[ -s "$f" && -s "$f.sha256" ]] && printf '%s\t%s\n' "$(basename "$f")" "$f"
+            done
+        done
+    } 2>/dev/null | sort -V | tail -n1 | cut -f2-
+}
+
 cmd_install() {
     need_root
     need_systemd
-    local version="" binary="" panel_binary=""
+    local version="" binary="" panel_binary="" archive="" offline=0
     while [[ $# -gt 0 ]]; do
         case $1 in
             --version) version=$2 && shift 2 ;;
             --binary) binary=$2 && shift 2 ;;
             --panel-binary) panel_binary=$2 && shift 2 ;;
+            --archive) archive=$2 && shift 2 ;;
+            --offline) offline=1 && shift ;;
             *) die "install: unknown option $1" ;;
         esac
     done
@@ -622,32 +688,52 @@ cmd_install() {
         [[ -x "$panel_binary" ]] || die "No executable at $panel_binary."
         install -m 0755 "$panel_binary" "$PANEL_BIN"
     fi
-    if [[ -n "$binary" ]]; then
+    if [[ -n "$archive" ]]; then
+        install_from_archive "$archive"
+    elif [[ -n "$binary" ]]; then
         [[ -x "$binary" ]] || die "No executable at $binary."
         install -m 0755 "$binary" "$BIN"
-    else
-        local a tmp
+    elif ((offline)); then
+        local a found
         a=$(arch)
-        [[ -n "$version" ]] || version=$(latest_version)
-        [[ -n "$version" ]] || die "Could not find the latest release (GitHub may be limiting you: set GITHUB_TOKEN)."
-        info "Downloading Kariz $version for $a"
-        local name="kariz-$version-$a-linux"
-        tmp=$(mktemp -d)
-        download_asset "$version" "$name.tar.gz" "$tmp/$name.tar.gz"
-        download_asset "$version" "$name.tar.gz.sha256" "$tmp/$name.tar.gz.sha256"
-        # The signature is optional to download (releases before 0.11 have none).
-        (download_asset "$version" "$name.tar.gz.sig" "$tmp/$name.tar.gz.sig") 2>/dev/null ||
-            rm -f "$tmp/$name.tar.gz.sig"
-        (cd "$tmp" && sha256sum -c --quiet "$name.tar.gz.sha256") ||
-            die "Checksum mismatch: the download is damaged."
-        verify_signature "$tmp" "$name" "$version"
-        tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
-        install -m 0755 "$tmp/$name/kariz" "$BIN"
-        # Releases from 0.8 carry the web panel and its agent in the same archive.
-        if [[ -f "$tmp/$name/kariz-panel" ]]; then
-            install -m 0755 "$tmp/$name/kariz-panel" "$PANEL_BIN"
+        found=$(find_local_archive)
+        [[ -n "$found" ]] ||
+            die "Offline install: no kariz-*-$a-linux.tar.gz found in the current folder, next to this script, /root or /opt/kariz. Copy the archive there with its .sha256 and .sig, or pass --archive FILE."
+        install_from_archive "$found"
+    else
+        local a tmp found
+        a=$(arch)
+        [[ -n "$version" ]] || version=$(FETCH_MAX=15 latest_version 2>/dev/null || true)
+        if [[ -z "$version" ]]; then
+            # GitHub could not be reached (no internet, or it is rate-limiting). Fall back to a
+            # local archive if one was copied over, else explain the offline install.
+            found=$(find_local_archive)
+            if [[ -n "$found" ]]; then
+                warn "Could not reach GitHub — installing from the local archive found here."
+                install_from_archive "$found"
+            else
+                die "Could not reach GitHub to find the latest release. If this server has no internet, download kariz-<version>-$a-linux.tar.gz with its .sha256 and .sig on a machine that does, copy them next to this script, and run the install again (or: kariz-manager install --archive FILE). If GitHub is limiting you, set GITHUB_TOKEN."
+            fi
+        else
+            info "Downloading Kariz $version for $a"
+            local name="kariz-$version-$a-linux"
+            tmp=$(mktemp -d)
+            download_asset "$version" "$name.tar.gz" "$tmp/$name.tar.gz"
+            download_asset "$version" "$name.tar.gz.sha256" "$tmp/$name.tar.gz.sha256"
+            # The signature is optional to download (releases before 0.11 have none).
+            (download_asset "$version" "$name.tar.gz.sig" "$tmp/$name.tar.gz.sig") 2>/dev/null ||
+                rm -f "$tmp/$name.tar.gz.sig"
+            (cd "$tmp" && sha256sum -c --quiet "$name.tar.gz.sha256") ||
+                die "Checksum mismatch: the download is damaged."
+            verify_signature "$tmp" "$name" "$version"
+            tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+            install -m 0755 "$tmp/$name/kariz" "$BIN"
+            # Releases from 0.8 carry the web panel and its agent in the same archive.
+            if [[ -f "$tmp/$name/kariz-panel" ]]; then
+                install -m 0755 "$tmp/$name/kariz-panel" "$PANEL_BIN"
+            fi
+            rm -rf "$tmp"
         fi
-        rm -rf "$tmp"
     fi
     mkdir -p "$CONF_DIR"
     chmod 700 "$CONF_DIR"
@@ -745,7 +831,7 @@ cmd_update() {
     local before local_install=0 a
     before=$("$BIN" --version)
     for a in "$@"; do
-        [[ "$a" == --binary || "$a" == --panel-binary ]] && local_install=1
+        [[ "$a" == --binary || "$a" == --panel-binary || "$a" == --archive || "$a" == --offline ]] && local_install=1
     done
     cmd_install "$@"
     # A copy of this script that is already installed is not replaced by an install: the
@@ -2290,6 +2376,8 @@ usage() {
   panel (docs/panel.md). This script installs Kariz and the panel on a server.
 
   install [--version vX.Y.Z] [--binary PATH]   install Kariz (latest release by default)
+          [--archive FILE] [--offline]         offline: from a release .tar.gz on disk, or a
+                                               kariz-*-ARCH-linux.tar.gz copied next to this script
   update  [--version vX.Y.Z]                   update Kariz and restart what runs
   uninstall [--yes]                            also deletes the configs with --yes
   panel install [--port N] [--domain D | --ip ADDRESS] [--email E] [--name NAME] [--yes]

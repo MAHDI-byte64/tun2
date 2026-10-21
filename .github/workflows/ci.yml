@@ -222,6 +222,33 @@ jobs:
           rm "$d/$n.tar.gz.sig"
           check "$d" "$n" v0.10.0
           if check "$d" "$n" v0.11.0; then echo "an unsigned 0.11 passed" >&2; exit 1; fi
+      # Offline install: the same archive layout a release ships, signed with the test key,
+      # installed through the manager's offline path (no network) into a temp prefix, and
+      # found by its auto-discovery.
+      - name: Offline install from a local archive
+        run: |
+          repo=$PWD
+          kp=target/release/kariz-panel
+          d=$(mktemp -d)
+          out=$($kp release-key --out "$d/key")
+          pem=$(printf '%s\n' "$out" | sed -n '/BEGIN PUBLIC KEY/,/END PUBLIC KEY/p')
+          off=$(mktemp -d); n=kariz-v99.0.0-x86_64-linux; mkdir -p "$off/$n"
+          cp target/release/kariz target/release/kariz-panel "$off/$n/"
+          (cd "$off" && tar czf "$n.tar.gz" "$n" && sha256sum "$n.tar.gz" > "$n.tar.gz.sha256")
+          KARIZ_SIGNING_KEY=$(cat "$d/key") $kp release-sign "$off/$n.tar.gz.sha256"
+          # Install from the archive by path, into a temporary prefix.
+          dst=$(mktemp -d)
+          KARIZ_RELEASE_KEY_PEM="$pem" bash -c "source '$repo/scripts/kariz.sh'; BIN='$dst/kariz'; PANEL_BIN='$dst/kariz-panel'; install_from_archive '$off/$n.tar.gz'"
+          test -x "$dst/kariz" && test -x "$dst/kariz-panel"
+          # Auto-discovery finds the archive copied next to the manager (its .sha256 is there).
+          found=$(cd "$off" && bash -c "source '$repo/scripts/kariz.sh'; find_local_archive")
+          test "$found" = "$off/$n.tar.gz"
+          # A tampered archive is refused and nothing is installed.
+          printf x >> "$off/$n.tar.gz"; bad=$(mktemp -d)
+          if KARIZ_RELEASE_KEY_PEM="$pem" bash -c "source '$repo/scripts/kariz.sh'; BIN='$bad/kariz'; PANEL_BIN='$bad/kariz-panel'; install_from_archive '$off/$n.tar.gz'"; then
+            echo "a tampered archive installed" >&2; exit 1
+          fi
+          test ! -e "$bad/kariz"
       # Updating the panel from the panel, on this systemd host: a second panel is built that
       # calls itself 99.0.0, a local server plays the releases (signed with a key made for the
       # test), and the panel must roll back a release that does not come up and take a good one.

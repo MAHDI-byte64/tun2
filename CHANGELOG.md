@@ -20,6 +20,12 @@
   `tcpmux`/`wss`, since SOCKS5 cannot carry UDP) and/or **panel internet** (release downloads for
   updating). Optional username/password; the password is kept in the panel and never shown again.
   Changing it rebuilds the reverse links so the new route takes effect at once.
+- **Offline install in the manager script.** `kariz-manager install --archive FILE` installs from
+  a release `.tar.gz` already on disk, and `--offline` finds a copied-over
+  `kariz-*-<arch>-linux.tar.gz` (next to the script, in the current folder, `/root` or
+  `/opt/kariz`) on its own; the interactive **Install** also falls back to a local archive when it
+  cannot reach GitHub. The checksum and signature are verified exactly as for a download, so an
+  air-gapped install is no less safe.
 
 ### Changed
 
