@@ -10,6 +10,7 @@ import type { MapData, MapHit } from "./scene-map";
 import { useApp } from "./store";
 import { BackupDialog, RestoreDialog } from "./Extras";
 import { TelegramSection } from "./Telegram";
+import { ProxySection } from "./Proxy";
 import { AutoRestartDialog } from "./AutoRestart";
 import { ServerFixDialog } from "./ServerFix";
 import { useNetworks } from "./Networks";
@@ -1285,6 +1286,7 @@ export function SettingsPage({ hasPassword, onPasswordSet, updates }: { hasPassw
     ["sec", t("set.sec"), "shield"],
     ["upd", t("set.updates"), "update"],
     ["tg", t("set.telegram"), "bell"],
+    ["px", t("set.proxy"), "shield"],
     ["bak", t("set.backup"), "download"],
     ["look", t("set.look"), "palette"],
   ];
@@ -1340,6 +1342,9 @@ export function SettingsPage({ hasPassword, onPasswordSet, updates }: { hasPassw
         </div>
         <div id="set-tg" className="set-section">
           <TelegramSection />
+        </div>
+        <div id="set-px" className="set-section">
+          <ProxySection />
         </div>
         <Card title={t("set.backup")} id="set-bak" className="set-section">
           {row(

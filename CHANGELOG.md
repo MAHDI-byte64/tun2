@@ -14,6 +14,12 @@
   recv_shape` forges one shape and accepts another over the single KCP session. The tunnel wizard
   gains a **"different transport each way"** switch for every connection kind (direct, reverse,
   source spoofing), with a two-direction picker and a flow diagram. Both servers need 2.10.
+- **Outbound SOCKS5 proxy for the panel.** Settings → Proxy lets the panel reach out through a
+  SOCKS5 proxy, with a selectable scope: **server connections** (the panel's reverse-mode dials
+  to the other servers and the tunnel management on those links — kept to the TCP transports
+  `tcpmux`/`wss`, since SOCKS5 cannot carry UDP) and/or **panel internet** (release downloads for
+  updating). Optional username/password; the password is kept in the panel and never shown again.
+  Changing it rebuilds the reverse links so the new route takes effect at once.
 
 ### Changed
 

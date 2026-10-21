@@ -102,6 +102,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/telegram/pair", post(telegram_pair))
         .route("/api/telegram/chats/remove", post(telegram_remove_chat))
         .route("/api/telegram/test", post(telegram_test))
+        .route("/api/proxy", get(proxy_get).post(proxy_set))
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
@@ -2356,6 +2357,85 @@ async fn telegram_set(
         },
     );
     reply(StatusCode::OK, state.hub.telegram.view(&s, &state.db))
+}
+
+// ---- Proxy ----
+
+#[derive(Deserialize)]
+struct ProxyBody {
+    enabled: Option<bool>,
+    addr: Option<String>,
+    username: Option<String>,
+    /// A new password. When omitted the stored one is kept (the page never sends it back).
+    password: Option<String>,
+    #[serde(default)]
+    remove_password: bool,
+    server_links: Option<bool>,
+    panel_internet: Option<bool>,
+}
+
+async fn proxy_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&state, &headers, false) {
+        return r;
+    }
+    reply(
+        StatusCode::OK,
+        crate::proxy::Settings::load(&state.db).view(),
+    )
+}
+
+async fn proxy_set(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<ProxyBody>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut s = crate::proxy::Settings::load(&state.db);
+    if let Some(v) = body.enabled {
+        s.enabled = v;
+    }
+    if let Some(v) = body.addr {
+        s.addr = v.trim().to_owned();
+    }
+    if let Some(v) = body.username {
+        s.username = v.trim().to_owned();
+    }
+    if body.remove_password {
+        s.password.clear();
+    } else if let Some(v) = body.password {
+        s.password = v;
+    }
+    if let Some(v) = body.server_links {
+        s.server_links = v;
+    }
+    if let Some(v) = body.panel_internet {
+        s.panel_internet = v;
+    }
+    if let Err(code) = s.check() {
+        return error(StatusCode::BAD_REQUEST, code);
+    }
+    if let Err(e) = s.save(&state.db) {
+        return internal(e);
+    }
+    s.apply();
+    // The proxy only carries TCP, so turning it on (or off) changes which transports the
+    // panel may dial a server with: the reverse links are rebuilt so they pick it up.
+    state.hub.start_reverse_links();
+    audit(
+        &state,
+        &format!("session {}", me.id),
+        &ip_of(&peer),
+        if s.enabled {
+            "changed the panel proxy (on)"
+        } else {
+            "changed the panel proxy (off)"
+        },
+    );
+    reply(StatusCode::OK, s.view())
 }
 
 /// A new code for connecting a chat: the chat sends `/start CODE` to the bot.

@@ -16,6 +16,7 @@ pub mod kcp;
 pub mod quic;
 #[cfg(feature = "quic")]
 mod quic_obfs;
+pub mod proxy;
 pub mod split;
 pub mod tcp;
 pub mod tls;

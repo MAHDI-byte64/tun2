@@ -640,6 +640,20 @@ export type TelegramChange = Partial<
   Pick<TelegramView, "enabled" | "lang" | "servers" | "tunnels" | "server_grace" | "tunnel_grace" | "digest_hours" | "api_base" | "proxy" | "connect_via">
 > & { token?: string; remove_token?: boolean };
 
+export interface ProxyView {
+  enabled: boolean;
+  addr: string;
+  username: string;
+  has_password: boolean;
+  server_links: boolean;
+  panel_internet: boolean;
+}
+
+export type ProxyChange = Partial<Pick<ProxyView, "enabled" | "addr" | "username" | "server_links" | "panel_internet">> & {
+  password?: string;
+  remove_password?: boolean;
+};
+
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -755,6 +769,8 @@ export const api = {
   telegramPair: () => call<TelegramView>("POST", "telegram/pair", {}),
   telegramRemoveChat: (id: number) => call<TelegramView>("POST", "telegram/chats/remove", { id }),
   telegramTest: () => call<{ ok: boolean; bot?: string; error?: string }>("POST", "telegram/test", {}),
+  proxy: () => call<ProxyView>("GET", "proxy"),
+  proxySet: (body: ProxyChange) => call<ProxyView>("POST", "proxy", body),
   applyUpdate: (confirm_major: boolean) => call<{ op: string }>("POST", "update/apply", { confirm_major }),
   updateServers: (restart_tunnels: boolean) => call<{ op: string }>("POST", "update/servers", { restart_tunnels }),
   newLink: () => call<{ token: string; valid_for: number }>("POST", "links"),

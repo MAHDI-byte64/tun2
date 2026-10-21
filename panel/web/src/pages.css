@@ -1466,3 +1466,27 @@ label.sp-opt { display: inline-flex; align-items: center; gap: var(--sp-2); min-
 @media (prefers-reduced-motion: reduce) {
   .bench-skel, .bench-bar i, .bench-spin, .bench-best { animation: none; }
 }
+
+/* ---- Settings > Proxy: scope tiles ---- */
+.px-scopes { display: grid; gap: var(--sp-3); width: 100%; max-width: 420px; }
+.px-scope {
+  display: flex; align-items: flex-start; gap: var(--sp-3); width: 100%; text-align: start;
+  padding: var(--sp-3) var(--sp-4); border-radius: 14px; cursor: pointer;
+  border: var(--hairline) solid var(--line-strong); background: var(--card-2);
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+}
+.px-scope:hover { border-color: var(--accent); background: var(--accent-soft); }
+.px-scope.on { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent) inset; }
+.px-scope-icon {
+  flex: none; display: grid; place-items: center; width: 36px; height: 36px; border-radius: 10px;
+  background: var(--card); border: var(--hairline) solid var(--line); color: var(--text-3);
+}
+.px-scope.on .px-scope-icon { color: var(--accent); border-color: var(--accent); }
+.px-scope-body { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.px-scope-body b { font-size: var(--fs-sm); }
+.px-scope-body span { font-size: var(--fs-xs); color: var(--text-3); line-height: 1.5; }
+.px-scope-check {
+  flex: none; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 999px;
+  color: var(--on-accent); background: transparent; margin-top: 2px;
+}
+.px-scope.on .px-scope-check { background: var(--accent); }
