@@ -864,6 +864,10 @@ pub fn create(hub: &Arc<Hub>, req: PairRequest) -> Result<String> {
     req.validate()?;
     if let Some(q) = &req.quota {
         crate::quota::check(q.limit_bytes, q.reset_day)?;
+        // An l3 tunnel counts no bytes: a limit on it would never be reached.
+        if req.transport == "l3" {
+            bail!("bad_input");
+        }
     }
     req.require_new_enough(hub)?;
     let id = hub.ops.begin("create", &req.name)?;

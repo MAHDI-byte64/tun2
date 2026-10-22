@@ -341,17 +341,23 @@ struct SideView {
 }
 
 /// Looks at every limit once: adds up the usage, resets what is due, warns, stops what is
-/// over its limit, and starts what is owed a start.
+/// over its limit, and starts what is owed a start. The API (a reset, a new limit) and the
+/// backup write the same rows at any time, so a row is read fresh before each decision and
+/// every write names what it changes (and what it assumes), never a whole row.
 async fn step(hub: &Arc<Hub>) -> Result<()> {
     let views = hub.snapshot()?;
     let t = now();
-    for mut r in rows(&hub.db)? {
+    let names: Vec<String> = rows(&hub.db)?.into_iter().map(|r| r.name).collect();
+    for name in names {
+        let Some(mut r) = row(&hub.db, &name)? else {
+            continue;
+        };
         let sides: Vec<SideView> = views
             .iter()
             .flat_map(|s| {
                 s.tunnels
                     .iter()
-                    .filter(|tv| tv.info.name == r.name)
+                    .filter(|tv| tv.info.name == name)
                     .map(move |tv| SideView {
                         online: s.online,
                         role: tv.info.role.clone(),
@@ -367,7 +373,6 @@ async fn step(hub: &Arc<Hub>) -> Result<()> {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let before = r.clone();
 
         // ---- the usage: the entry side's total, else the exit side's ----
         let counted = ["entry", "exit"].iter().find_map(|role| {
@@ -377,91 +382,116 @@ async fn step(hub: &Arc<Hub>) -> Result<()> {
         });
         if let Some(side) = counted {
             let (reading, id) = side.reading.clone().unwrap_or_default();
-            if r.last_seen < 0 || r.side != side.role {
+            let delta = if r.last_seen < 0 || r.side != side.role {
                 // The first reading, or another side's: a baseline, nothing to add yet.
+                0
+            } else if !id.is_empty() && !r.counter_id.is_empty() && id != r.counter_id {
+                // The counters started over under a new id (a new traffic file): the
+                // reading is what moved since, however it compares with the last one.
+                reading
             } else if reading >= r.last_seen {
-                r.used = r.used.saturating_add(reading - r.last_seen);
+                reading - r.last_seen
             } else if !id.is_empty() && id == r.counter_id {
                 // The daemon came back from a traffic file a few seconds stale: the same
                 // counters, a little behind. The bytes between are let go.
-                debug!(tunnel = %r.name, "the daemon's counter went back a little; keeping the usage");
+                debug!(tunnel = %name, "the daemon's counter went back a little; keeping the usage");
+                0
             } else {
-                // The counters started over (an older daemon restarted, or a new traffic
-                // file): the reading is what moved since.
-                r.used = r.used.saturating_add(reading);
-            }
-            r.last_seen = reading;
-            r.side = side.role.clone();
-            r.counter_id = id;
+                // An older daemon (no id) restarted from zero: the reading is what moved since.
+                reading
+            };
+            hub.db.conn().execute(
+                "UPDATE quotas SET used = used + ?2, last_seen = ?3, side = ?4, counter_id = ?5 WHERE name = ?1",
+                params![name, delta, reading, side.role, id],
+            )?;
+            r.used = r.used.saturating_add(delta);
         }
 
-        // ---- a monthly reset that is due ----
+        // ---- a monthly reset that is due (only if nothing reset it in the meantime) ----
         if next_reset(r.reset_day, r.last_reset).is_some_and(|at| t >= at) {
-            r.used = 0;
-            r.warned = false;
-            r.last_reset = t;
-            if r.stopped != 0 {
-                r.stopped = 0;
-                r.start_due = true;
+            let changed = hub.db.conn().execute(
+                "UPDATE quotas SET used = 0, warned = 0, last_reset = ?2, stopped = 0, \
+                 start_due = CASE WHEN stopped != 0 THEN 1 ELSE start_due END \
+                 WHERE name = ?1 AND last_reset = ?3",
+                params![name, t, r.last_reset],
+            )?;
+            if changed == 1 {
+                hub.history.event("quota_reset", &name, "monthly");
+                info!(tunnel = %name, "the traffic usage was reset for the month");
             }
-            hub.history.event("quota_reset", &r.name, "monthly");
-            info!(tunnel = %r.name, "the traffic usage was reset for the month");
         }
 
-        // ---- the warning ----
+        // ---- the warning, once per period ----
+        let Some(r) = row(&hub.db, &name)? else {
+            continue;
+        };
         if r.limit_bytes > 0 && !r.warned && r.used as f64 >= WARN_AT * r.limit_bytes as f64 {
-            r.warned = true;
-            hub.history.event(
-                "quota_near",
-                &r.name,
-                &format!("{} {}", r.used, r.limit_bytes),
-            );
-            hub.push_notice(Notice::QuotaNear {
-                name: r.name.clone(),
-                used: r.used as u64,
-                limit: r.limit_bytes as u64,
-            });
-        }
-        if r != before {
-            save(&hub.db, &r)?;
+            let changed = hub.db.conn().execute(
+                "UPDATE quotas SET warned = 1 WHERE name = ?1 AND warned = 0",
+                [&name],
+            )?;
+            if changed == 1 {
+                hub.history.event(
+                    "quota_near",
+                    &name,
+                    &format!("{} {}", r.used, r.limit_bytes),
+                );
+                hub.push_notice(Notice::QuotaNear {
+                    name: name.clone(),
+                    used: r.used as u64,
+                    limit: r.limit_bytes as u64,
+                });
+            }
         }
 
         // ---- over the limit: stopped, and kept stopped ----
         let running = sides.iter().any(|s| s.online && s.active == Some(true));
         if r.exhausted() && running {
-            match pair::control(hub, &r.name, "stop") {
-                Ok(op) => {
-                    let outcome = pair::wait(hub, &op).await;
-                    if outcome.is_ok() && r.stopped == 0 {
-                        r.stopped = t;
-                        r.start_due = false;
-                        save(&hub.db, &r)?;
-                        hub.history.event(
-                            "quota_stop",
-                            &r.name,
-                            &format!("{} {}", r.used, r.limit_bytes),
-                        );
-                        let _ = hub.db.audit(
-                            "quota",
-                            None,
-                            &format!(
-                                "stopped tunnel {}: its traffic limit is reached ({} of {} bytes)",
-                                r.name, r.used, r.limit_bytes
-                            ),
-                        );
-                        hub.push_notice(Notice::QuotaStopped {
-                            name: r.name.clone(),
-                            used: r.used as u64,
-                            limit: r.limit_bytes as u64,
-                        });
-                        info!(tunnel = %r.name, used = r.used, limit = r.limit_bytes, "a tunnel was stopped: its traffic limit is reached");
-                    } else if let Err(e) = outcome {
-                        warn!(tunnel = %r.name, error = %e, "a tunnel over its traffic limit could not be stopped; trying again");
+            match pair::control(hub, &name, "stop") {
+                Ok(op) => match pair::wait(hub, &op).await {
+                    Ok(()) => {
+                        // Marked only while it is still over its limit: a reset or a raise
+                        // in the meantime makes the stop a start that is owed instead.
+                        let marked = hub.db.conn().execute(
+                            "UPDATE quotas SET stopped = ?2, start_due = 0 \
+                             WHERE name = ?1 AND stopped = 0 AND limit_bytes > 0 AND used >= limit_bytes",
+                            params![name, t],
+                        )?;
+                        if marked == 1 {
+                            hub.history.event(
+                                "quota_stop",
+                                &name,
+                                &format!("{} {}", r.used, r.limit_bytes),
+                            );
+                            let _ = hub.db.audit(
+                                "quota",
+                                None,
+                                &format!(
+                                    "stopped tunnel {name}: its traffic limit is reached ({} of {} bytes)",
+                                    r.used, r.limit_bytes
+                                ),
+                            );
+                            hub.push_notice(Notice::QuotaStopped {
+                                name: name.clone(),
+                                used: r.used as u64,
+                                limit: r.limit_bytes as u64,
+                            });
+                            info!(tunnel = %name, used = r.used, limit = r.limit_bytes, "a tunnel was stopped: its traffic limit is reached");
+                        } else {
+                            let _ = hub.db.conn().execute(
+                                "UPDATE quotas SET start_due = 1 \
+                                 WHERE name = ?1 AND stopped = 0 AND NOT (limit_bytes > 0 AND used >= limit_bytes)",
+                                [&name],
+                            );
+                        }
                     }
-                }
+                    Err(e) => {
+                        warn!(tunnel = %name, error = %e, "a tunnel over its traffic limit could not be stopped; trying again");
+                    }
+                },
                 // Busy (an operation is running on it): next time.
                 Err(e) => {
-                    debug!(tunnel = %r.name, error = %format!("{e:#}"), "a tunnel over its traffic limit waits to be stopped")
+                    debug!(tunnel = %name, error = %format!("{e:#}"), "a tunnel over its traffic limit waits to be stopped")
                 }
             }
             continue;
@@ -469,26 +499,29 @@ async fn step(hub: &Arc<Hub>) -> Result<()> {
 
         // ---- a start that is owed, once the usage is under the limit again ----
         if r.start_due && !r.exhausted() {
-            let online: Vec<_> = sides.iter().filter(|s| s.online).collect();
-            if !online.is_empty() && online.iter().all(|s| s.active == Some(true)) {
-                r.start_due = false;
-                if r.limit_bytes > 0 {
-                    save(&hub.db, &r)?;
-                } else {
-                    forget(&hub.db, &r.name);
-                }
-            } else if online.iter().any(|s| s.active == Some(false)) {
-                match pair::control(hub, &r.name, "start") {
+            if !sides.is_empty() && sides.iter().all(|s| s.online && s.active == Some(true)) {
+                // Every side runs again (a side that is away is waited for: its service
+                // was disabled, and nothing but the panel brings it back).
+                hub.db.conn().execute(
+                    "UPDATE quotas SET start_due = 0 WHERE name = ?1 AND start_due = 1",
+                    [&name],
+                )?;
+                hub.db.conn().execute(
+                    "DELETE FROM quotas WHERE name = ?1 AND limit_bytes = 0 AND start_due = 0",
+                    [&name],
+                )?;
+            } else if sides.iter().any(|s| s.online && s.active == Some(false)) {
+                match pair::control(hub, &name, "start") {
                     Ok(op) => {
                         if let Err(e) = pair::wait(hub, &op).await {
-                            warn!(tunnel = %r.name, error = %e, "a tunnel could not be started again after its traffic limit; trying again");
+                            warn!(tunnel = %name, error = %e, "a tunnel could not be started again after its traffic limit; trying again");
                         } else {
-                            hub.history.event("quota_start", &r.name, "");
-                            info!(tunnel = %r.name, "a tunnel was started again after its traffic limit");
+                            hub.history.event("quota_start", &name, "");
+                            info!(tunnel = %name, "a tunnel was started again after its traffic limit");
                         }
                     }
                     Err(e) => {
-                        debug!(tunnel = %r.name, error = %format!("{e:#}"), "a tunnel waits to be started again")
+                        debug!(tunnel = %name, error = %format!("{e:#}"), "a tunnel waits to be started again")
                     }
                 }
             }
@@ -701,14 +734,30 @@ mod tests {
         );
         step(&hub).await.unwrap();
         assert_eq!(used(&hub), 650);
+        // Started over again, and already past the last reading by the time it is read: the
+        // id says so, and the whole reading counts.
+        hub.set_live_tunnels(
+            "a",
+            true,
+            vec![side("entry", Some(true), Some((2000, Some("three"))))],
+        );
+        step(&hub).await.unwrap();
+        assert_eq!(used(&hub), 2650);
+        hub.set_live_tunnels(
+            "a",
+            true,
+            vec![side("entry", Some(true), Some((2010, Some("three"))))],
+        );
+        step(&hub).await.unwrap();
+        assert_eq!(used(&hub), 2660);
 
         // An older daemon (no id) restarts: the same.
         hub.set_live_tunnels("a", true, vec![side("entry", Some(true), Some((7, None)))]);
         step(&hub).await.unwrap();
-        assert_eq!(used(&hub), 657);
+        assert_eq!(used(&hub), 2667);
         hub.set_live_tunnels("a", true, vec![side("entry", Some(true), Some((3, None)))]);
         step(&hub).await.unwrap();
-        assert_eq!(used(&hub), 660);
+        assert_eq!(used(&hub), 2670);
 
         // The entry side goes away: the exit side's counters are read, from a new baseline.
         hub.set_live_tunnels("a", false, vec![side("entry", Some(true), Some((3, None)))]);
@@ -718,14 +767,14 @@ mod tests {
             vec![side("exit", Some(true), Some((9000, Some("x"))))],
         );
         step(&hub).await.unwrap();
-        assert_eq!(used(&hub), 660);
+        assert_eq!(used(&hub), 2670);
         hub.set_live_tunnels(
             "b",
             true,
             vec![side("exit", Some(true), Some((9100, Some("x"))))],
         );
         step(&hub).await.unwrap();
-        assert_eq!(used(&hub), 760);
+        assert_eq!(used(&hub), 2770);
         // Nothing was stopped: well under the limit.
         assert_eq!(hub.ops.count("control"), 0);
     }
@@ -825,6 +874,66 @@ mod tests {
         step(&hub).await.unwrap();
         assert!(!row(&hub.db, "demo").unwrap().unwrap().start_due);
         assert_eq!(hub.ops.count("control"), 3);
+    }
+
+    /// A reset while one side is away: the start stays owed until that side is back and
+    /// runs again (its service was disabled by the stop).
+    #[tokio::test]
+    async fn a_start_stays_owed_until_every_side_is_back_and_running() {
+        let hub = hub();
+        write(&hub.db, "demo", MIN_LIMIT, 0).unwrap();
+        let mut r = row(&hub.db, "demo").unwrap().unwrap();
+        r.start_due = true;
+        save(&hub.db, &r).unwrap();
+        hub.set_live_tunnels("a", true, vec![side("entry", Some(true), None)]);
+        hub.set_live_tunnels("b", false, vec![side("exit", Some(false), None)]);
+        step(&hub).await.unwrap();
+        assert!(
+            row(&hub.db, "demo").unwrap().unwrap().start_due,
+            "b is away: still owed"
+        );
+        assert_eq!(
+            hub.ops.count("control"),
+            0,
+            "nothing to start on the side that runs"
+        );
+        hub.set_live_tunnels("b", true, vec![side("exit", Some(false), None)]);
+        step(&hub).await.unwrap();
+        assert_eq!(
+            hub.ops.count("control"),
+            1,
+            "b is back and stopped: started"
+        );
+        hub.set_live_tunnels("b", true, vec![side("exit", Some(true), None)]);
+        step(&hub).await.unwrap();
+        assert!(!row(&hub.db, "demo").unwrap().unwrap().start_due);
+    }
+
+    /// A reset that lands while the loop is stopping the tunnel is not undone by the stop.
+    #[tokio::test]
+    async fn a_reset_during_the_stop_is_kept_and_the_tunnel_is_owed_a_start() {
+        let hub = hub();
+        write(&hub.db, "demo", MIN_LIMIT, 0).unwrap();
+        let mut r = row(&hub.db, "demo").unwrap().unwrap();
+        r.used = MIN_LIMIT;
+        r.last_seen = MIN_LIMIT;
+        r.side = "entry".into();
+        save(&hub.db, &r).unwrap();
+        // The reset happens "during" the tick: the loop's stop fails here (no agent), so the
+        // guarded mark finds the row reset and owes a start instead of marking it stopped.
+        hub.set_live_tunnels(
+            "a",
+            true,
+            vec![side(
+                "entry",
+                Some(true),
+                Some((MIN_LIMIT as u64, Some("one"))),
+            )],
+        );
+        assert!(reset(&hub, "demo").unwrap());
+        step(&hub).await.unwrap();
+        let r = row(&hub.db, "demo").unwrap().unwrap();
+        assert_eq!((r.used, r.stopped), (0, 0), "the reset stands");
     }
 
     #[tokio::test]

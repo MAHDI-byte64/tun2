@@ -34,12 +34,13 @@ export function quotaOf(f: QuotaForm): { limit_bytes: number; reset_day: number 
   return { limit_bytes, reset_day: day };
 }
 
-/** A saved limit, as the form shows it. */
+/** A saved limit, as the form shows it: in TB when it is a round number of hundredths of one. */
 export function formOf(q: QuotaRow): QuotaForm {
-  const tb = q.limit_bytes >= TB && q.limit_bytes % (TB / 100) === 0;
+  const hundredths = (q.limit_bytes * 100) / TB;
+  const tb = q.limit_bytes >= TB && Math.abs(hundredths - Math.round(hundredths)) < 1e-6;
   const unit: Unit = tb ? "TB" : "GB";
-  const amount = q.limit_bytes / (tb ? TB : GB);
-  return { amount: String(Math.round(amount * 100) / 100), unit, reset: q.reset_day > 0 ? "monthly" : "manual", day: String(q.reset_day || 1) };
+  const amount = Number((q.limit_bytes / (tb ? TB : GB)).toPrecision(10));
+  return { amount: String(amount), unit, reset: q.reset_day > 0 ? "monthly" : "manual", day: String(q.reset_day || 1) };
 }
 
 /** "12.3 GB" style parts, in the units the rest of the panel uses. */
@@ -54,9 +55,14 @@ export function fmtBytes(n: number): { value: number; unit: string; decimals: nu
   return { value: v, unit: units[i], decimals: i === 0 || v >= 100 ? 0 : 1 };
 }
 
-/** Stopped by its limit, and still over it: it will not start until the usage is reset or the limit raised. */
+/** Over its limit: the panel refuses to start it until the usage is reset or the limit raised. */
+export function quotaExhausted(q?: QuotaRow | null): boolean {
+  return !!q && q.limit_bytes > 0 && q.used >= q.limit_bytes;
+}
+
+/** Stopped by its limit, and still over it. */
 export function quotaStopped(q?: QuotaRow | null): boolean {
-  return !!q && q.limit_bytes > 0 && q.stopped > 0 && q.used >= q.limit_bytes;
+  return quotaExhausted(q) && !!q && q.stopped > 0;
 }
 
 /** The usage against the limit: a bar and the numbers. */

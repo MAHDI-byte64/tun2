@@ -15,7 +15,7 @@ import type { BenchChoice } from "./Benchmark";
 import { useNetworks } from "./Networks";
 import { linkWithAddress } from "./GreChoice";
 import { AutoRestartBlock } from "./AutoRestart";
-import { QuotaBar, QuotaBlock, quotaStopped } from "./Quota";
+import { QuotaBar, QuotaBlock, quotaExhausted } from "./Quota";
 import { Wizard } from "./Wizard";
 import { TunnelEdit } from "./TunnelEdit";
 import { transportLabel } from "./transport";
@@ -282,8 +282,8 @@ function TunnelPage({
 }) {
   const { t, num, toast } = useApp();
   const [tab, setTab] = useState<TunnelTab>("overview");
-  // Stopped by its traffic limit: it does not start until the usage is reset or the limit raised.
-  const limited = quotaStopped(quota);
+  // Over its traffic limit: it does not start until the usage is reset or the limit raised.
+  const limited = quotaExhausted(quota);
   const resetUsage = async () => {
     try {
       await api.resetQuota(tunnel.name);
@@ -302,7 +302,7 @@ function TunnelPage({
   // An l3 (GRE) tunnel's bytes are not counted; an entry on an older version is counted by the panel alone.
   const metered = tunnel.transport !== "l3" && !tunnel.transport.startsWith("l3");
   const entryVersion = tunnel.entry?.server.version ?? "";
-  const oldAgent = !!entryVersion && !status?.counter_id;
+  const oldAgent = !!entryVersion && !!status && !status.counter_id;
   const mode = tunnel.entry?.tunnel.mode ?? tunnel.exit?.tunnel.mode ?? "";
   // What the tunnel runs over now, as the benchmark names it: its core transport (tcp is measured with mux), its
   // direction, and whether it listens on a private network link.
@@ -343,7 +343,7 @@ function TunnelPage({
           <div className="td-title">
             <h2 className="td-name mono">{tunnel.name}</h2>
             <div className="td-tags">
-              <StateBadge state={tunnel.state} label={limited ? t("st.limit") : undefined} />
+              <StateBadge state={tunnel.state} label={tunnel.state === "off" && limited ? t("st.limit") : undefined} />
               <span className={`tag ${tunnel.via ? "via" : ""}`} dir="ltr" title={tunnel.via ? t("td.autoNow", { via: tunnel.via.replace(/tcpmux/g, "tcp") }) : undefined}>
                 {transportLabel(tunnel.transport, tunnel.via)}
               </span>
@@ -454,7 +454,7 @@ function TunnelPage({
           </button>
         </div>
       )}
-      {limited && quota && (
+      {tunnel.state === "off" && limited && quota && (
         <div className="diagnosis calm" role="status">
           <div className="diag-icon">
             <Icon name="pause" size={18} />
@@ -843,7 +843,7 @@ export function TunnelsPage({
                   const r = rateParts(x.rate);
                   const mode = x.entry?.tunnel.mode ?? x.exit?.tunnel.mode ?? "";
                   const q = quotas.get(x.name);
-                  const limited = quotaStopped(q);
+                  const limited = x.state === "off" && quotaExhausted(q);
                   return (
                     <tr key={x.name} className={`clickable st-${x.state}`} onClick={() => setOpen(x.name)}>
                       <td>

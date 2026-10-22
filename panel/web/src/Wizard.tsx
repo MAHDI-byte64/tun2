@@ -258,7 +258,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     helper: helperOf(helperS, transport),
     ...l3Of(l3S, transport),
     forwards: parsed.forwards,
-    quota: qtWanted ?? undefined,
+    quota: isL3 ? undefined : (qtWanted ?? undefined),
   });
 
   const problem = (s: number): string => {
@@ -746,7 +746,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                     })}
                   </div>
                 )}
-                {!opId && (
+                {!opId && !isL3 && (
                   <div className="field wz-quota">
                     <label className="check">
                       <input type="checkbox" id="wz-quota" checked={qtOn} onChange={(e) => setQtOn(e.target.checked)} /> {t("wz.quota")}
@@ -805,7 +805,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
           </button>
         )}
         {!opId && step === 4 && (
-          <button className="btn btn-primary" type="button" disabled={checking || conflicts.length > 0 || (qtOn && !qtWanted)} onClick={() => void build()}>
+          <button className="btn btn-primary" type="button" disabled={checking || conflicts.length > 0 || (qtOn && !qtWanted && !isL3)} onClick={() => void build()}>
             <span className="shine" />
             {t("wz.make")}
           </button>

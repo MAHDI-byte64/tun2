@@ -55,6 +55,8 @@ export function ProxySection({ servers }: { servers: ServerInfo[] }) {
         panel_internet: form.panel_internet,
       };
       if (pwTouched) body.password = form.password;
+      // Sign-in cleared by emptying the username: the kept password goes too.
+      if (!body.username && !pwTouched && view.has_password) body.remove_password = true;
       adopt(await api.proxySet(body));
       toast(t("px.saved"), "ok");
     } catch (e) {

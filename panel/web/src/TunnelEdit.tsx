@@ -293,7 +293,15 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     try {
       setOpId((await api.editTunnel(request())).op);
     } catch (e) {
-      setError(e instanceof ApiError && e.code === "busy" ? t("wz.busy") : e instanceof ApiError ? opError(t, e.code, new Map(servers.map((x) => [x.id, x.name]))) : String(e));
+      setError(
+        e instanceof ApiError && e.code === "busy"
+          ? t("wz.busy")
+          : e instanceof ApiError && e.code === "quota_exceeded"
+            ? t("tun.quotaExceeded")
+            : e instanceof ApiError
+              ? opError(t, e.code, new Map(servers.map((x) => [x.id, x.name])))
+              : String(e),
+      );
     }
   };
 

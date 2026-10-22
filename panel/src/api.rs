@@ -1427,6 +1427,10 @@ async fn tunnel_edit(
         body.name,
         if body.rotate { " (new token)" } else { "" }
     );
+    // An edit runs the tunnel again: not while it is over its traffic limit.
+    if crate::quota::exhausted(&state.db, &body.name) {
+        return error(StatusCode::CONFLICT, "quota_exceeded");
+    }
     match pair::edit(&state.hub, body) {
         Ok(op) => {
             audit(&state, &format!("session {}", me.id), &ip_of(&peer), &what);

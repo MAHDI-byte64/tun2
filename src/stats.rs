@@ -533,43 +533,39 @@ impl Stats {
         tracing::debug!(path = %path.display(), bytes_up = file.bytes_up, bytes_down = file.bytes_down, "byte counters restored");
     }
 
-    /// This side's byte totals now: the forwards and the carry on the entry side, the
-    /// targets on the exit side.
-    fn bytes(&self) -> (u64, u64) {
-        if self.role == "exit" {
-            return self.targets.traffic.get();
-        }
-        let (mut up, mut down) = self.carry.get();
-        for f in &self.forwards {
-            let (u, d) = f.traffic.get();
-            up += u;
-            down += d;
-        }
-        (up, down)
-    }
-
-    /// What goes into the traffic file.
+    /// What goes into the traffic file. Each counter is read once, and the totals are made
+    /// from those same readings, so a file written while traffic flows always adds up.
     fn traffic_file(&self) -> TrafficFile {
-        let (bytes_up, bytes_down) = self.bytes();
+        let forwards: Vec<ForwardTraffic> = self
+            .forwards
+            .iter()
+            .map(|f| {
+                let (bytes_up, bytes_down) = f.traffic.get();
+                ForwardTraffic {
+                    listen: f.listen.clone(),
+                    target: f.target.clone(),
+                    protocol: f.protocol.to_string(),
+                    bytes_up,
+                    bytes_down,
+                }
+            })
+            .collect();
+        let (bytes_up, bytes_down) = if self.role == "exit" {
+            self.targets.traffic.get()
+        } else {
+            let (mut up, mut down) = self.carry.get();
+            for f in &forwards {
+                up += f.bytes_up;
+                down += f.bytes_down;
+            }
+            (up, down)
+        };
         TrafficFile {
             version: TRAFFIC_FILE_VERSION,
             counter_id: lock(&self.counter_id).clone(),
             bytes_up,
             bytes_down,
-            forwards: self
-                .forwards
-                .iter()
-                .map(|f| {
-                    let (bytes_up, bytes_down) = f.traffic.get();
-                    ForwardTraffic {
-                        listen: f.listen.clone(),
-                        target: f.target.clone(),
-                        protocol: f.protocol.to_string(),
-                        bytes_up,
-                        bytes_down,
-                    }
-                })
-                .collect(),
+            forwards,
         }
     }
 
@@ -719,43 +715,61 @@ fn write_traffic_file(path: &Path, file: &TrafficFile) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// One writer at a time to the traffic file: the periodic write runs on a blocking thread,
+/// and the write at shutdown waits for it before it writes the final counters.
+type WriteGate = Arc<Mutex<()>>;
+
 /// Writes the counters once more when the task that keeps the traffic file is dropped: at
 /// shutdown, when the runtime drops its tasks.
 struct FlushOnDrop {
     stats: Arc<Stats>,
     path: PathBuf,
+    gate: WriteGate,
 }
 
 impl Drop for FlushOnDrop {
     fn drop(&mut self) {
+        let _held = lock(&self.gate);
         let _ = write_traffic_file(&self.path, &self.stats.traffic_file());
     }
 }
 
 /// Keeps the traffic file at `path` up to date: every few seconds while the byte counters
-/// move, and once more at shutdown. It never returns (a tunnel's tasks end the tunnel when
-/// they do): a write that fails is logged, not more than once a minute, and tried again.
+/// move (written off the runtime's threads, so the tunnel never waits on the disk), and
+/// once more at shutdown. It never returns (a tunnel's tasks end the tunnel when they do):
+/// a write that fails is logged, not more than once a minute, and tried again.
 pub async fn persist(stats: Arc<Stats>, path: PathBuf) -> anyhow::Result<()> {
+    let gate: WriteGate = Arc::new(Mutex::new(()));
     let _flush = FlushOnDrop {
         stats: stats.clone(),
         path: path.clone(),
+        gate: gate.clone(),
     };
     let mut written = None;
     let mut last_warning: Option<Instant> = None;
     loop {
         tokio::time::sleep(SAVE_EVERY).await;
-        let now = stats.bytes();
+        let file = stats.traffic_file();
+        let now = (file.bytes_up, file.bytes_down);
         if written == Some(now) {
             continue;
         }
-        match write_traffic_file(&path, &stats.traffic_file()) {
-            Ok(()) => written = Some(now),
-            Err(e) => {
+        let (p, g) = (path.clone(), gate.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            let _held = lock(&g);
+            write_traffic_file(&p, &file)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => written = Some(now),
+            Ok(Err(e)) => {
                 if last_warning.map_or(true, |t| t.elapsed() >= Duration::from_secs(60)) {
                     tracing::warn!(path = %path.display(), error = %e, "the traffic file could not be written; the byte counters will not survive a restart");
                     last_warning = Some(Instant::now());
                 }
             }
+            // The write was cancelled with the runtime: the final write is the guard's.
+            Err(_) => {}
         }
     }
 }
@@ -1009,10 +1023,41 @@ mod tests {
         token = "0123456789abcdef0123"
     "#;
 
+    /// A fresh place for a test's traffic file (a leftover from an earlier run is removed).
     fn traffic_path(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kariz-traffic-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("main.traffic")
+    }
+
+    /// A file written while the counters move still adds up: the forwards and the totals
+    /// come from the same readings.
+    #[test]
+    fn a_traffic_file_written_under_load_adds_up() {
+        let stats = Stats::new(&Config::parse(ENTRY).unwrap());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let counting = {
+            let (stats, stop) = (stats.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Relaxed) {
+                    stats.forwards[0].traffic.add_up(3);
+                    stats.forwards[1].traffic.add_down(5);
+                }
+            })
+        };
+        for _ in 0..2000 {
+            let file = stats.traffic_file();
+            assert!(file.adds_up(), "{file:?}");
+            let (mut up, mut down) = (0, 0);
+            for f in &file.forwards {
+                up += f.bytes_up;
+                down += f.bytes_down;
+            }
+            assert_eq!((up, down), (file.bytes_up, file.bytes_down));
+        }
+        stop.store(true, Relaxed);
+        counting.join().unwrap();
     }
 
     fn totals(stats: &Stats) -> (u64, u64) {
