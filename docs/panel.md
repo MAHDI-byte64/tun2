@@ -239,7 +239,8 @@ until the usage is reset or the limit raised. Good to know:
 
 - **What is counted:** upload plus download, as the entry side's daemon counts them (`status`'s
   `bytes_up` + `bytes_down`), read every few seconds; the exit side's when the entry is away. An
-  `l3` (GRE) tunnel counts nothing and cannot have a limit.
+  `l3` (GRE) tunnel's packets are counted from 2.10.0 (the bytes inside the GRE frames, on both
+  sides); on an older entry it counts nothing and cannot have a limit.
 - **It survives restarts.** The usage is kept in the panel's database. Since 2.9.2 the daemons
   keep their own counters across restarts too (the traffic file next to the config,
   `[control] traffic_file`; see [Status](status.md)), so a restart of the tunnel, of its agent or
@@ -251,13 +252,31 @@ until the usage is reset or the limit raised. Good to know:
   limit), or **monthly** on a day you pick (1 to 28, at 00:00 UTC). Either way a tunnel the limit
   stopped is started again by the panel; if one of its servers is away or the tunnel is busy at
   that moment, the panel keeps trying until every side runs again.
-- **Notices:** at 80% of the limit and when the tunnel is stopped, an entry in *Events* and a
-  Telegram message (when the bot is set up); the stop is in the audit log too. The usage shows
-  in the tunnels list, on the tunnel's overview and on its *Traffic limit* tab.
-- API: `GET /api/quotas`, `POST /api/quotas` (`{name, limit_bytes, reset_day}`),
-  `POST /api/quotas/delete`, `POST /api/quotas/reset`, and `quota: {limit_bytes, reset_day}` in
-  `POST /api/tunnels`. A `start` or `restart` of a tunnel over its limit answers `409
-  quota_exceeded`.
+- **An end (2.10.0):** the limit can run for a number of days or until a date, with or
+  without a volume (a limit of time alone is fine). At the end the panel stops the tunnel the
+  same way and keeps it stopped until the limit is **extended** (*Extend by N days* on the
+  tab: from the end, or from now when it is already past), and a notice goes out three days
+  before. The days left show beside the usage, in the list too.
+- **The renter's page (2.10.0):** *Make a link* on the tab gives a page with a link of its
+  own, outside the panel's secret path (`https://panel/s/TOKEN`), for whoever rents the port:
+  the usage against the limit, the days left, whether the tunnel runs (or is stopped by the
+  volume or the end), its rate over the last day and week, and a **Restart** button (once in
+  five minutes; refused while the limit keeps it stopped; written to the audit log and
+  *Events*). It shows no server name, port or address, refreshes itself every half minute
+  and runs no script; `TOKEN/data` is the same as JSON. *New link* retires the old one,
+  *Revoke* takes the page down; so does removing the limit or the tunnel. An unknown link
+  answers 404 like any unknown address, and each visitor's address may ask ten times a minute.
+- **Notices:** at 80% of the limit, three days before its end, and when the tunnel is stopped
+  (by the volume or the end), an entry in *Events* and a Telegram message (when the bot is set
+  up); the stop is in the audit log too. The usage shows in the tunnels list, on the tunnel's
+  overview and on its *Traffic limit* tab.
+- API: `GET /api/quotas` (rows carry `expires_at`, `expired` and `share`), `POST /api/quotas`
+  (`{name, limit_bytes, reset_day, days?, expires_at?}`; `limit_bytes` 0 with an end is a limit
+  of time alone), `POST /api/quotas/delete`, `POST /api/quotas/reset`,
+  `POST /api/quotas/extend {name, days}`, `POST /api/quotas/share {name, title}` and
+  `/api/quotas/share/delete {name}`, and `quota: {limit_bytes, reset_day, days?}` in
+  `POST /api/tunnels`. A `start` or `restart` of a tunnel over its limit or past its end answers
+  `409 quota_exceeded`.
 
 ## Make a tunnel
 
@@ -288,9 +307,27 @@ automatically; or a real one from Let's Encrypt
 ([details](transports.md#wss-with-a-real-certificate)).
 
 Open a tunnel (click its row) to see both sides, its charts, and to **edit** it (the same
-wizard, filled in; both sides change together and are restarted, and if they do not connect
-again the old settings are put back), **start / stop / restart** it, give it **a new token**, run
-a **speed test**, or **delete** it (both sides).
+wizard, filled in; both sides change together, and if they do not connect again the old
+settings are put back), **start / stop / restart** it, give it **a new token**, run a **speed
+test**, or **delete** it (both sides). An edit that changes only the forwarded ports (or the
+per-address and UDP-flow limits) is applied to the running entry without a restart, so its
+open connections stay up and the exit is not touched (the operation shows *Applying the port
+changes to the running entry*); a side whose settings did not change is left alone. This
+needs 2.10.0 or newer on the entry's server: an older one is written and restarted, as every
+other change restarts both sides ([`kariz reload`](configuration.md#reloading-the-forward-rules)).
+
+**A copy of every tunnel** (2.10.0 or newer). Each create or edit leaves a copy of what the
+wizard sent in the panel's database (never the token, never the limit); tunnels made before
+that are read back from their two servers while both are online and kept the same way (one
+with settings the wizard cannot express, made by hand, is left out). The copy is what the
+*Missing from their servers* card on the *Tunnels* page lists when no server has the tunnel
+any more (a reinstalled server, a file removed by hand): **Make again** builds it from the
+copy with a new token, on the servers it was on or on two others you pick (a tunnel over a
+private network, or one whose addresses were tied to its old servers, may need an edit
+afterwards); **Forget** drops the copy. Deleting a tunnel drops its copy too. The copies are
+in backups. API: `GET /api/tunnels/specs`, `POST /api/tunnels/recreate {name, entry?, exit?}`
+(an operation like a create: `name_taken` while a server still has it), `POST
+/api/tunnels/specs/delete {name}`.
 
 The panel never keeps a tunnel's token: it makes one, sends it to the two servers over the link
 and forgets it. So *a new token* cannot be undone if it fails half way; run it again.
@@ -347,6 +384,9 @@ hours. Both servers need this release (`POST /api/bench`, `GET /api/bench?id=`,
   have **the same name**, which is how the panel names the two sides. Each tunnel's page
   has charts of its throughput and round trip over 1 hour, 24 hours, 7 days and 30 days. The
   last hour is kept in memory; five-minute averages are stored in the database for 30 days.
+  Its *Ports* table shows each forward rule with the entry daemon's live counters: bytes up
+  and down, TCP connections open and total, UDP flows open and total, and failed opens
+  (with how many the per-address limit refused), plus a total row.
 - **Networks:** private GRE networks between your servers, with addresses that are never
   repeated ([networks.md](networks.md)).
 - **Logs:** pick a tunnel and read the log of **both sides interleaved by time**, filtered by
@@ -361,6 +401,19 @@ hours. Both servers need this release (`POST /api/bench`, `GET /api/bench?id=`,
 Persian and English, Night and Dawn, and a low-power mode (also on when your browser asks for
 less motion) are in the top bar and in *Settings*. `Ctrl+K` opens commands.
 
+## Terminal
+
+The Logs page starts (2.10.0) with a **terminal**: pick a server and open a shell on it in the
+browser, as the user the agent runs as (root, as installed), carried over the agent's own link
+to the panel (no port is opened on the server). It is **off on every server** until that server
+allows it: `terminal = true` in `/etc/kariz-panel/agent.toml`, then `systemctl restart
+kariz-agent`; for the panel's own server `terminal = true` in `panel.toml` and a restart of
+`kariz-panel`. A server that does not allow it answers `terminal_off`, and an agent older
+than 2.10.0 has no terminal. Every open and close goes to the audit log (who, which server,
+how long), one terminal per browser session per server, and a terminal quiet for fifteen
+minutes is closed. It is a root shell: switch it on only where you want the panel's users to
+have one, and keep the panel's password and login links as safe as the servers themselves.
+
 ## Security
 
 - Everything is over TLS, under a secret path; plain HTTP gets nothing.
@@ -373,10 +426,12 @@ less motion) are in the top bar and in *Settings*. `Ctrl+K` opens commands.
   mux). A token alone is not enough: each agent also proves a key of its own, made when it
   joined. **Agents answer a fixed list of requests**: who are you, keep this identity, health,
   tunnels, check / write / read / delete a tunnel, start / stop / restart it, listening ports,
-  the log, the speed test. **There is no remote shell:** a request carries data (a tunnel's
-  settings as typed fields, which the agent turns into the file itself, refusing anything with a
-  control character in it), never a command or a path, and the programs an agent runs
-  (`systemctl`, `journalctl`, `kariz speedtest`) get fixed arguments and a checked name.
+  the log, the speed test. **There is no remote shell unless the server allows one:** a
+  request carries data (a tunnel's settings as typed fields, which the agent turns into the
+  file itself, refusing anything with a control character in it), never a command or a path,
+  and the programs an agent runs (`systemctl`, `journalctl`, `kariz speedtest`) get fixed
+  arguments and a checked name. The [terminal](#terminal) is the one exception, and only on a
+  server whose own settings say `terminal = true`; it is audited.
 - A tunnel's token is made by the panel, sent once to its two servers inside the encrypted
   link, and written there with mode 0600. The panel does not keep it and never shows it.
 - The database (`/var/lib/kariz-panel`, root only) holds the agents' keys, because the
@@ -397,15 +452,54 @@ kariz-manager agent status | logs | remove
 The menu has the same (items 3 to 10). Without the manager: `kariz-panel init`, `serve`,
 `login-link`, `reset-password`, `agent --join CODE` (see `kariz-panel --help`).
 
+## Metrics
+
+*Settings*, *Metrics (Prometheus)* switches on `GET /SECRET/metrics` (2.10.0 or newer): the
+servers' load, every tunnel side's state, bytes and connections, every forwarded port's
+counters and the traffic limits, as the panel last saw them, in Prometheus' text format. Off
+(the default) the address answers 404 like any unknown one; on, it answers a request that
+carries the token the section shows (`Authorization: Bearer …`) or a signed-in browser, and
+401 to anything else. *New token* replaces the token at once. The setting is not in backups.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `kariz_panel_info` | `version` | always 1 |
+| `kariz_server_online` | `server` | 1 while its agent is connected |
+| `kariz_server_cpu_percent`, `kariz_server_load1`, `kariz_server_uptime_seconds`, `kariz_server_tunnels` | `server` | from the agent's health |
+| `kariz_server_memory_bytes` | `server`, `kind` (`total`, `used`) | |
+| `kariz_server_network_bytes_per_second` | `server`, `direction` (`rx`, `tx`) | |
+| `kariz_tunnel_active`, `kariz_tunnel_connected`, `kariz_tunnel_rtt_seconds`, `kariz_tunnel_sessions`, `kariz_tunnel_uptime_seconds`, `kariz_tunnel_rate_mbps` | `tunnel`, `server`, `role` | one series per side, from its `kariz status` |
+| `kariz_tunnel_bytes_total` | `tunnel`, `server`, `role`, `direction` (`up`, `down`) | the side's totals (counters) |
+| `kariz_tunnel_connections` | `tunnel`, `server`, `role`, `kind` (`tcp`, `udp`) | open on that side |
+| `kariz_forward_bytes_total` | `tunnel`, `server`, `listen`, `target`, `protocol`, `direction` | per forwarded port, from the entry |
+| `kariz_forward_connections`, `kariz_forward_connections_total` | `tunnel`, `server`, `listen`, `protocol`, `kind` | open, and since the counters began |
+| `kariz_forward_open_failures_total`, `kariz_forward_refused_total` | `tunnel`, `server`, `listen`, `protocol` | opens to the target that failed; refused by the per-address limit |
+| `kariz_quota_used_bytes`, `kariz_quota_limit_bytes`, `kariz_quota_stopped` | `tunnel` | the traffic limits |
+
+A scrape config (the section writes one with your address and token):
+
+```yaml
+scrape_configs:
+  - job_name: kariz
+    scheme: https
+    metrics_path: /SECRET/metrics
+    bearer_token: TOKEN
+    tls_config:
+      insecure_skip_verify: true   # the panel's self-signed certificate; pin or trust it instead if you can
+    static_configs:
+      - targets: ["panel.example.com:8443"]
+```
+
 ## Backup and restore
 
 *Settings*, *Download a backup* gives one file, locked with a passphrase you choose (10
 characters or more; Argon2id and ChaCha20-Poly1305). It holds the servers this panel knows,
 with the keys they prove themselves with, and the token they dial with; where the panel dials
-the servers it connects to (and whether through its proxy); and the tunnels' traffic limits
-with their usage. It does **not** hold tunnels (they live on the servers, in their own files,
-and the panel reads them from there), the proxy's own settings, sessions or login links. Keep
-the passphrase: without it the file cannot be opened.
+the servers it connects to (and whether through its proxy); the tunnels' traffic limits
+with their usage; and the panel's copy of every tunnel's settings (2.10.0 or newer, see
+below). It does **not** hold the tunnels themselves (they live on the servers, in their own
+files, and the panel reads them from there), their tokens, the proxy's own settings, sessions
+or login links. Keep the passphrase: without it the file cannot be opened.
 
 To move to a new server: install the panel there, sign in, *Restore a backup*, then
 `systemctl restart kariz-panel` so the agents can connect with the restored token. They dial
@@ -433,15 +527,21 @@ tool (certbot, acme.sh) reload as above after each renewal.
 
 In a container there is no systemd to start the tunnels. Set `services = "process"` in
 `panel.toml` (or `agent.toml`): the panel or the agent then runs each tunnel as a child process
-(`kariz run`), which stops when it stops. Tunnels then do not come back after a reboot by
-themselves; that is the price of having no service manager.
+(`kariz run`), which stops when it stops. Since 2.10.0 it also looks after them, the way
+systemd would: a tunnel that was started (the wizard, *Start*; *Stop* takes it back) is marked
+in `NAME.enabled` beside its config and started again when the panel or the agent starts, so an
+update or a container restart brings the tunnels back; a daemon that exits is started again
+(2 s after the first exit, then up to 30 s between tries while it keeps exiting); and each
+daemon's output goes to `NAME.log` beside its config (owner only, started over past 4 MB),
+which the *Logs* page shows. Something still has to start the panel or the agent itself after a
+reboot (the container's own restart policy).
 
 ## Files
 
 | Path | What |
 |---|---|
-| `/etc/kariz-panel/panel.toml` | the panel's settings: `listen`, `path`, `agent_listen`, `data_dir`, `kariz_dir`, `services`, `cert_file`, `key_file`, `release_api`, `release_key` |
-| `/etc/kariz-panel/agent.toml` | an agent's identity (id and key), the panel's address, `kariz_dir`, `services`, `release_key` |
+| `/etc/kariz-panel/panel.toml` | the panel's settings: `listen`, `path`, `agent_listen`, `data_dir`, `kariz_dir`, `services`, `terminal`, `cert_file`, `key_file`, `release_api`, `release_key` |
+| `/etc/kariz-panel/agent.toml` | an agent's identity (id and key), the panel's address, `kariz_dir`, `services`, `release_key`, `terminal` |
 | `/var/lib/kariz-panel/updates/` | the releases the panel downloaded, and the result of the last update |
 | `/var/lib/kariz-panel/` | the database, the certificate and its key |
 | `kariz-panel.service`, `kariz-agent.service` | the systemd units |
@@ -522,7 +622,8 @@ checks the signature too).
 - **A new tunnel did not connect:** the wizard shows the reason each side reported (for
   example *connection refused*: the accepting server's port is not reachable from the other, a
   firewall in between; or a timeout). Nothing is left behind; fix the cause and try again.
-- **Logs are empty:** they come from `journalctl -u kariz@NAME`, so they need systemd; with
-  `services = "process"` the daemons' output is not kept.
+- **Logs are empty:** they come from `journalctl -u kariz@NAME` under systemd, and from
+  `NAME.log` beside the config with `services = "process"` (2.10.0 or newer; older agents in
+  process mode kept nothing).
 - **Locked out:** wait 15 minutes, or make a link on the server with
   `kariz-manager panel link`.

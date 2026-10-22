@@ -19,7 +19,9 @@ export default async function globalSetup() {
     .readFileSync(cfg, "utf8")
     .replace(/^kariz_dir = .*$/m, `kariz_dir = ${JSON.stringify(kariz)}`)
     .replace(/^services = .*$/m, 'services = "process"');
-  fs.writeFileSync(cfg, text);
+  // The panel's own server allows the terminal (the terminal test opens one on it).
+  const withTerminal = /^terminal = /m.test(text) ? text.replace(/^terminal = .*$/m, "terminal = true") : `${text}\nterminal = true\n`;
+  fs.writeFileSync(cfg, withTerminal);
   const secret = /^path = "(.*)"$/m.exec(text)?.[1];
   if (!secret) throw new Error("no secret path in the settings");
   const log = fs.openSync(path.join(root, "panel.log"), "a");

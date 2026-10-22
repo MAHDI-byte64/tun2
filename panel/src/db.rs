@@ -182,6 +182,29 @@ const MIGRATIONS: &[&str] = &[
          start_due INTEGER NOT NULL DEFAULT 0,  -- the panel still has to start it again
          since INTEGER NOT NULL
      );",
+    // 20: a copy of every tunnel's settings (`crate::specs`): what makes a tunnel that
+    // vanished from its servers one click to make again, and what backups carry.
+    "CREATE TABLE tunnel_specs (
+         name TEXT PRIMARY KEY,       -- the tunnel
+         request TEXT NOT NULL,       -- the pair request as JSON: no token, no limit
+         entry TEXT NOT NULL,         -- the servers it was made on (ids)
+         exit TEXT NOT NULL,
+         updated INTEGER NOT NULL,
+         source TEXT NOT NULL         -- 'panel': a create or an edit; 'server': read back from the servers
+     );",
+    // 21: a traffic limit can have an end (`crate::quota`), and a tunnel a page for its
+    // renter (`crate::share`).
+    "ALTER TABLE quotas ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0;     -- 0: no end
+     ALTER TABLE quotas ADD COLUMN expiry_warned INTEGER NOT NULL DEFAULT 0;  -- the three-days notice went out
+     ALTER TABLE quotas ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;        -- when the end stopped it (0: not)
+     CREATE TABLE shares (
+         name TEXT PRIMARY KEY,                 -- the tunnel
+         token TEXT NOT NULL UNIQUE,            -- the link's secret
+         title TEXT NOT NULL DEFAULT '',        -- what the page calls the tunnel
+         created INTEGER NOT NULL,
+         views INTEGER NOT NULL DEFAULT 0,
+         last_restart INTEGER NOT NULL DEFAULT 0 -- the last restart asked from the page
+     );",
 ];
 
 /// A shared handle to the database. SQLite calls are short, so one connection behind a

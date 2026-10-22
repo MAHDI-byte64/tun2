@@ -18,6 +18,7 @@ async fn start(limits: Limits) -> (std::net::SocketAddr, tempfile::TempDir) {
         agent_listen: None,
         kariz_dir: dir.path().join("kariz"),
         services: Default::default(),
+        terminal: false,
         cert_file: None,
         key_file: None,
         release_api: None,

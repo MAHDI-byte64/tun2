@@ -59,4 +59,8 @@ signature does not verify.
 - The systemd unit runs Kariz with `NoNewPrivileges` and only the capabilities it needs
   (binding ports below 1024).
 - Keep the config file readable by root only (`chmod 600`), since it holds the token.
+- The panel's web terminal (2.10.0) is a root shell on a server, opened from the browser. It
+  is off on every server until `terminal = true` is set in that server's `agent.toml`
+  (`panel.toml` for the panel's own server): switch it on only where the panel's users may
+  have a shell, and remember that the panel's password and login links then open it.
 - Report security problems privately to the maintainer rather than in a public issue.

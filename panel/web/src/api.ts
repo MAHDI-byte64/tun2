@@ -48,7 +48,20 @@ export interface TunnelStatus {
   totals: { bytes_up: number; bytes_down: number; tcp_open: number; udp_flows: number };
   /** Marks one life of the byte counters (2.9.2): absent from older daemons, whose counters reset at every restart. */
   counter_id?: string | null;
-  forwards?: { listen: string; open_failures: number; refused_per_ip?: number }[];
+  /** The entry's forward rules as they run: the counters of each (the bytes and the connections that went through it). */
+  forwards?: {
+    listen: string;
+    target?: string;
+    protocol?: string;
+    tcp_open?: number;
+    tcp_total?: number;
+    udp_flows?: number;
+    udp_total?: number;
+    bytes_up?: number;
+    bytes_down?: number;
+    open_failures: number;
+    refused_per_ip?: number;
+  }[];
   probe?: ProbeStatus | null;
 }
 
@@ -303,12 +316,22 @@ export interface QuotaRow {
   since: number;
   next_reset: number | null;
   pct: number;
+  /** When the limit ends (unix seconds; 0: it does not): the tunnel is stopped then, until it is extended. */
+  expires_at: number;
+  /** When the end stopped the tunnel (0: it did not). */
+  expired: number;
+  /** The renter's page, when one was made. */
+  share: { token: string; title: string; created: number; views: number } | null;
 }
 
 export interface QuotaBody {
   name: string;
+  /** 0: a limit of time alone. */
   limit_bytes: number;
   reset_day: number;
+  /** An end this many days from now, or at a time. */
+  days?: number;
+  expires_at?: number;
 }
 
 export interface ScheduleBody {
@@ -383,7 +406,7 @@ export interface MuxSpec {
 
 export interface PairRequest {
   /** A traffic limit for the new tunnel (the wizard): bytes, and the day of the month the usage resets on (0: by hand). */
-  quota?: { limit_bytes: number; reset_day: number };
+  quota?: { limit_bytes: number; reset_day: number; days?: number };
   name: string;
   entry: string;
   exit: string;
@@ -581,6 +604,17 @@ export interface Op {
   offline?: string[];
 }
 
+/** The panel's copy of a tunnel's settings (kept at each create or edit, or read back from the servers). */
+export interface TunnelCopy {
+  name: string;
+  entry: string;
+  exit: string;
+  updated: number;
+  source: "panel" | "server";
+  /** Some server still lists the tunnel. */
+  present: boolean;
+}
+
 export interface EventRow {
   id: number;
   at: number;
@@ -671,6 +705,11 @@ export interface ProxyView {
   panel_internet: boolean;
 }
 
+export interface MetricsView {
+  enabled: boolean;
+  token: string;
+}
+
 export type ProxyChange = Partial<Pick<ProxyView, "enabled" | "addr" | "username" | "panel_internet">> & {
   password?: string;
   remove_password?: boolean;
@@ -689,6 +728,11 @@ export class ApiError extends Error {
 }
 
 let csrf = "";
+
+/** The session's CSRF value, for a request made outside `call` (the terminal's WebSocket). */
+export function csrfToken(): string {
+  return csrf;
+}
 
 export function setCsrf(value: string | undefined) {
   csrf = value ?? "";
@@ -746,6 +790,9 @@ export const api = {
   setQuota: (body: QuotaBody) => call<object>("POST", "quotas", body),
   deleteQuota: (name: string) => call<object>("POST", "quotas/delete", { name }),
   resetQuota: (name: string) => call<object>("POST", "quotas/reset", { name }),
+  extendQuota: (name: string, days: number) => call<object>("POST", "quotas/extend", { name, days }),
+  shareQuota: (name: string, title: string) => call<{ token: string; title: string }>("POST", "quotas/share", { name, title }),
+  unshareQuota: (name: string) => call<object>("POST", "quotas/share/delete", { name }),
   sessions: () => call<{ sessions: SessionRow[] }>("GET", "sessions"),
   revoke: (id: number) => call<object>("POST", "sessions/revoke", { id }),
   changePassword: (current: string | undefined, next: string) =>
@@ -757,6 +804,9 @@ export const api = {
   editTunnel: (body: PairRequest) => call<{ op: string }>("POST", "tunnels/edit", body),
   controlTunnel: (name: string, action: "start" | "stop" | "restart") => call<{ op: string }>("POST", "tunnels/control", { name, action }),
   deleteTunnel: (name: string) => call<{ op: string }>("POST", "tunnels/delete", { name }),
+  tunnelCopies: () => call<{ specs: TunnelCopy[] }>("GET", "tunnels/specs"),
+  recreateTunnel: (body: { name: string; entry?: string; exit?: string }) => call<{ op: string }>("POST", "tunnels/recreate", body),
+  forgetTunnelCopy: (name: string) => call<{ ok?: boolean }>("POST", "tunnels/specs/delete", { name }),
   tunnelSpec: (server: string, name: string) =>
     call<Spec>("GET", `tunnel?server=${encodeURIComponent(server)}&name=${encodeURIComponent(name)}`),
   op: (id: string) => call<Op>("GET", `op?id=${encodeURIComponent(id)}`),
@@ -797,6 +847,8 @@ export const api = {
   telegramTest: () => call<{ ok: boolean; bot?: string; error?: string }>("POST", "telegram/test", {}),
   proxy: () => call<ProxyView>("GET", "proxy"),
   proxySet: (body: ProxyChange) => call<ProxyView>("POST", "proxy", body),
+  metrics: () => call<MetricsView>("GET", "metrics"),
+  metricsSet: (action: "enable" | "disable" | "regenerate") => call<MetricsView>("POST", "metrics", { action }),
   applyUpdate: (confirm_major: boolean) => call<{ op: string }>("POST", "update/apply", { confirm_major }),
   updateServers: (restart_tunnels: boolean) => call<{ op: string }>("POST", "update/servers", { restart_tunnels }),
   newLink: () => call<{ token: string; valid_for: number }>("POST", "links"),

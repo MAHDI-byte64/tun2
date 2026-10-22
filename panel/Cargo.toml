@@ -1,6 +1,6 @@
 [package]
 name = "kariz-panel"
-version = "2.9.3"
+version = "2.10.0"
 edition = "2021"
 rust-version = "1.80"
 description = "The Kariz web panel: sign-in, servers, tunnels, live monitoring."
@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 argon2 = { version = "0.5", default-features = false, features = ["std", "password-hash"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "ws"] }
 base64 = "0.23"
 blake3 = "1.8"
 bytes = "1"
@@ -48,6 +48,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # The day of the month a tunnel's traffic limit resets on (already a dependency of the core).
 time = "0.3"
+# The pseudo-terminal of the web terminal (openpty, the window size).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -44,6 +44,10 @@ pub const MAX_RESET_DAY: i64 = 28;
 const TICK: Duration = Duration::from_secs(3);
 /// The warning goes out at this share of the limit.
 const WARN_AT: f64 = 0.8;
+/// The notice that a limit's end is near goes out this long before it.
+const EXPIRY_WARN: i64 = 3 * 86_400;
+/// The most days a limit can run (or be extended by) at once.
+pub const MAX_DAYS: i64 = 3650;
 
 /// A tunnel's limit and usage, as the API shows it.
 #[derive(Debug, Clone, Serialize)]
@@ -67,15 +71,29 @@ pub struct Quota {
     pub next_reset: Option<i64>,
     /// Usage as a percentage of the limit.
     pub pct: f64,
+    /// When the limit ends (unix seconds; 0: it does not): the tunnel is stopped then,
+    /// until it is extended.
+    pub expires_at: i64,
+    /// When the end stopped the tunnel (0: it did not).
+    pub expired: i64,
+    /// The renter's page, when one was made.
+    pub share: Option<crate::share::ShareView>,
 }
 
-/// What the browser (or the wizard's request) sends to set a limit.
+/// What the browser (or the wizard's request) sends to set a limit. `limit_bytes` may be 0
+/// when the limit is a duration alone.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewQuota {
     pub name: String,
     pub limit_bytes: i64,
     #[serde(default)]
     pub reset_day: i64,
+    /// An end this many days from now (1 to 3650), or none.
+    #[serde(default)]
+    pub days: Option<i64>,
+    /// An end at this time (unix seconds; takes precedence over `days`), 0 for none.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
 }
 
 /// A limit as asked for in a tunnel's create request (the wizard): written once the tunnel
@@ -85,6 +103,18 @@ pub struct QuotaSpec {
     pub limit_bytes: i64,
     #[serde(default)]
     pub reset_day: i64,
+    /// An end this many days from when the tunnel is made.
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+impl QuotaSpec {
+    /// When the limit ends, counted from now; 0 without a duration.
+    pub fn expires_at(&self) -> i64 {
+        self.days
+            .filter(|d| *d > 0)
+            .map_or(0, |d| now() + d * 86_400)
+    }
 }
 
 /// One row of the `quotas` table.
@@ -105,10 +135,16 @@ struct Row {
     stopped: i64,
     start_due: bool,
     since: i64,
+    /// When the limit ends (0: never).
+    expires_at: i64,
+    /// The notice that the end is near went out.
+    expiry_warned: bool,
+    /// When the end stopped the tunnel (0: it did not).
+    expired: i64,
 }
 
 impl Row {
-    fn view(&self) -> Quota {
+    fn view(&self, share: Option<crate::share::ShareView>) -> Quota {
         Quota {
             name: self.name.clone(),
             limit_bytes: self.limit_bytes,
@@ -125,12 +161,27 @@ impl Row {
             } else {
                 0.0
             },
+            expires_at: self.expires_at,
+            expired: self.expired,
+            share,
         }
     }
 
-    /// Over the limit (a row whose limit was removed is never over it).
-    fn exhausted(&self) -> bool {
-        self.limit_bytes > 0 && self.used >= self.limit_bytes
+    /// A limit that is in force: a volume, an end, or both (a row without either stays
+    /// only while a start is owed).
+    fn live(&self) -> bool {
+        self.limit_bytes > 0 || self.expires_at > 0
+    }
+
+    /// Over the limit, or past its end, at `t`: the tunnel is kept stopped.
+    fn exhausted(&self, t: i64) -> bool {
+        (self.limit_bytes > 0 && self.used >= self.limit_bytes)
+            || (self.expires_at > 0 && t >= self.expires_at)
+    }
+
+    /// Past the end at `t`.
+    fn past_end(&self, t: i64) -> bool {
+        self.expires_at > 0 && t >= self.expires_at
     }
 }
 
@@ -173,10 +224,13 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         stopped: r.get(9)?,
         start_due: r.get::<_, i64>(10)? != 0,
         since: r.get(11)?,
+        expires_at: r.get(12)?,
+        expiry_warned: r.get::<_, i64>(13)? != 0,
+        expired: r.get(14)?,
     })
 }
 
-const COLUMNS: &str = "name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since";
+const COLUMNS: &str = "name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since, expires_at, expiry_warned, expired";
 
 fn rows(db: &Db) -> Result<Vec<Row>> {
     let conn = db.conn();
@@ -199,7 +253,8 @@ fn row(db: &Db, name: &str) -> Result<Option<Row>> {
 fn save(db: &Db, r: &Row) -> Result<()> {
     db.conn().execute(
         "UPDATE quotas SET limit_bytes = ?2, used = ?3, last_seen = ?4, side = ?5, counter_id = ?6, \
-         reset_day = ?7, last_reset = ?8, warned = ?9, stopped = ?10, start_due = ?11 WHERE name = ?1",
+         reset_day = ?7, last_reset = ?8, warned = ?9, stopped = ?10, start_due = ?11, \
+         expires_at = ?12, expiry_warned = ?13, expired = ?14 WHERE name = ?1",
         params![
             r.name,
             r.limit_bytes,
@@ -211,39 +266,52 @@ fn save(db: &Db, r: &Row) -> Result<()> {
             r.last_reset,
             r.warned as i64,
             r.stopped,
-            r.start_due as i64
+            r.start_due as i64,
+            r.expires_at,
+            r.expiry_warned as i64,
+            r.expired
         ],
     )?;
     Ok(())
 }
 
-/// Every tunnel with a limit.
+/// Every tunnel with a limit (a volume, an end, or both), each with its renter's page.
 pub fn list(db: &Db) -> Result<Vec<Quota>> {
+    let shares = crate::share::all(db)?;
     Ok(rows(db)?
         .iter()
-        .filter(|r| r.limit_bytes > 0)
-        .map(Row::view)
+        .filter(|r| r.live())
+        .map(|r| r.view(shares.get(&r.name).cloned()))
         .collect())
 }
 
-/// Whether a tunnel is over its limit (its Start and Restart are refused then).
+/// Whether a tunnel is over its limit or past its end (its Start and Restart are refused
+/// then).
 pub fn exhausted(db: &Db, name: &str) -> bool {
-    row(db, name).ok().flatten().is_some_and(|r| r.exhausted())
+    row(db, name)
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.exhausted(now()))
 }
 
-/// Checks a limit's numbers: `bad_input` when they are out of range.
-pub fn check(limit_bytes: i64, reset_day: i64) -> Result<()> {
-    if !(MIN_LIMIT..=MAX_LIMIT).contains(&limit_bytes) || !(0..=MAX_RESET_DAY).contains(&reset_day)
-    {
+/// Checks a limit's numbers: `bad_input` when they are out of range. The volume may be 0
+/// when there is an end (a limit of time alone); an end is 0 (none) or ahead, by at most
+/// [`MAX_DAYS`].
+pub fn check(limit_bytes: i64, reset_day: i64, expires_at: i64) -> Result<()> {
+    let volume_ok =
+        (MIN_LIMIT..=MAX_LIMIT).contains(&limit_bytes) || (limit_bytes == 0 && expires_at > 0);
+    let t = now();
+    let end_ok = expires_at == 0 || (expires_at > t && expires_at <= t + MAX_DAYS * 86_400);
+    if !volume_ok || !(0..=MAX_RESET_DAY).contains(&reset_day) || !end_ok {
         bail!("bad_input");
     }
     Ok(())
 }
 
 /// Sets (or changes) a tunnel's limit; the usage goes on. A tunnel the limit had stopped is
-/// started again when the new limit is above its usage.
-pub fn write(db: &Db, name: &str, limit_bytes: i64, reset_day: i64) -> Result<()> {
-    check(limit_bytes, reset_day)?;
+/// started again when the new limit is above its usage and the new end (if any) is ahead.
+pub fn write(db: &Db, name: &str, limit_bytes: i64, reset_day: i64, expires_at: i64) -> Result<()> {
+    check(limit_bytes, reset_day, expires_at)?;
     if !valid_name(name) {
         bail!("bad_name");
     }
@@ -252,7 +320,13 @@ pub fn write(db: &Db, name: &str, limit_bytes: i64, reset_day: i64) -> Result<()
         Some(mut r) => {
             r.limit_bytes = limit_bytes;
             r.reset_day = reset_day;
-            if r.stopped != 0 && r.used < limit_bytes {
+            if r.expires_at != expires_at {
+                // A new end (or none): the old one's notice and stop are over.
+                r.expires_at = expires_at;
+                r.expiry_warned = false;
+                r.expired = 0;
+            }
+            if r.stopped != 0 && !r.exhausted(t) {
                 r.stopped = 0;
                 r.start_due = true;
             }
@@ -264,11 +338,24 @@ pub fn write(db: &Db, name: &str, limit_bytes: i64, reset_day: i64) -> Result<()
         }
         None => {
             db.conn().execute(
-                "INSERT INTO quotas (name, limit_bytes, reset_day, last_reset, since) VALUES (?1, ?2, ?3, ?4, ?4)",
-                params![name, limit_bytes, reset_day, t],
+                "INSERT INTO quotas (name, limit_bytes, reset_day, last_reset, since, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params![name, limit_bytes, reset_day, t, expires_at],
             )?;
             Ok(())
         }
+    }
+}
+
+/// When a request's limit ends: `expires_at` as given, else `days` from now, else never.
+fn end_of(days: Option<i64>, expires_at: Option<i64>) -> Result<i64> {
+    if let Some(at) = expires_at {
+        return Ok(at.max(0));
+    }
+    match days {
+        None | Some(0) => Ok(0),
+        Some(d) if (1..=MAX_DAYS).contains(&d) => Ok(now() + d * 86_400),
+        Some(_) => bail!("bad_input"),
     }
 }
 
@@ -277,7 +364,8 @@ pub fn set(hub: &Hub, new: &NewQuota) -> Result<()> {
     if !valid_name(&new.name) {
         bail!("bad_name");
     }
-    check(new.limit_bytes, new.reset_day)?;
+    let expires_at = end_of(new.days, new.expires_at)?;
+    check(new.limit_bytes, new.reset_day, expires_at)?;
     let known = hub
         .snapshot()?
         .iter()
@@ -285,25 +373,60 @@ pub fn set(hub: &Hub, new: &NewQuota) -> Result<()> {
     if !known {
         bail!("no_such_tunnel");
     }
-    write(&hub.db, &new.name, new.limit_bytes, new.reset_day)
+    write(
+        &hub.db,
+        &new.name,
+        new.limit_bytes,
+        new.reset_day,
+        expires_at,
+    )
 }
 
-/// Takes a tunnel's limit away. A tunnel the limit had stopped is started again first: its
-/// row stays, without a limit, until that is done. Whether there was a limit.
+/// Moves a limit's end `days` further (from its end, or from now when it is already past
+/// or it had none). A tunnel the end had stopped is owed a start. Whether there was a limit.
+pub fn extend(hub: &Hub, name: &str, days: i64) -> Result<bool> {
+    if !(1..=MAX_DAYS).contains(&days) {
+        bail!("bad_input");
+    }
+    let Some(mut r) = row(&hub.db, name)? else {
+        return Ok(false);
+    };
+    if !r.live() {
+        return Ok(false);
+    }
+    let t = now();
+    r.expires_at = r.expires_at.max(t) + days * 86_400;
+    r.expiry_warned = false;
+    r.expired = 0;
+    if r.stopped != 0 && !r.exhausted(t) {
+        r.stopped = 0;
+        r.start_due = true;
+    }
+    save(&hub.db, &r)?;
+    hub.history
+        .event("quota_extend", name, &r.expires_at.to_string());
+    Ok(true)
+}
+
+/// Takes a tunnel's limit away (its volume, its end and its renter's page). A tunnel the
+/// limit had stopped is started again first: its row stays, without a limit, until that is
+/// done. Whether there was a limit.
 pub fn delete(db: &Db, name: &str) -> Result<bool> {
     let Some(r) = row(db, name)? else {
         return Ok(false);
     };
     if r.stopped != 0 {
         db.conn().execute(
-            "UPDATE quotas SET limit_bytes = 0, stopped = 0, start_due = 1, warned = 0 WHERE name = ?1",
+            "UPDATE quotas SET limit_bytes = 0, expires_at = 0, expired = 0, expiry_warned = 0, \
+             stopped = 0, start_due = 1, warned = 0 WHERE name = ?1",
             [name],
         )?;
     } else {
         db.conn()
             .execute("DELETE FROM quotas WHERE name = ?1", [name])?;
     }
-    Ok(r.limit_bytes > 0)
+    crate::share::forget(db, name);
+    Ok(r.live())
 }
 
 /// Starts a new period: the usage goes back to zero, and a tunnel the limit had stopped is
@@ -324,11 +447,12 @@ pub fn reset(hub: &Hub, name: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// A tunnel is gone: so is its limit.
+/// A tunnel is gone: so are its limit and its renter's page.
 pub fn forget(db: &Db, name: &str) {
     let _ = db
         .conn()
         .execute("DELETE FROM quotas WHERE name = ?1", [name]);
+    crate::share::forget(db, name);
 }
 
 /// One side of a tunnel, as the quota sees it.
@@ -444,20 +568,62 @@ async fn step(hub: &Arc<Hub>) -> Result<()> {
             }
         }
 
-        // ---- over the limit: stopped, and kept stopped ----
+        // ---- the end is near: one notice ----
+        if r.expires_at > 0 && !r.expiry_warned && t >= r.expires_at - EXPIRY_WARN && !r.past_end(t)
+        {
+            let changed = hub.db.conn().execute(
+                "UPDATE quotas SET expiry_warned = 1 WHERE name = ?1 AND expiry_warned = 0",
+                [&name],
+            )?;
+            if changed == 1 {
+                hub.history
+                    .event("quota_expiring", &name, &r.expires_at.to_string());
+                hub.push_notice(Notice::QuotaExpiring {
+                    name: name.clone(),
+                    days: ((r.expires_at - t + 86_399) / 86_400).max(1) as u64,
+                });
+            }
+        }
+
+        // ---- over the limit, or past its end: stopped, and kept stopped ----
         let running = sides.iter().any(|s| s.online && s.active == Some(true));
-        if r.exhausted() && running {
+        let past_end = r.past_end(t);
+        if past_end && r.expired == 0 && !running {
+            // Not running anyway (stopped by hand, or every side away): noted, so the page
+            // says so and a start is refused; nothing to stop.
+            let marked = hub.db.conn().execute(
+                "UPDATE quotas SET expired = ?2 WHERE name = ?1 AND expired = 0 AND expires_at > 0 AND expires_at <= ?2",
+                params![name, t],
+            )?;
+            if marked == 1 {
+                hub.history.event("quota_expired", &name, "");
+                hub.push_notice(Notice::QuotaExpired { name: name.clone() });
+            }
+        }
+        if r.exhausted(t) && running {
             match pair::control(hub, &name, "stop") {
                 Ok(op) => match pair::wait(hub, &op).await {
                     Ok(()) => {
-                        // Marked only while it is still over its limit: a reset or a raise
-                        // in the meantime makes the stop a start that is owed instead.
+                        // Marked only while it is still over its limit or past its end: a
+                        // reset, a raise or an extension in the meantime makes the stop a
+                        // start that is owed instead.
                         let marked = hub.db.conn().execute(
-                            "UPDATE quotas SET stopped = ?2, start_due = 0 \
-                             WHERE name = ?1 AND stopped = 0 AND limit_bytes > 0 AND used >= limit_bytes",
+                            "UPDATE quotas SET stopped = ?2, start_due = 0, \
+                             expired = CASE WHEN expires_at > 0 AND expires_at <= ?2 THEN ?2 ELSE expired END \
+                             WHERE name = ?1 AND stopped = 0 \
+                             AND ((limit_bytes > 0 AND used >= limit_bytes) OR (expires_at > 0 AND expires_at <= ?2))",
                             params![name, t],
                         )?;
-                        if marked == 1 {
+                        if marked == 1 && past_end {
+                            hub.history.event("quota_expired", &name, "");
+                            let _ = hub.db.audit(
+                                "quota",
+                                None,
+                                &format!("stopped tunnel {name}: its time is up"),
+                            );
+                            hub.push_notice(Notice::QuotaExpired { name: name.clone() });
+                            info!(tunnel = %name, "a tunnel was stopped: its time is up");
+                        } else if marked == 1 {
                             hub.history.event(
                                 "quota_stop",
                                 &name,
@@ -480,8 +646,9 @@ async fn step(hub: &Arc<Hub>) -> Result<()> {
                         } else {
                             let _ = hub.db.conn().execute(
                                 "UPDATE quotas SET start_due = 1 \
-                                 WHERE name = ?1 AND stopped = 0 AND NOT (limit_bytes > 0 AND used >= limit_bytes)",
-                                [&name],
+                                 WHERE name = ?1 AND stopped = 0 \
+                                 AND NOT ((limit_bytes > 0 AND used >= limit_bytes) OR (expires_at > 0 AND expires_at <= ?2))",
+                                params![name, t],
                             );
                         }
                     }
@@ -498,7 +665,7 @@ async fn step(hub: &Arc<Hub>) -> Result<()> {
         }
 
         // ---- a start that is owed, once the usage is under the limit again ----
-        if r.start_due && !r.exhausted() {
+        if r.start_due && !r.exhausted(t) {
             if !sides.is_empty() && sides.iter().all(|s| s.online && s.active == Some(true)) {
                 // Every side runs again (a side that is away is waited for: its service
                 // was disabled, and nothing but the panel brings it back).
@@ -507,7 +674,7 @@ async fn step(hub: &Arc<Hub>) -> Result<()> {
                     [&name],
                 )?;
                 hub.db.conn().execute(
-                    "DELETE FROM quotas WHERE name = ?1 AND limit_bytes = 0 AND start_due = 0",
+                    "DELETE FROM quotas WHERE name = ?1 AND limit_bytes = 0 AND expires_at = 0 AND start_due = 0",
                     [&name],
                 )?;
             } else if sides.iter().any(|s| s.online && s.active == Some(false)) {
@@ -571,26 +738,26 @@ mod tests {
 
     #[test]
     fn a_limit_is_checked() {
-        assert!(check(MIN_LIMIT, 0).is_ok());
-        assert!(check(MIN_LIMIT - 1, 0).is_err());
-        assert!(check(MAX_LIMIT + 1, 0).is_err());
-        assert!(check(MIN_LIMIT, 28).is_ok());
-        assert!(check(MIN_LIMIT, 29).is_err());
-        assert!(check(MIN_LIMIT, -1).is_err());
+        assert!(check(MIN_LIMIT, 0, 0).is_ok());
+        assert!(check(MIN_LIMIT - 1, 0, 0).is_err());
+        assert!(check(MAX_LIMIT + 1, 0, 0).is_err());
+        assert!(check(MIN_LIMIT, 28, 0).is_ok());
+        assert!(check(MIN_LIMIT, 29, 0).is_err());
+        assert!(check(MIN_LIMIT, -1, 0).is_err());
     }
 
     #[test]
     fn a_limit_is_written_changed_reset_and_taken_away() {
         let db = Db::in_memory().unwrap();
-        write(&db, "demo", 2 * MIN_LIMIT, 5).unwrap();
+        write(&db, "demo", 2 * MIN_LIMIT, 5, 0).unwrap();
         let q = &list(&db).unwrap()[0];
         assert_eq!(
             (q.name.as_str(), q.limit_bytes, q.reset_day),
             ("demo", 2 * MIN_LIMIT, 5)
         );
         assert!(q.next_reset.is_some() && q.stopped == 0);
-        assert!(write(&db, "demo", 10, 0).is_err(), "too small");
-        assert!(write(&db, "Bad Name", MIN_LIMIT, 0).is_err());
+        assert!(write(&db, "demo", 10, 0, 0).is_err(), "too small");
+        assert!(write(&db, "Bad Name", MIN_LIMIT, 0, 0).is_err());
 
         // Over the limit and stopped; a raise above the usage owes it a start.
         let mut r = row(&db, "demo").unwrap().unwrap();
@@ -599,13 +766,13 @@ mod tests {
         r.warned = true;
         save(&db, &r).unwrap();
         assert!(exhausted(&db, "demo"));
-        write(&db, "demo", 2 * MIN_LIMIT, 0).unwrap();
+        write(&db, "demo", 2 * MIN_LIMIT, 0, 0).unwrap();
         let r = row(&db, "demo").unwrap().unwrap();
         assert!(
             r.stopped == 7 && !r.start_due,
             "the same limit: still stopped"
         );
-        write(&db, "demo", 10 * MIN_LIMIT, 0).unwrap();
+        write(&db, "demo", 10 * MIN_LIMIT, 0, 0).unwrap();
         let r = row(&db, "demo").unwrap().unwrap();
         assert!(r.stopped == 0 && r.start_due && !r.warned);
         assert_eq!(r.used, 2 * MIN_LIMIT, "the usage goes on");
@@ -692,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn the_usage_adds_up_the_readings_and_knows_a_counter_that_started_over() {
         let hub = hub();
-        write(&hub.db, "demo", 100 * MIN_LIMIT, 0).unwrap();
+        write(&hub.db, "demo", 100 * MIN_LIMIT, 0, 0).unwrap();
         // The first reading is a baseline: what moved before the limit was set is not counted.
         hub.set_live_tunnels(
             "a",
@@ -780,9 +947,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_limit_with_an_end_warns_three_days_before_stops_at_the_end_and_goes_on_when_extended(
+    ) {
+        let hub = hub();
+        let t = now();
+        // A limit of time alone, ending in two days: the notice goes out at once.
+        write(&hub.db, "demo", 0, 0, t + 2 * 86_400).unwrap();
+        assert_eq!(
+            list(&hub.db).unwrap().len(),
+            1,
+            "a duration alone is a limit"
+        );
+        hub.set_live_tunnels(
+            "a",
+            true,
+            vec![side("entry", Some(true), Some((0, Some("one"))))],
+        );
+        step(&hub).await.unwrap();
+        let notices = hub.take_notices();
+        assert!(
+            matches!(&notices[..], [Notice::QuotaExpiring { name, days }] if name == "demo" && *days == 2),
+            "{notices:?}"
+        );
+        step(&hub).await.unwrap();
+        assert!(hub.take_notices().is_empty(), "the notice goes out once");
+        assert!(!exhausted(&hub.db, "demo"));
+
+        // Past the end: a stop is tried (nothing answers here), and a start is refused.
+        let mut r = row(&hub.db, "demo").unwrap().unwrap();
+        r.expires_at = t - 1;
+        save(&hub.db, &r).unwrap();
+        step(&hub).await.unwrap();
+        assert!(exhausted(&hub.db, "demo"));
+        assert_eq!(hub.ops.count("control"), 1);
+
+        // Stopped (as the agent would report): marked expired, told once.
+        hub.set_live_tunnels("a", true, vec![side("entry", Some(false), None)]);
+        step(&hub).await.unwrap();
+        let r = row(&hub.db, "demo").unwrap().unwrap();
+        assert!(r.expired > 0, "{r:?}");
+        let notices = hub.take_notices();
+        assert!(
+            matches!(&notices[..], [Notice::QuotaExpired { name }] if name == "demo"),
+            "{notices:?}"
+        );
+        step(&hub).await.unwrap();
+        assert!(hub.take_notices().is_empty());
+        assert_eq!(hub.ops.count("control"), 1, "nothing more to stop");
+
+        // As the panel's own stop leaves it (the agent answered here): stopped at the end.
+        let mut r = row(&hub.db, "demo").unwrap().unwrap();
+        r.stopped = t;
+        save(&hub.db, &r).unwrap();
+        // Extended by ten days: the end moves on from now, and a start is owed.
+        assert!(extend(&hub, "demo", 10).unwrap());
+        let r = row(&hub.db, "demo").unwrap().unwrap();
+        assert!(r.expires_at >= now() + 10 * 86_400 - 2 && r.expired == 0 && !r.expiry_warned);
+        assert!(r.start_due && r.stopped == 0, "{r:?}");
+        assert!(!exhausted(&hub.db, "demo"));
+        step(&hub).await.unwrap();
+        assert_eq!(hub.ops.count("control"), 2, "started again");
+        // A bad extension changes nothing.
+        assert!(extend(&hub, "demo", 0).is_err() && extend(&hub, "demo", 4000).is_err());
+        assert!(!extend(&hub, "nobody", 3).unwrap());
+    }
+
+    #[test]
+    fn a_limit_s_numbers_are_checked_with_its_end() {
+        let t = now();
+        assert!(check(MIN_LIMIT, 0, 0).is_ok());
+        assert!(check(0, 0, t + 86_400).is_ok(), "time alone");
+        assert!(check(0, 0, 0).is_err(), "neither");
+        assert!(check(MIN_LIMIT, 0, t - 1).is_err(), "an end in the past");
+        assert!(check(MIN_LIMIT, 0, t + (MAX_DAYS + 1) * 86_400).is_err());
+        assert_eq!(end_of(None, None).unwrap(), 0);
+        assert!(end_of(Some(3), None).unwrap() >= t + 3 * 86_400);
+        assert_eq!(
+            end_of(Some(3), Some(t + 5)).unwrap(),
+            t + 5,
+            "a given end wins"
+        );
+        assert!(end_of(Some(0), None).unwrap() == 0 && end_of(Some(9999), None).is_err());
+    }
+
+    #[tokio::test]
     async fn a_tunnel_over_its_limit_is_warned_about_and_stopped_only_while_a_side_is_online() {
         let hub = hub();
-        write(&hub.db, "demo", MIN_LIMIT, 0).unwrap();
+        write(&hub.db, "demo", MIN_LIMIT, 0, 0).unwrap();
         hub.set_live_tunnels(
             "a",
             true,
@@ -881,7 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn a_start_stays_owed_until_every_side_is_back_and_running() {
         let hub = hub();
-        write(&hub.db, "demo", MIN_LIMIT, 0).unwrap();
+        write(&hub.db, "demo", MIN_LIMIT, 0, 0).unwrap();
         let mut r = row(&hub.db, "demo").unwrap().unwrap();
         r.start_due = true;
         save(&hub.db, &r).unwrap();
@@ -913,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn a_reset_during_the_stop_is_kept_and_the_tunnel_is_owed_a_start() {
         let hub = hub();
-        write(&hub.db, "demo", MIN_LIMIT, 0).unwrap();
+        write(&hub.db, "demo", MIN_LIMIT, 0, 0).unwrap();
         let mut r = row(&hub.db, "demo").unwrap().unwrap();
         r.used = MIN_LIMIT;
         r.last_seen = MIN_LIMIT;
@@ -939,7 +1190,7 @@ mod tests {
     #[tokio::test]
     async fn a_monthly_reset_zeroes_the_usage_and_owes_a_stopped_tunnel_a_start() {
         let hub = hub();
-        write(&hub.db, "demo", MIN_LIMIT, 1).unwrap();
+        write(&hub.db, "demo", MIN_LIMIT, 1, 0).unwrap();
         let mut r = row(&hub.db, "demo").unwrap().unwrap();
         // The last reset was long ago; the tunnel is stopped over its limit.
         r.last_reset = now() - 40 * 86_400;

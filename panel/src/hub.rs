@@ -359,6 +359,7 @@ impl Hub {
             release_key: None,
             transport: None,
             listen: None,
+            terminal: false,
         };
         Arc::new(Self {
             history: crate::history::History::new(db.clone()),
@@ -408,6 +409,36 @@ impl Hub {
             .and_then(|l| l.session.clone())
             .ok_or_else(|| anyhow!("that server is not connected"))?;
         request_within(&session, request, limit).await
+    }
+
+    /// Whether the panel may open a terminal on its own server (`panel.toml`'s `terminal`).
+    pub fn allow_terminal(&self, on: bool) {
+        self.local.allow_terminal(on);
+    }
+
+    /// Opens a terminal on `server`: a stream of the agent's link that stays open, or, on
+    /// the panel's own server, a pipe to a shell served in process.
+    pub async fn open_terminal(
+        &self,
+        server: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<crate::terminal::Backend> {
+        if server == LOCAL {
+            return Ok(crate::terminal::Backend::Local(
+                self.local.open_shell(cols, rows),
+            ));
+        }
+        let session = self
+            .live()
+            .get(server)
+            .filter(|l| l.online)
+            .and_then(|l| l.session.clone())
+            .ok_or_else(|| anyhow!("not connected"))?;
+        let syn = serde_json::to_vec(&Request::Shell { cols, rows })?;
+        Ok(crate::terminal::Backend::Remote(
+            session.open(Bytes::from(syn))?,
+        ))
     }
 
     /// Like [`Hub::ask`], with the answer read as `T`.
@@ -1815,16 +1846,24 @@ impl Hub {
 
     /// The panel's own server, sampled here (no link).
     pub async fn run_local(self: Arc<Self>) {
+        tokio::spawn(self.services.clone().supervise());
         self.local.restore_net().await;
         if let Err(e) = self.net_sync(LOCAL).await {
             warn!(error = %e, "the private network links could not be synced");
         }
         let mut sampler = Sampler::default();
         let mut round = 0u32;
+        // Tunnels made before the panel kept copies of them that could not be read back.
+        let mut uncopied = std::collections::HashSet::new();
         loop {
             // Old history goes about once an hour.
             if round % 1800 == 0 {
                 let _ = self.history.prune();
+            }
+            // The copies of tunnels made before 2.10.0: half a minute in, then every two
+            // minutes (a server may have come back with one).
+            if round % 60 == 15 {
+                crate::specs::back_fill(&self, &mut uncopied).await;
             }
             // A look for a newer release: a minute after the start, then every day. It
             // only looks; installing is always the user's button.

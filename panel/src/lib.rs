@@ -18,6 +18,7 @@ pub mod hub;
 pub mod iptest;
 pub mod join;
 pub mod manage;
+pub mod metrics;
 pub mod net;
 pub mod netops;
 pub mod networks;
@@ -26,8 +27,11 @@ pub mod proxy;
 pub mod quota;
 pub mod reverse;
 pub mod schedule;
+pub mod share;
 pub mod sign;
+pub mod specs;
 pub mod telegram;
+pub mod terminal;
 pub mod update;
 pub mod updater;
 pub mod wire;
@@ -76,6 +80,7 @@ pub fn init_with_cert(
             agent_listen: Some(format!("0.0.0.0:{}", random_port()?)),
             kariz_dir: std::path::PathBuf::from("/etc/kariz"),
             services: Default::default(),
+            terminal: false,
             cert_file,
             key_file,
             release_api: None,

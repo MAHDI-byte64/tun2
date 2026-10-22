@@ -849,6 +849,34 @@ pub mod text {
                         );
                     }
                 }
+                Notice::QuotaExpiring { name, days } => {
+                    let name = esc(name);
+                    if fa {
+                        let _ = write!(
+                            out,
+                            "⏳ مهلت تانل <b>{name}</b> {days} روز دیگر تمام می‌شود. برای ادامه، در پنل تمدیدش کنید."
+                        );
+                    } else {
+                        let _ = write!(
+                            out,
+                            "⏳ Tunnel <b>{name}</b> has {days} day(s) left. Extend it in the panel to keep it going."
+                        );
+                    }
+                }
+                Notice::QuotaExpired { name } => {
+                    let name = esc(name);
+                    if fa {
+                        let _ = write!(
+                            out,
+                            "🛑 تانل <b>{name}</b> متوقف شد: مهلتش تمام شده. در پنل تمدیدش کنید."
+                        );
+                    } else {
+                        let _ = write!(
+                            out,
+                            "🛑 Tunnel <b>{name}</b> was stopped: its time is up. Extend it in the panel."
+                        );
+                    }
+                }
                 Notice::Unstable { name } => {
                     let name = esc(name);
                     if fa {

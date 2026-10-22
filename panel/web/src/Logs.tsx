@@ -3,6 +3,7 @@ import { api } from "./api";
 import type { EventRow, LogLine, ServerInfo } from "./api";
 import { pairTunnels } from "./derive";
 import { useApp } from "./store";
+import { TerminalSection } from "./Terminal";
 import { Card, Empty, Icon, Seg, useAgo } from "./ui";
 
 // eslint-disable-next-line no-control-regex
@@ -95,6 +96,7 @@ export function LogsPage({ servers }: { servers: ServerInfo[] }) {
 
   return (
     <div className="page is-on">
+      <TerminalSection servers={servers} />
       <div className="page-band log-bar">
         <Seg
           value={tab}

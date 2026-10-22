@@ -2,8 +2,10 @@
 //! the link token they dial with, and where the panel dials the ones it connects to
 //! (reverse), in one file locked with a passphrase.
 //!
-//! Tunnels are not in it: they live on the servers, in their own files, and the panel
-//! reads them from there. Sessions and login links are not in it either.
+//! The tunnels themselves live on the servers, in their own files, and the panel reads
+//! them from there; what is in the backup is the panel's copy of each one's settings
+//! (`crate::specs`, without tokens), so they can be made again. Sessions and login links
+//! are not in it.
 //!
 //! The file is `KZB1`, a random salt, a random nonce, then the JSON sealed with
 //! ChaCha20-Poly1305 under a key that Argon2id makes from the passphrase.
@@ -69,6 +71,35 @@ struct QuotaRow {
     stopped: i64,
     start_due: i64,
     since: i64,
+    /// Not in backups from before limits had an end: then none.
+    #[serde(default)]
+    expires_at: i64,
+    #[serde(default)]
+    expiry_warned: i64,
+    #[serde(default)]
+    expired: i64,
+}
+
+/// A tunnel's renter page (`crate::share`), the whole row.
+#[derive(Debug, Serialize, Deserialize)]
+struct ShareRow {
+    name: String,
+    token: String,
+    title: String,
+    created: i64,
+    views: i64,
+    last_restart: i64,
+}
+
+/// The panel's copy of a tunnel's settings (`crate::specs`), the whole row.
+#[derive(Debug, Serialize, Deserialize)]
+struct TunnelRow {
+    name: String,
+    request: String,
+    entry: String,
+    exit: String,
+    updated: i64,
+    source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,6 +121,12 @@ struct Payload {
     /// The tunnels' traffic limits and usage. Not in backups from before them: then none.
     #[serde(default)]
     quotas: Vec<QuotaRow>,
+    /// The copies of the tunnels' settings. Not in backups from before them: then none.
+    #[serde(default)]
+    tunnels: Vec<TunnelRow>,
+    /// The tunnels' renter pages. Not in backups from before them: then none.
+    #[serde(default)]
+    shares: Vec<ShareRow>,
 }
 
 fn derive(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
@@ -170,8 +207,8 @@ pub fn export(db: &Db, passphrase: &str) -> Result<Vec<u8>> {
     let quotas = {
         let conn = db.conn();
         let mut stmt = conn.prepare(
-            "SELECT name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since \
-             FROM quotas ORDER BY name",
+            "SELECT name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since, \
+             expires_at, expiry_warned, expired FROM quotas ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(QuotaRow {
@@ -187,6 +224,43 @@ pub fn export(db: &Db, passphrase: &str) -> Result<Vec<u8>> {
                 stopped: r.get(9)?,
                 start_due: r.get(10)?,
                 since: r.get(11)?,
+                expires_at: r.get(12)?,
+                expiry_warned: r.get(13)?,
+                expired: r.get(14)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let shares = {
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, token, title, created, views, last_restart FROM shares ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ShareRow {
+                name: r.get(0)?,
+                token: r.get(1)?,
+                title: r.get(2)?,
+                created: r.get(3)?,
+                views: r.get(4)?,
+                last_restart: r.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tunnels = {
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, request, entry, exit, updated, source FROM tunnel_specs ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TunnelRow {
+                name: r.get(0)?,
+                request: r.get(1)?,
+                entry: r.get(2)?,
+                exit: r.get(3)?,
+                updated: r.get(4)?,
+                source: r.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -201,6 +275,8 @@ pub fn export(db: &Db, passphrase: &str) -> Result<Vec<u8>> {
         ports,
         local_position: db.meta("local_position")?.and_then(|p| p.parse().ok()),
         quotas,
+        tunnels,
+        shares,
     };
     seal(serde_json::to_vec(&payload)?, passphrase)
 }
@@ -292,11 +368,20 @@ pub fn import(db: &Db, passphrase: &str, file: &[u8], replace: bool) -> Result<u
             params![p.server, p.port],
         )?;
     }
+    tx.execute("DELETE FROM tunnel_specs", [])?;
+    for t in &payload.tunnels {
+        tx.execute(
+            "INSERT INTO tunnel_specs (name, request, entry, exit, updated, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![t.name, t.request, t.entry, t.exit, t.updated, t.source],
+        )?;
+    }
     tx.execute("DELETE FROM quotas", [])?;
     for q in &payload.quotas {
         tx.execute(
-            "INSERT INTO quotas (name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO quotas (name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since, \
+             expires_at, expiry_warned, expired) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 q.name,
                 q.limit_bytes,
@@ -309,8 +394,19 @@ pub fn import(db: &Db, passphrase: &str, file: &[u8], replace: bool) -> Result<u
                 q.warned,
                 q.stopped,
                 q.start_due,
-                q.since
+                q.since,
+                q.expires_at,
+                q.expiry_warned,
+                q.expired
             ],
+        )?;
+    }
+    tx.execute("DELETE FROM shares", [])?;
+    for s in &payload.shares {
+        tx.execute(
+            "INSERT INTO shares (name, token, title, created, views, last_restart) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![s.name, s.token, s.title, s.created, s.views, s.last_restart],
         )?;
     }
     if let Some(token) = &payload.link_token {
@@ -411,6 +507,30 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect()
+    }
+
+    #[test]
+    fn a_backup_carries_the_copies_of_the_tunnels() {
+        let db = db_with_servers();
+        let req = crate::pair::PairRequest {
+            name: "kept-1".into(),
+            entry: "a1".into(),
+            exit: "b2".into(),
+            mode: "reverse".into(),
+            transport: "tcpmux".into(),
+            listen: "0.0.0.0:3080".into(),
+            dial: "ist.example.com:3080".into(),
+            ..Default::default()
+        };
+        crate::specs::keep(&db, &req, "panel").unwrap();
+        let file = export(&db, "a long enough passphrase").unwrap();
+        let fresh = Db::in_memory().unwrap();
+        import(&fresh, "a long enough passphrase", &file, false).unwrap();
+        let back = crate::specs::get(&fresh, "kept-1")
+            .unwrap()
+            .expect("the copy came back");
+        assert_eq!(back.dial, "ist.example.com:3080");
+        assert_eq!(back.exit, "b2");
     }
 
     #[test]

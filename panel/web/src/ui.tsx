@@ -722,3 +722,13 @@ export function useAgo() {
     return t("ago.d", { n: num(Math.floor(secs / 86400)) });
   };
 }
+
+/** Whether a server's version (`2.10.0`, maybe with a suffix after a dash) is at least `min`. */
+export function versionAtLeast(version: string, min: [number, number, number]): boolean {
+  const parts = version.replace(/^v/, "").split("-")[0].split(".").map(Number);
+  if (parts.length < 3 || parts.slice(0, 3).some((p) => !Number.isInteger(p))) return false;
+  for (let i = 0; i < 3; i++) {
+    if (parts[i] !== min[i]) return parts[i] > min[i];
+  }
+  return true;
+}

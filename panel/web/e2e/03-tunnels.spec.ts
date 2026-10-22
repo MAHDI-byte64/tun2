@@ -149,15 +149,19 @@ test.describe("the tunnel", () => {
     await expect(page.locator("#te-ports")).toHaveValue(`${front}=${echoPort}`);
     const newFront = await freePort();
     await page.locator("#te-ports").fill(`${newFront}=${echoPort}`);
+    // this panel's own server runs the current release: a port change needs no restart
+    await expect(page.locator(".tunnel-edit")).toContainText(/applied to the running entry/i);
     await page.locator(".edit-bar .btn-primary").click(); // Save
     await expect(page.locator(".tunnel-edit p.ok")).toContainText(/Done/i, { timeout: 60_000 });
+    // The entry takes the new port on a reload (no restart); the exit, unchanged, is left alone.
+    await expect(page.locator(".tunnel-edit .checklist li")).toHaveText([/Looking/, /Checking the entry/, /Checking the exit/, /Writing the entry/, /Applying the port changes/, /connect/i]);
     await page.locator(".edit-bar").getByRole("button", { name: "Close" }).click();
     expect(await echoes(newFront, "after the edit")).toBe(true);
     expect(await refuses(front), "the old port is closed").toBe(true);
     front = newFront;
   });
 
-  test("takes a traffic limit, shows the usage, and lets it go again", async ({ page }) => {
+  test("takes a traffic limit, shows the usage, and lets it go again", async ({ page, request }) => {
     await signIn(page);
     await goTo(page, "tunnels");
     const row = page.locator(".tunnels tr", { hasText: "demo" });
@@ -182,8 +186,32 @@ test.describe("the tunnel", () => {
     await expect(row.locator(".qt-bar")).toContainText(/of 1\.0 GB/, { timeout: 15_000 });
     await row.click();
     await expect(page.locator(".stat-card .qt-bar")).toBeVisible();
-    // Reset, then remove: the usage goes, then the limit.
+
+    // An end 30 days away: the days left show, and a renter's page can be made and revoked.
     await page.locator("#td-tab-quota").click();
+    await panel.getByRole("button", { name: "Days", exact: true }).click();
+    await panel.locator("#qt-days").fill("30");
+    await panel.getByRole("button", { name: /^Save$/ }).click();
+    await expect(page.locator(".toast, [role=status]").filter({ hasText: /limit saved/i }).first()).toBeVisible();
+    await expect(panel).toContainText(/30 days left/);
+    await panel.locator("#qt-share-title").fill("Office line");
+    await panel.getByRole("button", { name: /Make a link/ }).click();
+    await expect(page.locator(".toast, [role=status]").filter({ hasText: /link was made/i }).first()).toBeVisible();
+    const link = (await panel.locator(".copy-val-text").first().textContent())?.trim() ?? "";
+    expect(link).toMatch(/\/s\/[0-9a-f]{32}$/);
+    const shared = await request.get(link, { ignoreHTTPSErrors: true });
+    expect(shared.status()).toBe(200);
+    const html = await shared.text();
+    expect(html).toContain("Office line");
+    expect(html).toContain("30 days left");
+    expect(html).not.toContain("far-away");
+    const data = await request.get(`${link}/data`, { ignoreHTTPSErrors: true });
+    expect((await data.json()).days_left).toBe(30);
+    await panel.getByRole("button", { name: /Revoke/ }).click();
+    await expect(page.locator(".toast, [role=status]").filter({ hasText: /revoked/i }).first()).toBeVisible();
+    expect((await request.get(link, { ignoreHTTPSErrors: true })).status()).toBe(404);
+
+    // Reset, then remove: the usage goes, then the limit.
     await panel.getByRole("button", { name: /Reset the usage/i }).click();
     await expect(page.locator(".toast, [role=status]").filter({ hasText: /usage was reset/i }).first()).toBeVisible();
     await panel.getByRole("button", { name: /Remove the limit/i }).click();

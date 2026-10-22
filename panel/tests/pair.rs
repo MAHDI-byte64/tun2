@@ -237,6 +237,19 @@ async fn a_pair_is_made_edited_stopped_deleted_and_a_failure_leaves_nothing() {
     let op = pair::edit(&hub, request(new_front, listen)).unwrap();
     let done = finished(&hub, &op).await;
     assert_eq!(done.state, "done", "{done:?}");
+    let steps: Vec<&str> = done.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        steps,
+        [
+            "look",
+            "check_entry",
+            "check_exit",
+            "write_entry",
+            "reload_entry",
+            "connect"
+        ],
+        "a port change is applied to the running entry and the exit is left alone: {done:?}"
+    );
     assert!(through(new_front, b"after the edit").await);
 
     // ---- a new token on both sides ----
@@ -245,6 +258,21 @@ async fn a_pair_is_made_edited_stopped_deleted_and_a_failure_leaves_nothing() {
     let op = pair::edit(&hub, rotate).unwrap();
     let done = finished(&hub, &op).await;
     assert_eq!(done.state, "done", "{done:?}");
+    let steps: Vec<&str> = done.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        steps,
+        [
+            "look",
+            "check_entry",
+            "check_exit",
+            "write_entry",
+            "write_exit",
+            "start_entry",
+            "start_exit",
+            "connect"
+        ],
+        "a new token is written to both sides, which restart: {done:?}"
+    );
     assert!(through(new_front, b"after the new token").await);
 
     // ---- stop ----

@@ -28,6 +28,10 @@ pub struct Config {
     /// How tunnels are started: `systemd` (default) or `process`.
     #[serde(default)]
     pub services: crate::manage::ServiceKind,
+    /// The panel may open a terminal (a root shell) on its own server, from the Logs page.
+    /// Off unless set here.
+    #[serde(default)]
+    pub terminal: bool,
     /// Your own certificate (PEM chain) and key, instead of the self-signed one made at
     /// install. Reloaded when the panel gets SIGHUP. Set both or neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]

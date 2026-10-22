@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiError, api, isPrivatePath } from "./api";
-import type { QuotaRow, ServerInfo } from "./api";
+import type { QuotaRow, ServerInfo, TunnelStatus, TunnelCopy } from "./api";
 import { pairTunnels, rateParts } from "./derive";
 import type { Tunnel, TunnelState } from "./derive";
 import { useApp } from "./store";
 import { Chart } from "./Chart";
-import { Card, Dialog, Empty, Icon, Menu, Seg, Sep, Skeleton, Stat, Tabs, useAgo } from "./ui";
+import { Card, Dialog, Empty, Icon, Menu, Seg, Sep, Skeleton, Stat, Tabs, useAgo, versionAtLeast } from "./ui";
 import { Checklist, opError, useOp } from "./ops";
 import { RouteScene } from "./RouteScene";
 import { SpeedTest } from "./SpeedTest";
@@ -17,6 +17,7 @@ import { linkWithAddress } from "./GreChoice";
 import { AutoRestartBlock } from "./AutoRestart";
 import { QuotaBar, QuotaBlock, quotaExhausted } from "./Quota";
 import { Wizard } from "./Wizard";
+import { MissingTunnels } from "./Missing";
 import { TunnelEdit } from "./TunnelEdit";
 import { transportLabel } from "./transport";
 
@@ -299,11 +300,20 @@ function TunnelPage({
   const up = tunnel.state === "up";
   const r = rateParts(tunnel.rate);
   const moved = bytes(status ? status.totals.bytes_up + status.totals.bytes_down : 0);
-  // An l3 (GRE) tunnel's bytes are not counted; an entry on an older version is counted by the panel alone.
-  const metered = tunnel.transport !== "l3" && !tunnel.transport.startsWith("l3");
   const entryVersion = tunnel.entry?.server.version ?? "";
+  // An l3 (GRE) tunnel's bytes are counted from 2.10.0; an entry on an older version is counted by the panel alone.
+  const metered = !(tunnel.transport === "l3" || tunnel.transport.startsWith("l3")) || versionAtLeast(entryVersion, [2, 10, 0]);
   const oldAgent = !!entryVersion && !!status && !status.counter_id;
   const mode = tunnel.entry?.tunnel.mode ?? tunnel.exit?.tunnel.mode ?? "";
+  // The counters of each forward rule, as the entry's daemon reports them (matched by the listen address and protocol).
+  const live = !!status?.forwards?.length;
+  const counters = (f: { listen: string; protocol: string }) => status?.forwards?.find((s) => s.listen === f.listen && (!s.protocol || s.protocol === f.protocol));
+  const sum = (of: (s: NonNullable<TunnelStatus["forwards"]>[number]) => number) => (status?.forwards ?? []).reduce((acc, s) => acc + of(s), 0);
+  const fmtB = (n?: number) => {
+    if (n == null) return "—";
+    const b = bytes(n);
+    return `${num(b.value, b.decimals)} ${b.unit}`;
+  };
   // What the tunnel runs over now, as the benchmark names it: its core transport (tcp is measured with mux), its
   // direction, and whether it listens on a private network link.
   const acceptorSide = mode === "reverse" ? tunnel.entry : tunnel.exit;
@@ -538,29 +548,64 @@ function TunnelPage({
         )}
   
         <div className="grid-2">
-          <Card title={t("tun.forwards")} sub={forwards.length ? t("td.portsSub", { n: num(forwards.length) }) : undefined} flush>
+          <Card title={t("tun.forwards")} sub={forwards.length ? `${t("td.portsSub", { n: num(forwards.length) })}${live ? ` · ${t("td.fw.live")}` : ""}` : undefined} flush>
             {forwards.length === 0 ? (
               <p className="muted small pad">—</p>
             ) : (
-              <table className="plain-table">
+              <table className="plain-table td-fw">
                 <thead>
                   <tr>
                     <th>{t("td.listen")}</th>
                     <th>{t("td.target")}</th>
                     <th>{t("td.proto")}</th>
+                    {live && (
+                      <>
+                        <th className="num">{t("td.fw.up")}</th>
+                        <th className="num">{t("td.fw.down")}</th>
+                        <th className="num">{t("td.fw.tcp")}</th>
+                        <th className="num">{t("td.fw.udp")}</th>
+                        <th className="num">{t("td.fw.failed")}</th>
+                      </>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
-                  {forwards.map((f) => (
-                    <tr key={`${f.listen}-${f.target}-${f.protocol}`}>
-                      <td className="mono">{f.listen}</td>
-                      <td className="mono">{f.target}</td>
-                      <td>
-                        <span className="tag">{f.protocol}</span>
-                      </td>
-                    </tr>
-                  ))}
+                  {forwards.map((f) => {
+                    const s = counters(f);
+                    return (
+                      <tr key={`${f.listen}-${f.target}-${f.protocol}`}>
+                        <td className="mono">{f.listen}</td>
+                        <td className="mono">{f.target}</td>
+                        <td>
+                          <span className="tag">{f.protocol}</span>
+                        </td>
+                        {live && (
+                          <>
+                            <td className="num mono" dir="ltr">{fmtB(s?.bytes_up)}</td>
+                            <td className="num mono" dir="ltr">{fmtB(s?.bytes_down)}</td>
+                            <td className="num mono" dir="ltr">{s ? `${num(s.tcp_open ?? 0)} / ${num(s.tcp_total ?? 0)}` : "—"}</td>
+                            <td className="num mono" dir="ltr">{s ? `${num(s.udp_flows ?? 0)} / ${num(s.udp_total ?? 0)}` : "—"}</td>
+                            <td className="num mono" dir="ltr" title={s?.refused_per_ip ? t("td.fw.refusedTitle", { n: num(s.refused_per_ip) }) : undefined}>
+                              {s ? `${num(s.open_failures)}${s.refused_per_ip ? ` +${num(s.refused_per_ip)}` : ""}` : "—"}
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
                 </tbody>
+                {live && forwards.length > 1 && (
+                  <tfoot>
+                    <tr>
+                      <td colSpan={3}>{t("td.fw.total")}</td>
+                      <td className="num mono" dir="ltr">{fmtB(sum((s) => s.bytes_up ?? 0))}</td>
+                      <td className="num mono" dir="ltr">{fmtB(sum((s) => s.bytes_down ?? 0))}</td>
+                      <td className="num mono" dir="ltr">{`${num(sum((s) => s.tcp_open ?? 0))} / ${num(sum((s) => s.tcp_total ?? 0))}`}</td>
+                      <td className="num mono" dir="ltr">{`${num(sum((s) => s.udp_flows ?? 0))} / ${num(sum((s) => s.udp_total ?? 0))}`}</td>
+                      <td className="num mono" dir="ltr">{num(sum((s) => s.open_failures))}</td>
+                    </tr>
+                  </tfoot>
+                )}
               </table>
             )}
           </Card>
@@ -646,6 +691,25 @@ export function TunnelsPage({
     readQuotas.current = read;
     read();
     const id = setInterval(read, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+  // The copies of the tunnels' settings the panel keeps: the ones no server lists any more are offered back.
+  const [copies, setCopies] = useState<TunnelCopy[]>([]);
+  const readCopies = useRef(() => {});
+  useEffect(() => {
+    let alive = true;
+    const read = () => {
+      api
+        .tunnelCopies()
+        .then((r) => alive && setCopies(r.specs))
+        .catch(() => {});
+    };
+    readCopies.current = read;
+    read();
+    const id = setInterval(read, 15_000);
     return () => {
       alive = false;
       clearInterval(id);
@@ -925,6 +989,14 @@ export function TunnelsPage({
           </div>
         </div>
       )}
+      <MissingTunnels
+        servers={servers}
+        copies={copies}
+        onChanged={() => {
+          readCopies.current();
+          onChanged();
+        }}
+      />
       {dialogs}
     </div>
   );

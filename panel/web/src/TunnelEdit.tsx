@@ -4,7 +4,7 @@ import type { PairRequest } from "./api";
 import type { ServerInfo } from "./api";
 import type { Tunnel } from "./derive";
 import { useApp } from "./store";
-import { Icon, Seg } from "./ui";
+import { Icon, Seg, versionAtLeast } from "./ui";
 import { Checklist, opError, useOp } from "./ops";
 import { MuxFields, MuxToggle, muxFromSpec, muxSpecOf, muxToSpec } from "./MuxFields";
 import { TlsChoice, emptyTls, tlsReady } from "./TlsChoice";
@@ -468,7 +468,9 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
 
           <fieldset className="card edit-sec" disabled={running || op?.state === "done"}>
             <legend>{t("te.ports")}</legend>
-            <p className="muted small">{t("wz.lead4")}</p>
+            <p className="muted small">
+              {t("wz.lead4")} {versionAtLeast(servers.find((s) => s.id === entry)?.version ?? "", [2, 10, 0]) ? t("te.portsLive") : t("te.portsRestart")}
+            </p>
             <div className="field" style={{ maxWidth: 520 }}>
               <label htmlFor="te-ports">{t("wz.ports")}</label>
               <input className="text mono" id="te-ports" dir="ltr" value={ports} placeholder="443, 8080-8090" onChange={(e) => setPorts(e.target.value)} />

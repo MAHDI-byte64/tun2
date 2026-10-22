@@ -116,6 +116,15 @@ pub enum Notice {
         used: u64,
         limit: u64,
     },
+    /// A tunnel's limit ends in `days` days (three or fewer).
+    QuotaExpiring {
+        name: String,
+        days: u64,
+    },
+    /// A tunnel was stopped: its time is up.
+    QuotaExpired {
+        name: String,
+    },
 }
 
 /// A subject that is down, since when, and whether the user was told.

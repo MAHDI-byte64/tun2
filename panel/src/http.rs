@@ -61,7 +61,7 @@ const NOT_FOUND: &str = "<html>\r\n<head><title>404 Not Found</title></head>\r\n
                          <center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n\
                          </body>\r\n</html>\r\n";
 
-fn not_found() -> Response<Body> {
+pub(crate) fn not_found() -> Response<Body> {
     let mut response = Response::new(Body::from(NOT_FOUND));
     *response.status_mut() = StatusCode::NOT_FOUND;
     let headers = response.headers_mut();
@@ -75,6 +75,7 @@ pub fn router(path: &str, state: AppState) -> Router {
     // Without the closing slash the page's relative addresses (`./api/...`, `./assets/...`)
     // would point outside the secret path and the app would not load: send it to the slash.
     let slash = format!("/{path}/");
+    let public = crate::share::routes(state.clone());
     let inner = Router::new()
         .route(
             "/",
@@ -84,6 +85,10 @@ pub fn router(path: &str, state: AppState) -> Router {
             }),
         )
         .route("/api/version", get(version))
+        // Prometheus reads this with its token (Settings → Metrics); off, it is a 404.
+        .route("/metrics", get(crate::metrics::serve))
+        // The web terminal: a WebSocket to a server's shell (where its agent allows it).
+        .route("/api/terminal", get(crate::terminal::open))
         .merge(crate::api::routes())
         .route("/api/{*rest}", get(|| async { not_found() }))
         .fallback(get(asset))
@@ -96,6 +101,8 @@ pub fn router(path: &str, state: AppState) -> Router {
             get(|| async { asset(Uri::from_static("/")).await }),
         )
         .nest(&format!("/{path}"), inner)
+        // The renter's pages: links of their own, outside the secret path.
+        .merge(public)
         .fallback(|| async { not_found() })
         // The front page is served by the outer router, so the headers go on all of it.
         .layer(axum::middleware::from_fn(security_headers))
@@ -333,7 +340,11 @@ async fn serve_connection(
         .timer(TokioTimer::new())
         .keep_alive_interval(Some(Duration::from_secs(30)))
         .keep_alive_timeout(Duration::from_secs(20));
-    if let Err(e) = builder.serve_connection(TokioIo::new(tls), service).await {
+    // With upgrades: the web terminal is a WebSocket.
+    if let Err(e) = builder
+        .serve_connection_with_upgrades(TokioIo::new(tls), service)
+        .await
+    {
         debug!(%peer, error = %e, "connection ended with an error");
     }
 }

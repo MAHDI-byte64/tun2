@@ -13,14 +13,16 @@ use crate::config::random_hex;
 use crate::hub::Hub;
 use crate::manage::valid_name;
 use crate::wire::{
-    Ack, CheckReply, ForwardInfo, PutReply, Request, Spec, SpeedReply, TextReply, TunnelInfo,
+    Ack, CheckReply, DiffReply, ForwardInfo, PutReply, ReloadReply, Request, Spec, SpeedReply,
+    TextReply, TunnelInfo,
 };
 
 /// How long a new tunnel has to connect before it counts as failed.
 pub const CONNECT_WAIT: Duration = Duration::from_secs(30);
 
-/// What the wizard sends: one tunnel, both sides.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// What the wizard sends: one tunnel, both sides. Serialized, it is the copy the panel
+/// keeps of the tunnel ([`crate::specs`]).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PairRequest {
     pub name: String,
     /// Server ids (`local` for the panel's own).
@@ -198,6 +200,116 @@ impl PairRequest {
             }
         }
         self.tls_sni.clone()
+    }
+
+    /// The request that makes a tunnel again from the two specs its servers hold: the
+    /// reverse of [`Self::specs`], for a tunnel made before the panel kept copies. `None`
+    /// when the specs are not a pair (different names, modes or transports) or lack what a
+    /// request needs. A tunnel over a private network keeps its addresses, not the
+    /// network, and a spoof tunnel's accepting side gets its peer from the dialing server
+    /// again at each create.
+    pub fn from_specs(
+        name: &str,
+        entry_id: &str,
+        exit_id: &str,
+        entry: &Spec,
+        exit: &Spec,
+    ) -> Option<Self> {
+        if entry.name != name
+            || exit.name != name
+            || entry.mode != exit.mode
+            || entry.transport != exit.transport
+        {
+            return None;
+        }
+        let reverse = entry.mode == "reverse";
+        let (acc, dia) = if reverse {
+            (entry, exit)
+        } else {
+            (exit, entry)
+        };
+        let listen = acc.listen.clone()?;
+        let dial = dia.remote.clone()?;
+        let real_cert = acc.tls_cert.is_some() && acc.tls_key.is_some();
+        let either = |a: &Option<String>, b: &Option<String>| a.clone().or_else(|| b.clone());
+        let spoof = (entry.transport == "spoof").then(|| {
+            let (e, x) = (
+                entry.spoof.clone().unwrap_or_default(),
+                exit.spoof.clone().unwrap_or_default(),
+            );
+            crate::wire::SpoofSpec {
+                shape: e.shape.or(x.shape),
+                pool: Vec::new(),
+                entry_pool: e.pool,
+                exit_pool: x.pool,
+                peer: None,
+                manage_firewall: e.manage_firewall.or(x.manage_firewall),
+            }
+        });
+        let helper = matches!(entry.transport.as_str(), "naive" | "xhttp" | "reality").then(|| {
+            let (a, d) = (
+                acc.helper.clone().unwrap_or_default(),
+                dia.helper.clone().unwrap_or_default(),
+            );
+            crate::wire::HelperSpec {
+                binary: a.binary.or(d.binary),
+                username: a.username.or(d.username),
+                password: a.password.or(d.password),
+                uuid: a.uuid.or(d.uuid),
+                path: a.path.or(d.path),
+                server_name: a.server_name.or(d.server_name),
+                host: a.host.or(d.host),
+                short_id: a.short_id.or(d.short_id),
+                private_key: a.private_key,
+                target: a.target,
+                certificate: a.certificate,
+                key: a.key,
+                public_key: d.public_key,
+                ca_file: d.ca_file,
+            }
+        });
+        let l3 = entry.l3.as_ref().or(exit.l3.as_ref());
+        // The auto-picked `10.10.N.0/30` block: its N, when the address is one of those.
+        let l3_net = l3
+            .and_then(|l| l.local_ip.as_deref())
+            .and_then(|ip| ip.strip_prefix("10.10.")?.split('.').next()?.parse().ok());
+        Some(Self {
+            name: name.to_owned(),
+            entry: entry_id.to_owned(),
+            exit: exit_id.to_owned(),
+            mode: entry.mode.clone(),
+            transport: entry.transport.clone(),
+            profile: either(&entry.profile, &exit.profile),
+            listen,
+            dial,
+            pool: entry.pool.or(exit.pool),
+            ws_path: either(&entry.ws_path, &exit.ws_path),
+            ws_host: either(&entry.ws_host, &exit.ws_host),
+            tls_sni: if real_cert { None } else { dia.tls_sni.clone() },
+            mux: entry.mux.clone().or_else(|| exit.mux.clone()),
+            encryption: entry.encryption.clone(),
+            quic_obfs: entry.quic_obfs || exit.quic_obfs,
+            max_conns_per_ip: entry.max_conns_per_ip,
+            udp_max_flows: entry.udp_max_flows,
+            proxy_protocol: entry.proxy_protocol.clone(),
+            tls_cert: real_cert.then(|| acc.tls_cert.clone()).flatten(),
+            tls_key: real_cert.then(|| acc.tls_key.clone()).flatten(),
+            tls_host: real_cert.then(|| dia.tls_sni.clone()).flatten(),
+            forwards: entry.forwards.clone(),
+            rotate: false,
+            network: None,
+            stealth: entry.stealth.clone().or_else(|| exit.stealth.clone()),
+            faketcp: entry.faketcp.clone().or_else(|| exit.faketcp.clone()),
+            icmp: entry.icmp.clone().or_else(|| exit.icmp.clone()),
+            spoof,
+            helper,
+            l3_carrier: l3.map(|l| l.carrier.clone()),
+            l3_layer: l3.and_then(|l| l.layer),
+            l3_net,
+            l3_gre_key: l3.and_then(|l| l.gre_key),
+            l3_mtu: l3.and_then(|l| l.mtu),
+            quota: None,
+        })
     }
 
     /// The server that accepts the tunnel's connections, and the one that dials.
@@ -563,6 +675,27 @@ const TRANSPORTS_SINCE: &str = "2.7.0";
 /// spoof tester.
 const SPOOF_SINCE: &str = "2.9.0";
 
+/// The first release whose daemon counts an l3 tunnel's bytes, so it can have a limit.
+pub const L3_COUNTS_SINCE: &str = "2.10.0";
+
+/// A server's agent version as the hub last saw it; empty for one it does not know.
+pub fn server_version(hub: &Hub, id: &str) -> String {
+    hub.snapshot()
+        .ok()
+        .into_iter()
+        .flatten()
+        .find(|s| s.id == id)
+        .map(|s| s.version)
+        .unwrap_or_default()
+}
+
+/// Keeps the panel's copy of a tunnel that was just made or edited ([`crate::specs`]).
+fn keep_copy(hub: &Hub, req: &PairRequest) {
+    if let Err(e) = crate::specs::keep(&hub.db, req, "panel") {
+        tracing::warn!(tunnel = %req.name, error = %format!("{e:#}"), "the tunnel's settings could not be kept");
+    }
+}
+
 /// Whether `version` is `min` or a later release, prereleases in their order
 /// (`2.6.0-beta.3` is before `2.6.0-beta.4`, which is before `2.6.0`). One that cannot be
 /// read counts as too old.
@@ -863,9 +996,12 @@ fn describe(check: &CheckReply) -> String {
 pub fn create(hub: &Arc<Hub>, req: PairRequest) -> Result<String> {
     req.validate()?;
     if let Some(q) = &req.quota {
-        crate::quota::check(q.limit_bytes, q.reset_day)?;
-        // An l3 tunnel counts no bytes: a limit on it would never be reached.
-        if req.transport == "l3" {
+        crate::quota::check(q.limit_bytes, q.reset_day, q.expires_at())?;
+        // An l3 tunnel's bytes are counted from 2.10.0: on an older entry a limit would
+        // never be reached.
+        if req.transport == "l3"
+            && !release_at_least(&server_version(hub, &req.entry), L3_COUNTS_SINCE)
+        {
             bail!("bad_input");
         }
     }
@@ -878,7 +1014,10 @@ pub fn create(hub: &Arc<Hub>, req: PairRequest) -> Result<String> {
         let mut made_link = None;
         let outcome = run_create(&hub, &op, &req, &mut made_link).await;
         match outcome {
-            Ok(()) => hub.ops.finish(&op, None, None),
+            Ok(()) => {
+                keep_copy(&hub, &req);
+                hub.ops.finish(&op, None, None)
+            }
             Err((error, undone)) => {
                 if let Some(link) = made_link {
                     crate::netops::tear_down(&hub, &link).await;
@@ -1031,8 +1170,13 @@ async fn run_create(
             ops.end(op, true, None);
             // The limit the wizard asked for, from the first byte.
             if let Some(q) = &req.quota {
-                if let Err(e) = crate::quota::write(&hub.db, &req.name, q.limit_bytes, q.reset_day)
-                {
+                if let Err(e) = crate::quota::write(
+                    &hub.db,
+                    &req.name,
+                    q.limit_bytes,
+                    q.reset_day,
+                    q.expires_at(),
+                ) {
                     tracing::warn!(tunnel = %req.name, error = %format!("{e:#}"), "the new tunnel's traffic limit could not be set");
                 }
             }
@@ -1066,7 +1210,10 @@ pub fn edit(hub: &Arc<Hub>, req: PairRequest) -> Result<String> {
         // A link made for this edit goes again if the edit cannot be made.
         let mut made_link = None;
         match run_edit(&hub, &op, &req, &mut made_link).await {
-            Ok(()) => hub.ops.finish(&op, None, None),
+            Ok(()) => {
+                keep_copy(&hub, &req);
+                hub.ops.finish(&op, None, None)
+            }
             Err((error, undone)) => {
                 if let Some(link) = made_link {
                     crate::netops::tear_down(&hub, &link).await;
@@ -1143,9 +1290,31 @@ async fn run_edit(
     }
 
     let [first, second] = req.acceptor_first();
-    let mut pin = None;
-    let mut changed: Vec<&str> = Vec::new();
+    // The dialing side's pin stays what it is when the listening side is not written.
+    let pin_before = before
+        .iter()
+        .find(|(server, _)| server == second)
+        .and_then(|(_, spec)| spec.tls_pin.clone());
+    // Without a new token, the sides are asked what the new settings change: a side whose
+    // file would come out the same is left alone, and an entry that differs only in its
+    // forward rules takes them on a reload instead of a restart, so its users' connections
+    // stay up. An agent older than the reload answers neither question, which reads as
+    // "write it and restart", as before.
+    let plan = if token.is_none() {
+        plan_edit(hub, req, pin_before.as_deref()).await
+    } else {
+        EditPlan::default()
+    };
+    let mut pin = if plan.untouched(first) {
+        pin_before
+    } else {
+        None
+    };
+    let mut changed: Vec<(&str, bool)> = Vec::new();
     for (i, server) in [first, second].into_iter().enumerate() {
+        if plan.untouched(server) {
+            continue;
+        }
         let (entry_spec, exit_spec) = req.specs(token.as_deref(), pin.as_deref());
         let spec = if server == req.entry {
             entry_spec
@@ -1159,7 +1328,7 @@ async fn run_edit(
                 if i == 0 {
                     pin = p;
                 }
-                changed.push(server);
+                changed.push((server, plan.reloads(req, server)));
                 ops.end(op, true, None);
             }
             Err(e) => {
@@ -1170,6 +1339,31 @@ async fn run_edit(
     }
     for server in [first, second] {
         let role = if server == req.entry { "entry" } else { "exit" };
+        if plan.untouched(server) {
+            // Left as it was; brought up only when it is down (an edit leaves the tunnel
+            // running, as it always has).
+            if is_active(hub, server, &req.name).await {
+                continue;
+            }
+        } else if plan.reloads(req, server) {
+            ops.run(op, "reload_entry");
+            match reload_entry(hub, server, &req.name).await {
+                Ok(Reloaded::Applied(report)) => {
+                    ops.end(op, true, Some(report.to_string()));
+                    continue;
+                }
+                // The daemon will not (older than the reload, or not running): a restart
+                // does it, as before.
+                Ok(Reloaded::Refused(reason)) => {
+                    tracing::info!(tunnel = %req.name, %reason, "the entry's daemon did not take the reload; restarting it");
+                    ops.end(op, true, Some(reason));
+                }
+                Err(e) => {
+                    let undone = restore(hub, &before, &changed, token.is_some()).await;
+                    return Err((step_fail(ops, e), undone));
+                }
+            }
+        }
         ops.run(op, &format!("start_{role}"));
         match run_again(hub, server, &req.name).await {
             Ok(()) => ops.end(op, true, None),
@@ -1192,17 +1386,129 @@ async fn run_edit(
     }
 }
 
-/// Puts the earlier settings back and restarts. A new token cannot be put back (the panel
-/// never keeps tokens), so a failed rotation is reported as not undone.
-async fn restore(hub: &Hub, before: &[(String, Spec)], changed: &[&str], rotated: bool) -> bool {
+/// Puts the earlier settings back on the sides that were written (`changed`: each with
+/// whether it was to take them on a reload, which the way back uses too) and restarts the
+/// rest. A new token cannot be put back (the panel never keeps tokens), so a failed
+/// rotation is reported as not undone.
+async fn restore(
+    hub: &Hub,
+    before: &[(String, Spec)],
+    changed: &[(&str, bool)],
+    rotated: bool,
+) -> bool {
     let mut all = !rotated;
     for (server, spec) in before {
-        if changed.contains(&server.as_str()) {
-            all &= put(hub, server, spec.clone()).await.is_ok();
-            all &= run_again(hub, server, &spec.name).await.is_ok();
-        }
+        let Some((_, by_reload)) = changed.iter().find(|(s, _)| *s == server.as_str()) else {
+            continue;
+        };
+        all &= put(hub, server, spec.clone()).await.is_ok();
+        all &= if *by_reload {
+            reload_or_restart(hub, server, &spec.name).await.is_ok()
+        } else {
+            run_again(hub, server, &spec.name).await.is_ok()
+        };
     }
     all
+}
+
+/// What an edit leaves alone and what it reloads, from what the two sides say the new
+/// settings change ([`Request::TunnelDiff`]).
+#[derive(Default)]
+struct EditPlan {
+    /// Sides whose file would come out the same: neither written nor restarted.
+    same: Vec<String>,
+    /// The entry differs only in its forward rules (or its limits): written, then told to
+    /// read the file again instead of restarted.
+    reload_entry: bool,
+}
+
+impl EditPlan {
+    fn untouched(&self, server: &str) -> bool {
+        self.same.iter().any(|s| s == server)
+    }
+
+    fn reloads(&self, req: &PairRequest, server: &str) -> bool {
+        self.reload_entry && server == req.entry
+    }
+}
+
+async fn plan_edit(hub: &Hub, req: &PairRequest, pin_before: Option<&str>) -> EditPlan {
+    let mut plan = EditPlan::default();
+    let (entry_spec, exit_spec) = req.specs(None, pin_before);
+    for (server, spec) in [(&req.entry, entry_spec), (&req.exit, exit_spec)] {
+        match hub
+            .ask_as::<DiffReply>(server, &Request::TunnelDiff { spec })
+            .await
+        {
+            Ok(d) if d.ok && d.same => plan.same.push(server.clone()),
+            Ok(d) if d.ok && d.reloadable && server == &req.entry => plan.reload_entry = true,
+            Ok(d) => tracing::debug!(
+                server,
+                error = ?d.error,
+                "the edit writes this side and restarts it"
+            ),
+            Err(e) => tracing::debug!(
+                server,
+                error = %e,
+                "the edit writes this side and restarts it"
+            ),
+        }
+    }
+    plan
+}
+
+/// Whether the tunnel's service runs on `server` right now (asked, not read from the last
+/// snapshot). One that cannot be asked reads as running.
+async fn is_active(hub: &Hub, server: &str, name: &str) -> bool {
+    match hub
+        .ask_as::<Vec<TunnelInfo>>(server, &Request::Tunnels)
+        .await
+    {
+        Ok(tunnels) => tunnels
+            .iter()
+            .find(|t| t.name == name)
+            .is_some_and(|t| t.active != Some(false)),
+        Err(_) => true,
+    }
+}
+
+/// How a reload was answered.
+enum Reloaded {
+    /// Applied: the daemon's report (what it added, removed and changed).
+    Applied(kariz::control::ReloadReport),
+    /// The daemon (or an agent older than the reload) will not, and says why. A restart
+    /// does it instead.
+    Refused(String),
+}
+
+/// Tells a written entry to apply its new forward rules. A rule whose port could not be
+/// bound fails the step (the rest of the reload stands; the way back undoes it).
+async fn reload_entry(hub: &Hub, server: &str, name: &str) -> Result<Reloaded, String> {
+    let r: ReloadReply = hub
+        .ask_as(
+            server,
+            &Request::TunnelReload {
+                name: name.to_owned(),
+            },
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    match (r.ok, r.report) {
+        (true, Some(report)) if report.failed.is_empty() => Ok(Reloaded::Applied(report)),
+        (true, Some(report)) => Err(report.to_string()),
+        (true, None) => Err("the reload was not reported".into()),
+        (false, _) => Ok(Reloaded::Refused(
+            r.error.unwrap_or_else(|| "refused".into()),
+        )),
+    }
+}
+
+/// Reloads a written entry, or restarts it when its daemon will not.
+async fn reload_or_restart(hub: &Hub, server: &str, name: &str) -> Result<(), String> {
+    match reload_entry(hub, server, name).await? {
+        Reloaded::Applied(_) => Ok(()),
+        Reloaded::Refused(_) => run_again(hub, server, name).await,
+    }
 }
 
 /// Runs a tunnel with the settings just written: enabled (a tunnel that was stopped, and so
@@ -1358,13 +1664,14 @@ async fn run_delete(hub: &Hub, op: &str, name: &str) -> Result<(), String> {
             }
         }
     }
-    // A tunnel that is gone needs no automatic restart, and no traffic limit.
+    // A tunnel that is gone needs no automatic restart, no traffic limit, and no copy.
     if failed.is_none() {
         let _ = hub.db.conn().execute(
             "DELETE FROM schedules WHERE kind = 'tunnel' AND subject = ?1",
             [name],
         );
         crate::quota::forget(&hub.db, name);
+        let _ = crate::specs::forget(&hub.db, name);
     }
     failed.map_or(Ok(()), Err)
 }
@@ -1569,6 +1876,74 @@ mod tests {
         assert!(version_at_least("2.0.0-rc1", min) && version_at_least("1.5.0-dev", min));
         assert!(!version_at_least("1.4.0", min) && !version_at_least("1.4.99", min));
         assert!(!version_at_least("", min) && !version_at_least("unknown", min));
+    }
+
+    /// The specs of a request's two sides give the request back.
+    #[test]
+    fn a_request_comes_back_from_the_specs_of_its_two_sides() {
+        let mut req = PairRequest {
+            name: "t".into(),
+            entry: "a".into(),
+            exit: "b".into(),
+            mode: "reverse".into(),
+            transport: "tcpmux".into(),
+            profile: Some("throughput".into()),
+            listen: "0.0.0.0:3080".into(),
+            dial: "198.51.100.7:3080".into(),
+            mux: Some(crate::wire::MuxSpec {
+                connections: Some(4),
+                ..Default::default()
+            }),
+            encryption: Some("chacha20-poly1305".into()),
+            max_conns_per_ip: Some(20),
+            udp_max_flows: Some(500),
+            proxy_protocol: Some("v2".into()),
+            forwards: vec![
+                ForwardInfo {
+                    listen: "0.0.0.0:443".into(),
+                    target: "127.0.0.1:443".into(),
+                    protocol: "tcp".into(),
+                },
+                ForwardInfo {
+                    listen: "0.0.0.0:53".into(),
+                    target: "127.0.0.1:53".into(),
+                    protocol: "udp".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        for (mode, transport) in [("reverse", "tcpmux"), ("direct", "kcp"), ("direct", "wss")] {
+            req.mode = mode.into();
+            req.transport = transport.into();
+            req.tls_sni = (transport == "wss").then(|| "www.example.com".to_owned());
+            let (entry, exit) = req.specs(None, Some("pin"));
+            let back = PairRequest::from_specs("t", "a", "b", &entry, &exit)
+                .unwrap_or_else(|| panic!("{mode} {transport}"));
+            let (entry_again, exit_again) = back.specs(None, Some("pin"));
+            assert_eq!(entry, entry_again, "{mode} {transport}");
+            assert_eq!(exit, exit_again, "{mode} {transport}");
+            assert_eq!(back.max_conns_per_ip, Some(20));
+            assert_eq!(back.forwards.len(), 2);
+        }
+        // A real certificate on the listening side: its files and the name it was issued for.
+        req.mode = "direct".into();
+        req.transport = "wss".into();
+        req.tls_sni = None;
+        req.tls_cert = Some("/etc/kariz/t.crt".into());
+        req.tls_key = Some("/etc/kariz/t.key".into());
+        req.tls_host = Some("tunnel.example.com".into());
+        let (entry, exit) = req.specs(None, None);
+        let back = PairRequest::from_specs("t", "a", "b", &entry, &exit).unwrap();
+        assert_eq!(back.tls_host.as_deref(), Some("tunnel.example.com"));
+        assert_eq!(back.specs(None, None), (entry, exit));
+        // Not a pair.
+        let (entry, _) = req.specs(None, None);
+        let (_, other) = {
+            let mut r = req.clone();
+            r.transport = "kcp".into();
+            r.specs(None, None)
+        };
+        assert!(PairRequest::from_specs("t", "a", "b", &entry, &other).is_none());
     }
 
     #[test]

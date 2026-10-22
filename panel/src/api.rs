@@ -51,6 +51,9 @@ pub fn routes() -> Router<AppState> {
         .route("/api/quotas", get(quotas_list).post(quota_set))
         .route("/api/quotas/delete", post(quota_delete))
         .route("/api/quotas/reset", post(quota_reset))
+        .route("/api/quotas/extend", post(quota_extend))
+        .route("/api/quotas/share", post(quota_share))
+        .route("/api/quotas/share/delete", post(quota_share_delete))
         // A tunnel with many ports is a bigger body than the other calls take.
         .route(
             "/api/tunnels/check",
@@ -66,6 +69,9 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/tunnels/control", post(tunnel_control))
         .route("/api/tunnels/delete", post(tunnel_delete))
+        .route("/api/tunnels/specs", get(tunnel_specs))
+        .route("/api/tunnels/specs/delete", post(tunnel_spec_forget))
+        .route("/api/tunnels/recreate", post(tunnel_recreate))
         .route("/api/op", get(op_status))
         .route("/api/ports", get(server_ports))
         .route("/api/tunnel", get(tunnel_spec))
@@ -106,6 +112,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/telegram/chats/remove", post(telegram_remove_chat))
         .route("/api/telegram/test", post(telegram_test))
         .route("/api/proxy", get(proxy_get).post(proxy_set))
+        .route("/api/metrics", get(metrics_get).post(metrics_set))
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
@@ -164,7 +171,11 @@ fn set_cookie(token: &str, max_age: i64) -> HeaderValue {
 
 /// The signed-in session of a request. With `csrf`, the request must also carry the
 /// session's CSRF value.
-fn authenticate(state: &AppState, headers: &HeaderMap, csrf: bool) -> Result<Session, Response> {
+pub(crate) fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+    csrf: bool,
+) -> Result<Session, Response> {
     let token = cookie_value(headers, COOKIE)
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "signed_out"))?;
     let session = auth::find_session(&state.db, &token, auth::now())
@@ -1260,6 +1271,101 @@ async fn quota_reset(
 }
 
 #[derive(Deserialize)]
+struct ExtendBody {
+    name: String,
+    days: i64,
+}
+
+/// Moves a limit's end further; a tunnel the end had stopped goes on.
+async fn quota_extend(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<ExtendBody>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::quota::extend(&state.hub, &body.name, body.days) {
+        Ok(true) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!(
+                    "extended the traffic limit of tunnel {} by {} days",
+                    body.name, body.days
+                ),
+            );
+            reply(StatusCode::OK, json!({}))
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
+        Err(e) if format!("{e:#}") == "bad_input" => error(StatusCode::BAD_REQUEST, "bad_input"),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ShareBody {
+    name: String,
+    #[serde(default)]
+    title: String,
+}
+
+/// Makes (or makes again, with a new link) the renter's page of a tunnel with a limit.
+async fn quota_share(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<ShareBody>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::share::make(&state.db, &body.name, &body.title) {
+        Ok(Some(share)) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!("made a renter's page for tunnel {}", body.name),
+            );
+            reply(StatusCode::OK, json!(crate::share::ShareView::from(share)))
+        }
+        Ok(None) => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
+        Err(e) if format!("{e:#}") == "bad_input" => error(StatusCode::BAD_REQUEST, "bad_input"),
+        Err(e) => internal(e),
+    }
+}
+
+async fn quota_share_delete(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<QuotaKey>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::share::revoke(&state.db, &body.name) {
+        Ok(true) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!("revoked the renter's page of tunnel {}", body.name),
+            );
+            reply(StatusCode::OK, json!({}))
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
 struct ScheduleKey {
     kind: String,
     subject: String,
@@ -1503,6 +1609,136 @@ async fn tunnel_delete(
         }
         Err(e) => pair_error(e),
     }
+}
+
+/// The copies of the tunnels' settings the panel keeps ([`crate::specs`]).
+async fn tunnel_specs(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&state, &headers, false) {
+        return r;
+    }
+    match crate::specs::list(&state.hub) {
+        Ok(specs) => reply(StatusCode::OK, json!({ "specs": specs })),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecreateBody {
+    name: String,
+    #[serde(default)]
+    entry: Option<String>,
+    #[serde(default)]
+    exit: Option<String>,
+}
+
+/// Makes a tunnel again from its kept copy (a create, as an operation).
+async fn tunnel_recreate(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<RecreateBody>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::specs::recreate(
+        &state.hub,
+        &body.name,
+        body.entry.as_deref(),
+        body.exit.as_deref(),
+    ) {
+        Ok(op) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!("made tunnel {} again from its kept settings", body.name),
+            );
+            reply(StatusCode::ACCEPTED, json!({ "op": op }))
+        }
+        Err(e) if format!("{e:#}") == "no_copy" => error(StatusCode::NOT_FOUND, "no_copy"),
+        Err(e) => pair_error(e),
+    }
+}
+
+async fn tunnel_spec_forget(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<NameBody>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::specs::forget(&state.hub.db, &body.name) {
+        Ok(true) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!("forgot the kept settings of tunnel {}", body.name),
+            );
+            reply(StatusCode::OK, json!({}))
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no_copy"),
+        Err(e) => internal(e),
+    }
+}
+
+/// Settings → Metrics: whether the Prometheus endpoint is on, and its token.
+async fn metrics_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&state, &headers, false) {
+        return r;
+    }
+    let s = crate::metrics::Settings::load(&state.db);
+    reply(
+        StatusCode::OK,
+        json!({ "enabled": s.enabled, "token": s.token }),
+    )
+}
+
+#[derive(Deserialize)]
+struct MetricsBody {
+    /// `enable`, `disable` or `regenerate` (a new token).
+    action: String,
+}
+
+async fn metrics_set(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<MetricsBody>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut s = crate::metrics::Settings::load(&state.db);
+    let done = match body.action.as_str() {
+        "enable" => s.enable().map(|()| "switched the metrics endpoint on"),
+        "disable" => {
+            s.enabled = false;
+            Ok("switched the metrics endpoint off")
+        }
+        "regenerate" => s
+            .regenerate()
+            .map(|()| "made a new token for the metrics endpoint"),
+        _ => return error(StatusCode::BAD_REQUEST, "bad_input"),
+    };
+    let what = match done {
+        Ok(what) => what,
+        Err(e) => return internal(e),
+    };
+    if let Err(e) = s.save(&state.db) {
+        return internal(e);
+    }
+    audit(&state, &format!("session {}", me.id), &ip_of(&peer), what);
+    reply(
+        StatusCode::OK,
+        json!({ "enabled": s.enabled, "token": s.token }),
+    )
 }
 
 #[derive(Deserialize)]

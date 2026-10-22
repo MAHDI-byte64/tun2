@@ -1,5 +1,88 @@
 # Changelog
 
+## 2.10.0 - 2026-10-22
+
+### Added
+
+- **Benchmarks you can run.** `scripts/bench.sh run <label>` measures every transport
+  (`tcpmux`, `kcp`, `wss`, `quic`) with every profile over emulated paths (a clean 40 ms
+  path, 1% loss, 100 ms with jitter, a 50 Mbit/s bottleneck) and on localhost: one and eight
+  TCP streams, and a UDP flow with its delivered share and delay percentiles; `bench.sh compare
+  a b` puts two runs side by side. The numbers of this release are in
+  [Performance](docs/performance.md#2100-before-and-after).
+- **Faster UDP and KCP.** Datagrams are received and sent in batches (`recvmmsg` /
+  `sendmmsg` on Linux) on the forward path, the KCP carrier and the exit's target sockets, and
+  the per-packet copies on the way are gone. KCP's send window now follows the path: it grows
+  while it is what limits the flow and the round trip stays flat, and comes back down when a
+  queue builds, never below the configured window (`[tunnel.kcp] adaptive = false` keeps it
+  fixed; `send_window` / `recv_window` set the start and the ceiling). On this machine's
+  emulated links the eight-stream KCP throughput roughly doubled on localhost and the
+  gaming profile gained a third; the lossy and narrow paths kept their numbers with better
+  tail latency.
+- **New tuning keys.** `[tuning] udp_socket_buffer` (the UDP socket buffers the profile
+  sets), `tcp_buffer` (`SO_SNDBUF` / `SO_RCVBUF` on tunnel and user sockets) and
+  `tcp_congestion` (`TCP_CONGESTION`, `bbr` for example). Their [reference](docs/configuration.md#tuning).
+- **Port changes without a restart.** A running entry reads its config file again on
+  `kariz reload -c NAME.toml`, `systemctl reload kariz@NAME` or `SIGHUP`, and applies the
+  `[[forward]]` rules: rules that stay keep their listeners and their users' connections,
+  removed ones end, added ones are bound, a retargeted one keeps its port; `max_conns_per_ip`
+  and `udp_max_flows` are applied too; anything else is refused with `restart needed`. The
+  panel uses it: an edit that changes only the forwarded ports (or those limits) is applied to
+  the running entry (*Applying the port changes to the running entry*) and leaves the exit
+  alone; a side whose settings did not change is not touched. Servers older than 2.10.0 are
+  written and restarted as before.
+- **Process mode looks after its tunnels.** Where there is no systemd (`services = "process"`),
+  a tunnel that was started is marked (`NAME.enabled`) and started again when the panel or
+  the agent starts, so an update or a container restart brings the tunnels back; a daemon
+  that exits is started again with backoff; and each daemon's output goes to `NAME.log`
+  beside its config, which the Logs page now shows for such servers.
+- **A copy of every tunnel in the panel.** Each create or edit keeps the settings the
+  wizard sent (never the token); tunnels made earlier are read back from their servers. A
+  tunnel that no server lists any more (a reinstalled server) appears under *Missing from
+  their servers* with **Make again** (from the copy, with a new token, on the same or other
+  servers) and **Forget**. The copies are in backups. API: `GET /api/tunnels/specs`,
+  `POST /api/tunnels/recreate`, `POST /api/tunnels/specs/delete`.
+- **l3 (GRE) tunnels count their bytes** (the packets inside the frames, on both sides) and
+  keep them in the traffic file, so they can have a traffic limit when the entry's server
+  runs 2.10.0; `status` lists the link as one `l3` entry of `forwards`.
+- **Live counters per forwarded port** on the tunnel's page: bytes up and down, TCP
+  connections open and total, UDP flows, failed opens and refusals by the per-address limit,
+  with a total row.
+- **Prometheus metrics.** Settings → Metrics switches on `GET /SECRET/metrics` behind a
+  bearer token: the servers' load, every tunnel side's state, round trip, bytes and
+  connections, every forwarded port's counters and the traffic limits. The section writes a
+  scrape config to paste. API: `GET`/`POST /api/metrics`. [Reference](docs/panel.md#metrics).
+- **A traffic limit with an end.** A limit can run for a number of days or until a date, with
+  or without a volume; at the end the panel stops the tunnel until the limit is **extended**
+  (*Extend by N days*), and a notice goes out three days before (events `quota_expiring`,
+  `quota_expired`, `quota_extend`; Telegram too). The days left show beside the usage. API:
+  `days` / `expires_at` in `POST /api/quotas` and in the wizard's `quota`,
+  `POST /api/quotas/extend`.
+- **A page for the renter of a port.** *Make a link* on the *Traffic limit* tab gives a page
+  of its own, outside the panel's secret path (`/s/TOKEN`), with the usage, the days left, the
+  state, the rate over the last day and week, and a **Restart** button (once in five minutes;
+  refused while the limit keeps the tunnel stopped; audited). No server, port or address is
+  shown. API: `POST /api/quotas/share`, `/api/quotas/share/delete`, `GET /s/TOKEN/data`.
+- **A terminal in the browser.** The Logs page opens a shell on any server whose agent
+  allows it (`terminal = true` in `agent.toml`, `panel.toml` for the panel's own server),
+  carried over the agent's link; off everywhere until switched on, audited, one per browser
+  session per server, closed after fifteen idle minutes. [Details](docs/panel.md#terminal).
+
+### Changed
+
+- The KCP windows per profile: the receive window is 4096 for `balanced`, 16384 for
+  `ultraspeed` and 2048 for `gaming` (the send window starts at 1024, 512 for `gaming`, and
+  adapts up to it).
+- `kariz check` prints the new tuning values; the systemd units carry an `ExecReload`.
+- An edit in the panel compares the settings by meaning: a default written out or left out
+  is no change, and the sides that did not change are left running.
+
+### Compatibility
+
+- Everything works with older servers; nothing on the wire changed. A server older than
+  2.10.0 is restarted on every edit (as before), counts no l3 bytes, keeps no process-mode
+  logs and has no terminal. Backups from 2.10.0 restore on 2.10.0 or newer.
+
 ## 2.9.3 - 2026-10-22
 
 ### Fixed

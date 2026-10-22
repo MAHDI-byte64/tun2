@@ -5,7 +5,7 @@ import type { CheckReply, ForwardSpec, PairRequest, ServerInfo } from "./api";
 import { useApp } from "./store";
 import { QuotaFields, emptyQuotaForm, quotaOf } from "./Quota";
 import type { QuotaForm } from "./Quota";
-import { Icon, Seg, useFocusTrap } from "./ui";
+import { Icon, Seg, useFocusTrap, versionAtLeast } from "./ui";
 import { Checklist, opError, useOp } from "./ops";
 import { useNetworks } from "./Networks";
 import { GreChoice, linkBetween } from "./GreChoice";
@@ -205,6 +205,8 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const udp = !spoof && (transport === "quic" || transport === "kcp" || transport === "udp");
   const isWs = !spoof && (transport === "ws" || transport === "wss" || transport === "wsmux" || transport === "wssmux");
   const isL3 = !spoof && transport === "l3";
+  // An l3 tunnel's bytes are counted by an entry of 2.10.0 or newer, so it can have a limit there.
+  const counted = !isL3 || versionAtLeast(servers.find((s) => s.id === entry)?.version ?? "", [2, 10, 0]);
   const rootOnly = ROOT_ONLY.includes(tp) || (isL3 && ["faketcp", "icmp", "proto47"].includes(l3S.carrier));
 
   // The accepting server's address, as the other one reaches it. A new tunnel starts from
@@ -258,7 +260,14 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     helper: helperOf(helperS, transport),
     ...l3Of(l3S, transport),
     forwards: parsed.forwards,
-    quota: isL3 ? undefined : (qtWanted ?? undefined),
+    quota:
+      counted && qtWanted
+        ? {
+            limit_bytes: qtWanted.limit_bytes,
+            reset_day: qtWanted.reset_day,
+            days: qtWanted.days ?? (qtWanted.expires_at ? Math.max(1, Math.ceil((qtWanted.expires_at - Date.now() / 1000) / 86400)) : undefined),
+          }
+        : undefined,
   });
 
   const problem = (s: number): string => {
@@ -746,7 +755,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                     })}
                   </div>
                 )}
-                {!opId && !isL3 && (
+                {!opId && counted && (
                   <div className="field wz-quota">
                     <label className="check">
                       <input type="checkbox" id="wz-quota" checked={qtOn} onChange={(e) => setQtOn(e.target.checked)} /> {t("wz.quota")}

@@ -470,6 +470,7 @@ fn serve(config: Config, config_path: &std::path::Path) -> Result<()> {
             config.services.services(&config.kariz_dir),
             config.data_dir.clone(),
         );
+        hub.allow_terminal(config.terminal);
         // Where updating finds its releases and the programs it replaces.
         hub.set_update_settings(kariz_panel::updater::UpdateSettings {
             api: config

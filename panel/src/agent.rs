@@ -55,6 +55,9 @@ pub struct AgentConfig {
     /// Reverse: listen here for the panel (`0.0.0.0:PORT`) instead of dialing `panel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
+    /// The panel may open a terminal (a root shell) on this server. Off unless set here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
 }
 
 fn default_kariz_dir() -> PathBuf {
@@ -75,6 +78,7 @@ impl AgentConfig {
             release_key: None,
             transport: code.x.clone(),
             listen: code.l.clone(),
+            terminal: false,
         }
     }
 
@@ -235,6 +239,24 @@ impl Agent {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Whether the panel may open a terminal here (the panel's own server takes it from
+    /// `panel.toml`).
+    pub fn allow_terminal(&self, on: bool) {
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal = on;
+    }
+
+    /// A terminal on this server, in process (the panel's own server): one end of a pipe
+    /// whose other end the shell is served on.
+    pub fn open_shell(&self, cols: u16, rows: u16) -> crate::terminal::Pipe {
+        let (mine, theirs) = crate::terminal::pipe();
+        let allowed = self.config().terminal;
+        tokio::spawn(crate::terminal::serve_stream(theirs, cols, rows, allowed));
+        mine
     }
 
     /// Starts a speed test in the background; its id comes back at once.
@@ -426,10 +448,23 @@ impl Agent {
                     }),
                 }
             }
+            Request::TunnelDiff { spec } => {
+                let dir = self.config().kariz_dir;
+                to_json(&manage::diff(&dir, &spec))
+            }
+            Request::TunnelReload { name } => {
+                let dir = self.config().kariz_dir;
+                to_json(&manage::reload(&dir, &name).await)
+            }
             Request::TunnelDelete { name } => {
                 let dir = self.config().kariz_dir;
                 ack(manage::delete(&dir, &*self.services, &name).await)
             }
+            // Served on its own stream (see `serve_with`); never answered here.
+            Request::Shell { .. } => to_json(&Ack {
+                ok: false,
+                error: Some("a terminal needs a stream of its own".into()),
+            }),
             Request::TunnelCtl { name, action } => ack(self.services.ctl(name, action).await),
             Request::Ports => to_json(
                 &tokio::task::spawn_blocking(manage::ports)
@@ -495,7 +530,10 @@ impl Agent {
                 data,
             } => ack(self.update.chunk(&version, &name, offset, &data)),
             Request::UpdateApply { version } => ack(self.update.apply(&version)),
-            Request::Logs { name, lines } => to_json(&manage::logs(&name, lines).await),
+            Request::Logs { name, lines } => match self.services.logs(name.clone(), lines).await {
+                Some(kept) => to_json(&kept),
+                None => to_json(&manage::logs(&name, lines).await),
+            },
             Request::Speedtest {
                 name,
                 seconds,
@@ -584,6 +622,14 @@ impl Agent {
             }
             let agent = self.clone();
             tokio::spawn(async move {
+                // A terminal keeps its stream: the shell's bytes go both ways on it.
+                if let Ok(Request::Shell { cols, rows }) = serde_json::from_slice::<Request>(&syn) {
+                    if syn.len() <= MAX_REQUEST {
+                        let allowed = agent.config().terminal;
+                        crate::terminal::serve_stream(stream, cols, rows, allowed).await;
+                        return;
+                    }
+                }
                 let reply = match serde_json::from_slice::<Request>(&syn) {
                     Ok(request) if syn.len() <= MAX_REQUEST => {
                         // A request that panics is answered with an error (and logged), not
@@ -649,6 +695,9 @@ impl Agent {
                 "the agent has no join code and no identity: run `kariz-panel agent --join CODE`"
             );
         }
+        // The tunnels run as child processes come back with the agent (nothing to do under
+        // systemd).
+        tokio::spawn(self.services.clone().supervise());
         // The private network links this server had come back with the agent.
         for (name, result) in self.net.restore().await {
             match result {

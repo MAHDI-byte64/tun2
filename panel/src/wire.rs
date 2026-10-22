@@ -31,6 +31,14 @@ pub enum Request {
     TunnelPut { spec: Spec },
     /// One tunnel's spec, without its token.
     TunnelGet { name: String },
+    /// Whether this side would change with `spec`: the file the agent would write is
+    /// compared with the one it has. Only an agent of 2.10 or newer knows it; an older
+    /// one answers `unknown request`, which reads as "write it and restart".
+    TunnelDiff { spec: Spec },
+    /// Tell a running entry to read its (just written) config again and apply its forward
+    /// rules without a restart (what `kariz reload` does). Only an agent of 2.10 or newer
+    /// knows it.
+    TunnelReload { name: String },
     /// Stop it, remove its config.
     TunnelDelete { name: String },
     /// `start`, `stop`, `restart`, `enable` or `disable` the tunnel's service.
@@ -139,6 +147,10 @@ pub enum Request {
     },
     /// Everything has been sent: check it, unpack it and swap the programs.
     UpdateApply { version: String },
+    /// A terminal: the stream stays open and carries the shell's bytes both ways (see
+    /// [`crate::terminal`]). Refused with `terminal_off` unless the agent's settings allow
+    /// it. Only an agent of 2.10 or newer knows it.
+    Shell { cols: u16, rows: u16 },
 }
 
 /// A file of a release that is being sent to an agent.
@@ -565,6 +577,33 @@ pub struct PutReply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
+}
+
+/// The answer to `tunnel_diff`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffReply {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The file would come out the same (by value): nothing to write.
+    #[serde(default)]
+    pub same: bool,
+    /// What differs is only what a running entry applies on a reload (the forward rules,
+    /// `max_conns_per_ip`, `udp_max_flows`). Also set when `same`.
+    #[serde(default)]
+    pub reloadable: bool,
+}
+
+/// The answer to `tunnel_reload`: the daemon's report, or why it was not done. A refusal
+/// (`restart needed: …`, `not an entry`, `not running: …`, or an older agent's `unknown
+/// request`) means a restart does it instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadReply {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<kariz::control::ReloadReport>,
 }
 
 /// The answer to `tunnel_check`.

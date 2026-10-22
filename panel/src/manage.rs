@@ -12,7 +12,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use kariz::config::{mode_name, role_name, Config, Role};
 
-use crate::wire::{CheckReply, ForwardInfo, PortOwner, Spec, SpeedReply, TextReply};
+use crate::wire::{
+    CheckReply, DiffReply, ForwardInfo, PortOwner, ReloadReply, Spec, SpeedReply, TextReply,
+};
 
 const PLACEHOLDER_TOKEN: &str = "0000000000000000000000000000000000000000000000000000";
 
@@ -545,6 +547,39 @@ pub fn put(dir: &Path, spec: &Spec) -> Result<Option<String>> {
     Ok(pin)
 }
 
+/// How the file `spec` renders to compares with the one on disk: `same` when they are
+/// equal by value (nothing to write), `reloadable` when they differ only in what a running
+/// entry applies without a restart (see [`Config::same_but_forwards`]). A spec that cannot
+/// be rendered, or a tunnel that is not there, is `ok: false`.
+pub fn diff(dir: &Path, spec: &Spec) -> DiffReply {
+    let failed = |error: String| DiffReply {
+        ok: false,
+        error: Some(error),
+        ..Default::default()
+    };
+    let path = match config_path(dir, &spec.name) {
+        Ok(p) => p,
+        Err(e) => return failed(format!("{e:#}")),
+    };
+    let current = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return failed(format!("failed to read {}: {e}", path.display())),
+    };
+    let (text, _) = match build(dir, spec, true) {
+        Ok(b) => b,
+        Err(e) => return failed(format!("{e:#}")),
+    };
+    // By meaning: the edit page spells a default out (`pool = 8`) where the wizard left it
+    // out, and that is no change.
+    let same = Config::same_as(&current, &text);
+    DiffReply {
+        ok: true,
+        error: None,
+        same,
+        reloadable: same || Config::same_but_forwards(&current, &text).is_ok(),
+    }
+}
+
 /// The spec of an existing tunnel, without its token.
 pub fn get(dir: &Path, name: &str) -> Result<Spec> {
     let path = config_path(dir, name)?;
@@ -701,6 +736,8 @@ pub fn remove_files(dir: &Path, name: &str) -> Result<()> {
         path.with_extension("traffic.tmp"),
         path.with_extension("crt"),
         path.with_extension("key"),
+        path.with_extension("log"),
+        path.with_extension("enabled"),
     ] {
         match std::fs::remove_file(&p) {
             Ok(()) => {}
@@ -1078,6 +1115,17 @@ pub trait Services: Send + Sync {
     fn ctl(&self, name: String, action: String) -> Fut<Result<()>>;
     /// Whether the tunnel runs; `None` when this cannot be known.
     fn active(&self, name: String) -> Fut<Option<bool>>;
+    /// Looks after the tunnels for as long as it runs (spawned once, when the agent or the
+    /// panel starts). Systemd does that itself: nothing to do.
+    fn supervise(self: std::sync::Arc<Self>) -> Fut<()> {
+        Box::pin(async {})
+    }
+    /// The last `lines` of a tunnel's log, when the services keep it themselves; `None`
+    /// means the journal has it (`journalctl -u kariz@NAME`).
+    fn logs(&self, name: String, lines: u32) -> Fut<Option<TextReply>> {
+        let _ = (name, lines);
+        Box::pin(async { None })
+    }
 }
 
 /// The services of a Linux server with systemd: `kariz@NAME`.
@@ -1117,13 +1165,39 @@ impl Services for Systemd {
     }
 }
 
-/// Daemons run as child processes of the agent, for hosts without systemd. They stop
-/// with the agent.
+/// Daemons run as child processes of the agent (or the panel), for hosts without systemd.
+/// They stop with it, and [`Services::supervise`] looks after them: a daemon that exits is
+/// started again (2 s after the first exit, then up to 30 s between tries while it keeps
+/// exiting, back to 2 s once it has run for a minute), and the tunnels that were enabled
+/// (the `NAME.enabled` marker beside the config, made by `enable` and removed by `disable`)
+/// are started when the supervisor starts, so they come back after the agent or the
+/// container restarts. Each daemon's output goes to `NAME.log` beside its config.
 pub struct Processes {
     dir: PathBuf,
     binary: PathBuf,
-    children: std::sync::Mutex<HashMap<String, tokio::process::Child>>,
+    /// Never held across an await.
+    children: std::sync::Mutex<HashMap<String, Slot>>,
+    /// How often the supervisor looks.
+    tick: Duration,
 }
+
+/// A tunnel that is wanted running: its process, or when it is started again.
+struct Slot {
+    child: Option<tokio::process::Child>,
+    /// When the process was started.
+    since: std::time::Instant,
+    /// How long the next start waits after an exit.
+    backoff: Duration,
+    /// When it is started again, after an exit.
+    next: std::time::Instant,
+}
+
+const RESPAWN_MIN: Duration = Duration::from_secs(2);
+const RESPAWN_MAX: Duration = Duration::from_secs(30);
+/// A daemon that ran this long is given the shortest wait again.
+const STABLE: Duration = Duration::from_secs(60);
+/// A daemon's output file is started over, at its next start, once it is this big.
+const LOG_CAP: u64 = 4 * 1024 * 1024;
 
 impl Processes {
     pub fn new(dir: &Path, binary: &Path) -> Self {
@@ -1131,48 +1205,190 @@ impl Processes {
             dir: dir.to_path_buf(),
             binary: binary.to_path_buf(),
             children: std::sync::Mutex::new(HashMap::new()),
+            tick: Duration::from_secs(2),
         }
     }
 
+    #[cfg(test)]
+    fn with_tick(mut self, tick: Duration) -> Self {
+        self.tick = tick;
+        self
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
+        self.children.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Runs the daemon, its output (the log goes to stdout, a crash's message to stderr)
+    /// going to `NAME.log` beside its config.
+    fn spawn(&self, name: &str) -> Result<tokio::process::Child> {
+        let config = config_path(&self.dir, name)?;
+        let log = log_file(&config)?;
+        let errors = log.try_clone().context("failed to open the log twice")?;
+        tokio::process::Command::new(&self.binary)
+            .arg("run")
+            .arg("-c")
+            .arg(config)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(errors))
+            .spawn()
+            .with_context(|| format!("failed to start {}", self.binary.display()))
+    }
+
     fn start(&self, name: &str) -> Result<()> {
-        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(child) = children.get_mut(name) {
+        let mut children = self.lock();
+        if let Some(Slot {
+            child: Some(child), ..
+        }) = children.get_mut(name)
+        {
             if matches!(child.try_wait(), Ok(None)) {
                 return Ok(());
             }
         }
-        let child = tokio::process::Command::new(&self.binary)
-            .arg("run")
-            .arg("-c")
-            .arg(config_path(&self.dir, name)?)
-            .kill_on_drop(true)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to start {}", self.binary.display()))?;
-        children.insert(name.to_owned(), child);
+        let child = self.spawn(name)?;
+        let now = std::time::Instant::now();
+        children.insert(
+            name.to_owned(),
+            Slot {
+                child: Some(child),
+                since: now,
+                backoff: RESPAWN_MIN,
+                next: now,
+            },
+        );
         Ok(())
     }
 
     fn stop(&self, name: &str) {
-        let child = self
-            .children
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(name);
-        if let Some(mut child) = child {
+        let slot = self.lock().remove(name);
+        if let Some(Slot {
+            child: Some(mut child),
+            ..
+        }) = slot
+        {
             let _ = child.start_kill();
         }
     }
+
+    /// One look: a daemon that exited is noted, and started again once its wait is over.
+    fn look(&self) {
+        let now = std::time::Instant::now();
+        for (name, slot) in self.lock().iter_mut() {
+            if let Some(child) = &mut slot.child {
+                match child.try_wait() {
+                    Ok(None) => {}
+                    Ok(Some(status)) => {
+                        let wait = if now.duration_since(slot.since) >= STABLE {
+                            RESPAWN_MIN
+                        } else {
+                            slot.backoff
+                        };
+                        slot.backoff = (wait * 2).min(RESPAWN_MAX);
+                        slot.next = now + wait;
+                        slot.child = None;
+                        tracing::warn!(
+                            tunnel = %name,
+                            %status,
+                            after = ?wait,
+                            "a tunnel's daemon exited; it is started again"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(tunnel = %name, error = %e, "a tunnel's daemon cannot be looked at")
+                    }
+                }
+            } else if now >= slot.next {
+                match self.spawn(name) {
+                    Ok(child) => {
+                        slot.child = Some(child);
+                        slot.since = now;
+                        tracing::info!(tunnel = %name, "a tunnel's daemon was started again");
+                    }
+                    Err(e) => {
+                        tracing::warn!(tunnel = %name, error = %format!("{e:#}"), "a tunnel's daemon could not be started again");
+                        slot.next = now + slot.backoff;
+                        slot.backoff = (slot.backoff * 2).min(RESPAWN_MAX);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tunnels marked enabled whose config is there, by name.
+    fn enabled(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let file = e.file_name().into_string().ok()?;
+                let name = file.strip_suffix(".enabled")?.to_owned();
+                (valid_name(&name) && self.dir.join(format!("{name}.toml")).is_file())
+                    .then_some(name)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(test)]
+    fn pid(&self, name: &str) -> Option<u32> {
+        self.lock().get(name)?.child.as_ref()?.id()
+    }
+}
+
+/// The marker that says a tunnel in process mode is to run (what systemd's `enable` is).
+fn enabled_marker(dir: &Path, name: &str) -> Result<PathBuf> {
+    Ok(config_path(dir, name)?.with_extension("enabled"))
+}
+
+/// A daemon's output file, beside its config: owner only, appended to, and started over
+/// once it has grown past [`LOG_CAP`].
+fn log_file(config: &Path) -> Result<std::fs::File> {
+    let path = config.with_extension("log");
+    let big = std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_CAP);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true);
+    if big {
+        options.truncate(true);
+    } else {
+        options.append(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))
 }
 
 impl Services for Processes {
     fn ctl(&self, name: String, action: String) -> Fut<Result<()>> {
         let result = ctl_args(&name, &action).and_then(|_| match action.as_str() {
-            "start" | "enable" => self.start(&name),
-            "stop" | "disable" => {
+            "start" => self.start(&name),
+            "enable" => {
+                let marker = enabled_marker(&self.dir, &name)?;
+                std::fs::write(&marker, b"")
+                    .with_context(|| format!("failed to write {}", marker.display()))?;
+                self.start(&name)
+            }
+            "stop" => {
                 self.stop(&name);
                 Ok(())
+            }
+            "disable" => {
+                self.stop(&name);
+                let marker = enabled_marker(&self.dir, &name)?;
+                match std::fs::remove_file(&marker) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(e).with_context(|| format!("failed to remove {}", marker.display()))
+                    }
+                    _ => Ok(()),
+                }
             }
             _ => {
                 self.stop(&name);
@@ -1184,12 +1400,46 @@ impl Services for Processes {
 
     fn active(&self, name: String) -> Fut<Option<bool>> {
         let running = self
-            .children
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .get_mut(&name)
-            .map(|c| matches!(c.try_wait(), Ok(None)));
-        Box::pin(async move { Some(running.unwrap_or(false)) })
+            .and_then(|slot| slot.child.as_mut())
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+        Box::pin(async move { Some(running) })
+    }
+
+    fn supervise(self: std::sync::Arc<Self>) -> Fut<()> {
+        Box::pin(async move {
+            for name in self.enabled() {
+                match self.start(&name) {
+                    Ok(()) => tracing::info!(tunnel = %name, "an enabled tunnel was started"),
+                    Err(e) => {
+                        tracing::warn!(tunnel = %name, error = %format!("{e:#}"), "an enabled tunnel could not be started")
+                    }
+                }
+            }
+            loop {
+                tokio::time::sleep(self.tick).await;
+                self.look();
+            }
+        })
+    }
+
+    fn logs(&self, name: String, lines: u32) -> Fut<Option<TextReply>> {
+        let reply = match config_path(&self.dir, &name) {
+            Ok(config) => {
+                let text =
+                    std::fs::read_to_string(config.with_extension("log")).unwrap_or_default();
+                let all: Vec<&str> = text.lines().collect();
+                let keep = lines.clamp(1, 1000) as usize;
+                TextReply {
+                    ok: true,
+                    error: None,
+                    text: all[all.len().saturating_sub(keep)..].join("\n"),
+                }
+            }
+            Err(e) => text_failed(format!("{e:#}")),
+        };
+        Box::pin(async move { Some(reply) })
     }
 }
 
@@ -1335,6 +1585,42 @@ async fn measure(
     bail!("the speed test needs a Linux server")
 }
 
+/// Tells the tunnel's running daemon to read its config file again and apply its forward
+/// rules (over its control socket, as `kariz reload` does). The file is written first
+/// ([`put`]). The daemon's refusal comes back as the error: `restart needed: …` when more
+/// than the rules changed, `not an entry` for an exit; `not running: …` when it is down.
+pub async fn reload(dir: &Path, name: &str) -> ReloadReply {
+    match try_reload(dir, name).await {
+        Ok(report) => ReloadReply {
+            ok: true,
+            error: None,
+            report: Some(report),
+        },
+        Err(e) => ReloadReply {
+            ok: false,
+            error: Some(format!("{e:#}")),
+            report: None,
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn try_reload(dir: &Path, name: &str) -> Result<kariz::control::ReloadReport> {
+    let config = Config::load(&config_path(dir, name)?)?;
+    let socket = config
+        .control_socket()
+        .context("this tunnel has no control socket")?;
+    let connection = kariz::control::connect(&socket)
+        .await
+        .map_err(|e| anyhow!("not running: {e}"))?;
+    Ok(kariz::control::reload(connection).await?)
+}
+
+#[cfg(not(unix))]
+async fn try_reload(_: &Path, _: &str) -> Result<kariz::control::ReloadReport> {
+    bail!("not running: the reload needs a Linux server")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1399,6 +1685,114 @@ mod tests {
         assert_eq!(got.forwards.len(), 1);
         assert!(got.token.is_none(), "the token is never handed back");
         assert_eq!(existing_token(&d.0.join("main.toml")), Some("a".repeat(48)));
+    }
+
+    /// A stand-in for the `kariz` program: says it started, then runs until it is killed.
+    #[cfg(unix)]
+    fn fake_daemon(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("kariz-fake");
+        std::fs::write(&bin, "#!/bin/sh\necho started >&2\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_mode_brings_enabled_tunnels_back_and_restarts_one_that_exits() {
+        use std::sync::Arc;
+        let d = Dir::new();
+        std::fs::write(d.0.join("t.toml"), "").unwrap();
+        let bin = fake_daemon(&d.0);
+        let tick = Duration::from_millis(100);
+        let p = Arc::new(Processes::new(&d.0, &bin).with_tick(tick));
+        p.ctl("t".into(), "enable".into()).await.unwrap();
+        assert!(d.0.join("t.enabled").exists());
+        assert_eq!(p.active("t".into()).await, Some(true));
+        let pid = p.pid("t").unwrap();
+        let supervisor = tokio::spawn(p.clone().supervise());
+        // Killed from outside: started again (after the first wait), with another pid.
+        assert!(std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let mut again = None;
+        for _ in 0..100 {
+            tokio::time::sleep(tick).await;
+            if let Some(now) = p.pid("t").filter(|now| *now != pid) {
+                again = Some(now);
+                break;
+            }
+        }
+        assert!(again.is_some(), "the daemon was not started again");
+        for _ in 0..20 {
+            if p.logs("t".into(), 10)
+                .await
+                .unwrap()
+                .text
+                .contains("started")
+            {
+                break;
+            }
+            tokio::time::sleep(tick).await;
+        }
+        let logs = p.logs("t".into(), 10).await.unwrap();
+        assert!(logs.ok && logs.text.contains("started"), "{logs:?}");
+        // Stopped by hand: it stays stopped, and stays enabled.
+        p.ctl("t".into(), "stop".into()).await.unwrap();
+        tokio::time::sleep(tick * 5).await;
+        assert_eq!(p.active("t".into()).await, Some(false));
+        assert!(d.0.join("t.enabled").exists());
+        supervisor.abort();
+        // The next agent brings back what is enabled.
+        let p = Arc::new(Processes::new(&d.0, &bin).with_tick(tick));
+        let supervisor = tokio::spawn(p.clone().supervise());
+        for _ in 0..50 {
+            if p.active("t".into()).await == Some(true) {
+                break;
+            }
+            tokio::time::sleep(tick).await;
+        }
+        assert_eq!(p.active("t".into()).await, Some(true));
+        p.ctl("t".into(), "disable".into()).await.unwrap();
+        assert!(!d.0.join("t.enabled").exists());
+        assert_eq!(p.active("t".into()).await, Some(false));
+        supervisor.abort();
+        remove_files(&d.0, "t").unwrap();
+        assert!(!d.0.join("t.log").exists() && !d.0.join("t.toml").exists());
+    }
+
+    #[test]
+    fn a_diff_tells_a_reload_from_a_restart() {
+        let d = Dir::new();
+        put(&d.0, &spec("main")).unwrap();
+        // The same again, without the token (an edit never carries one): nothing to write.
+        let mut same = spec("main");
+        same.token = None;
+        let r = diff(&d.0, &same);
+        assert!(r.ok && r.same && r.reloadable, "{r:?}");
+        // A default spelled out (the edit page sends the pool it read back): the same.
+        let mut spelled = same.clone();
+        spelled.pool = Some(8);
+        spelled.profile = Some("balanced".into());
+        let r = diff(&d.0, &spelled);
+        assert!(r.ok && r.same && r.reloadable, "{r:?}");
+        // Another port: a reload does it.
+        let mut ports = same.clone();
+        ports.forwards[0].listen = "0.0.0.0:8444".into();
+        ports.max_conns_per_ip = Some(10);
+        let r = diff(&d.0, &ports);
+        assert!(r.ok && !r.same && r.reloadable, "{r:?}");
+        // Another transport: a restart.
+        let mut transport = same.clone();
+        transport.transport = "wss".into();
+        transport.tls_cert = None;
+        let r = diff(&d.0, &transport);
+        assert!(r.ok && !r.same && !r.reloadable, "{r:?}");
+        // A tunnel that is not there.
+        let r = diff(&d.0, &spec("other"));
+        assert!(!r.ok, "{r:?}");
     }
 
     #[test]

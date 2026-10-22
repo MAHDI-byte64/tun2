@@ -1444,3 +1444,30 @@ label.sp-opt { display: inline-flex; align-items: center; gap: var(--sp-2); min-
 .qt-state dd { min-width: 0; flex: 1 1 auto; text-align: end; }
 .qt-state dd .qt-bar { margin-top: 0; }
 .qt-block .banner.small { margin-bottom: var(--sp-3); }
+
+/* The tunnel page's ports table with the entry's live counters: numbers end-aligned, the total row set apart. */
+.td-fw th.num, .td-fw td.num { text-align: end; white-space: nowrap; }
+.td-fw tfoot td { color: var(--text-2); font-size: var(--fs-xs); background: var(--card-2); border-bottom: 0; }
+
+/* The tunnels the panel keeps a copy of that no server lists: one row each, with its buttons. */
+.ms-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-3); }
+.ms-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
+.ms-what { display: grid; gap: 2px; }
+.ms-pick, .ms-op { margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: var(--hairline) solid var(--line); }
+
+/* Settings > Metrics: the scrape config to paste. */
+.mt-sample { margin: var(--sp-3) 0 0; padding: var(--sp-3); background: var(--card-2); border-radius: var(--r-sm); white-space: pre; overflow-x: auto; max-width: 520px; }
+
+/* A limit's days left beside its bar; the renter's page block on the limit tab. */
+.qt-days { font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; }
+.qt-days.near { color: var(--warn, #f0b35a); }
+.qt-days.over { color: var(--danger, #f06565); }
+.qt-share { margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: var(--hairline) solid var(--line); }
+.qt-share h4 { margin: 0 0 var(--sp-1); font-size: var(--fs-sm); }
+
+/* The Logs page's terminal. */
+.term-card { margin-bottom: var(--sp-4); }
+.term-bar { margin-bottom: var(--sp-3); }
+.term-box { height: 360px; background: #0b0f17; border-radius: var(--r-sm); padding: 6px; overflow: hidden; }
+.term-state.is-open { color: var(--ok, #3ec98a); }
+.term-state.is-opening { color: var(--warn, #f0b35a); }

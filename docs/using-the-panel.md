@@ -70,23 +70,36 @@ step failed and why. You cannot end with half a tunnel.
   **IPv6** address (or the address set for it) to copy it: the chip shows a check and a note says
   what was copied. On a phone each address is a full-width row, easy to hit.
 - **Tunnels:** click a row. You see both sides, live charts of throughput and round trip (1 hour to
-  30 days), and the ports it forwards with their traffic. **Health** says whether a new connection
+  30 days), and the ports it forwards with their traffic (per port: bytes up and down,
+  connections and UDP flows open and total, failed opens, live from the entry). **Health** says whether a new connection
   gets through right now (checked every 15 seconds, the way a user connects) and how many of the
   tunnel's streams are in use; a tunnel that is connected but lets no one through says why, with
   the fix.
+- **Terminal** (top of the Logs page, 2.10.0): a shell on the server you pick, in the browser,
+  as the agent runs (root). Only servers that allow it: `terminal = true` in
+  `/etc/kariz-panel/agent.toml` (`panel.toml` for the panel's own server), then restart the
+  agent. Every open and close is in the audit log ([details](panel.md#terminal)).
 - **Logs:** pick a tunnel and read both sides interleaved by time. Filter by level or text.
 - **Events:** a server going offline, a tunnel losing its connection, and coming back.
+- **Missing from their servers:** under the tunnels, the ones the panel still has a copy of
+  (every create and edit leaves one) that no server lists any more. *Make again* builds one
+  from its copy, with a new token; *Forget* drops the copy ([details](panel.md#make-a-tunnel)).
 
 ## 5. Change, stop, test, delete
 
 Open the tunnel, then:
 
 - **Edit:** the same wizard, filled in. Both sides change together; if they do not connect again,
-  the old settings come back.
+  the old settings come back. A change to the ports alone is applied to the running entry
+  without a restart (2.10.0 or newer on that server), so what is connected stays connected.
 - **Start, stop, restart:** stopping also keeps it stopped at boot.
 - **Speed test:** measures download, upload, latency under load and UDP through the tunnel, for
   the seconds you choose.
 - **New token:** replaces the secret on both sides.
+- **Traffic limit:** a volume, an end date (days or a date), or both; at the limit the panel
+  stops the tunnel until the usage is reset, the limit raised or the end extended. *Make a
+  link* gives whoever rents the port a page of their own with the usage, the days left, the
+  state, the rate and a Restart button ([details](panel.md#traffic-limit)).
 - **Auto restart:** restarts the tunnel by itself, every so many minutes, hours or days or every
   day at a time. The same on a server's card restarts all its running tunnels
   ([details](panel.md#restart-on-a-timer)).
@@ -140,3 +153,10 @@ separate proxy under *Settings, Telegram*.)
 
 [Troubleshooting](panel.md#troubleshooting) lists the usual ones: a server that does not show up,
 a port in use, a tunnel that did not connect, being locked out.
+
+## Metrics for Prometheus
+
+*Settings*, *Metrics (Prometheus)* switches on an address Prometheus can scrape with a token:
+the servers' load, each tunnel's state and bytes, every port's counters and the traffic limits.
+The section shows the address, the token and a scrape config to paste
+([the metrics](panel.md#metrics)).

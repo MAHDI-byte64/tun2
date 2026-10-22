@@ -13,7 +13,8 @@ export default async function globalTeardown() {
     }
     // Some time for the processes to let go of their files before the folder goes.
     await new Promise((r) => setTimeout(r, 1000));
-    fs.rmSync(s.root, { recursive: true, force: true });
+    // KARIZ_E2E_KEEP=1 leaves the panel's folder (its log, the daemons' logs) for a look.
+    if (!process.env.KARIZ_E2E_KEEP) fs.rmSync(s.root, { recursive: true, force: true });
   } finally {
     removeStack();
   }
