@@ -117,7 +117,7 @@ sudo systemctl enable --now kariz
 journalctl -u kariz -f
 ```
 
-این unit فایل `/etc/kariz/config.toml` را می‌خواند، اگر کاریز از کار بیفتد دوباره راهش می‌اندازد و برای پورت‌های زیر ۱۰۲۴ دسترسی لازم را می‌دهد. بعد از تغییری که فقط در قاعده‌های `[[forward]]` باشد، `sudo systemctl reload kariz` آن را بدون قطع چیزی روی ورودیِ در حال اجرا اعمال می‌کند ([جزئیات](configuration.md#بارگذاری-دوبارهٔ-قاعده‌های-forward))؛ هر تغییر دیگری `sudo systemctl restart kariz` می‌خواهد.
+این unit فایل `/etc/kariz/config.toml` را می‌خواند، اگر کاریز از کار بیفتد دوباره راهش می‌اندازد و برای پورت‌های زیر ۱۰۲۴ دسترسی لازم را می‌دهد. بعد از تغییری که فقط در قاعده‌های `[[forward]]` باشد، `sudo systemctl reload kariz` آن را بدون قطع چیزی روی ورودیِ در حال اجرا اعمال می‌کند ([جزئیات](configuration.md#بارگذاری-دوبارهٔ-قاعدههای-forward))؛ هر تغییر دیگری `sudo systemctl restart kariz` می‌خواهد.
 
 ## بعد از این
 
