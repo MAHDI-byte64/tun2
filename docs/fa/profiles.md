@@ -17,6 +17,7 @@ profile = "ultraspeed"            # balanced (default) | ultraspeed | gaming
 | ادغام نوشتن در mux | روشن | روشن | خاموش |
 | Keepalive / ping | 30 s | 30 s | 10 s |
 | KCP FEC | خاموش | خاموش | 10 / 3 |
+| پنجرهٔ ارسال KCP (تطبیقی تا) | 1024 (4096) بسته | 1024 (16384) | 512 (2048) |
 | بافر سوکت UDP | 1 MiB | 4 MiB | 1 MiB |
 | صف جریان UDP | 128 بسته | 512 بسته | 64 بسته |
 | بافر نشست UDP | 256 KiB | 1 MiB | 128 KiB |

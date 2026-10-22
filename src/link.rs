@@ -428,7 +428,8 @@ impl Pending {
 
 /// How a [`Dialer`] connects.
 enum Dialing {
-    Stream(TransportDialer),
+    /// Boxed: a dialer carries the whole `Tuning`, which the QUIC variant does not.
+    Stream(Box<TransportDialer>),
     #[cfg(feature = "quic")]
     Quic(Box<QuicDialer>),
 }
@@ -464,7 +465,7 @@ impl Dialer {
         if let Some(proxy) = proxy {
             dialer.dialing =
                 match dialer.dialing {
-                    Dialing::Stream(d) => Dialing::Stream(d.with_proxy(Some(proxy))?),
+                    Dialing::Stream(d) => Dialing::Stream(Box::new(d.with_proxy(Some(proxy))?)),
                     #[cfg(feature = "quic")]
                     Dialing::Quic(_) => return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -481,18 +482,18 @@ impl Dialer {
         #[cfg(feature = "quic")]
         let dialing = match &common.quic {
             Some(settings) => Dialing::Quic(Box::new(QuicDialer::new(addr, None, settings)?)),
-            None => Dialing::Stream(TransportDialer::new(
+            None => Dialing::Stream(Box::new(TransportDialer::new(
                 &common.settings,
                 addr,
                 &common.tuning,
-            )?),
+            )?)),
         };
         #[cfg(not(feature = "quic"))]
-        let dialing = Dialing::Stream(TransportDialer::new(
+        let dialing = Dialing::Stream(Box::new(TransportDialer::new(
             &common.settings,
             addr,
             &common.tuning,
-        )?);
+        )?));
         Ok(Self { dialing, common })
     }
 

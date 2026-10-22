@@ -250,10 +250,6 @@ mod imp {
             }
         }
 
-        pub(in super::super) async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-            self.recv_segment(buf).await.map(|(n, _)| n)
-        }
-
         pub(in super::super) async fn recv_from(
             &self,
             buf: &mut [u8],

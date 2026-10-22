@@ -568,14 +568,14 @@ impl Batch {
 
     async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         let (mut i, mut offset) = (0, 0);
+        let mut slices = [io::IoSlice::new(&[]); MAX_IOV];
         while i < self.segments.len() {
-            let slices: Vec<io::IoSlice<'_>> = (i..self.segments.len().min(i + MAX_IOV))
-                .map(|k| {
-                    let s = self.segment(k);
-                    io::IoSlice::new(if k == i { &s[offset..] } else { s })
-                })
-                .collect();
-            let mut n = writer.write_vectored(&slices).await?;
+            let count = self.segments.len().min(i + MAX_IOV) - i;
+            for (k, slot) in slices.iter_mut().enumerate().take(count) {
+                let s = self.segment(i + k);
+                *slot = io::IoSlice::new(if k == 0 { &s[offset..] } else { s });
+            }
+            let mut n = writer.write_vectored(&slices[..count]).await?;
             if n == 0 {
                 return Err(io::ErrorKind::WriteZero.into());
             }
@@ -1259,6 +1259,14 @@ impl MuxStream {
     /// Receives the next datagram, whole. `None` once the peer finished the stream.
     pub async fn recv_datagram(&self) -> io::Result<Option<Bytes>> {
         std::future::poll_fn(|cx| self.poll_recv_datagram(cx)).await
+    }
+
+    /// A datagram already received, if any (to gather several into one send).
+    pub fn try_recv_datagram(&self) -> Option<Bytes> {
+        let mut st = self.shared.lock();
+        st.streams
+            .get_mut(&self.id)
+            .and_then(|s| s.datagrams.pop_front())
     }
 
     /// Half close: no more data from this side. Queued data is still sent first.

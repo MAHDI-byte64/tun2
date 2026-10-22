@@ -7,7 +7,7 @@
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,9 @@ impl Traffic {
 #[derive(Debug)]
 pub struct ForwardStats {
     listen: String,
-    target: String,
+    /// A reload that only retargets the rule (same listen and protocol) changes this and
+    /// keeps the counters.
+    target: Mutex<String>,
     protocol: &'static str,
     pub traffic: Arc<Traffic>,
     tcp_open: AtomicU64,
@@ -68,7 +70,7 @@ impl ForwardStats {
     pub fn new(listen: &str, target: &str, protocol: &'static str) -> Arc<Self> {
         Arc::new(Self {
             listen: listen.to_string(),
-            target: target.to_string(),
+            target: Mutex::new(target.to_string()),
             protocol,
             traffic: Arc::default(),
             tcp_open: AtomicU64::new(0),
@@ -78,6 +80,23 @@ impl ForwardStats {
             open_failures: AtomicU64::new(0),
             refused_per_ip: AtomicU64::new(0),
         })
+    }
+
+    pub fn listen(&self) -> &str {
+        &self.listen
+    }
+
+    pub fn target(&self) -> String {
+        lock(&self.target).clone()
+    }
+
+    pub fn protocol(&self) -> &'static str {
+        self.protocol
+    }
+
+    /// The rule now points at `target` (a reload); the counters go on.
+    pub fn set_target(&self, target: &str) {
+        *lock(&self.target) = target.to_string();
     }
 
     /// Counts a user connection as open until the guard is dropped.
@@ -415,15 +434,17 @@ pub struct Stats {
     profile: &'static str,
     mux: bool,
     pub peer: Arc<Peer>,
-    /// One per `[[forward]]` rule, in config order (entry side).
-    pub forwards: Vec<Arc<ForwardStats>>,
+    /// The `[[forward]]` rules' counters and the carry, under one lock so a reader never
+    /// counts a rule twice or not at all while a reload swaps them (entry side). An l3
+    /// tunnel has one entry for its link, on both sides.
+    forwards: RwLock<ForwardSet>,
+    /// An l3 (GRE) tunnel: its bytes are the link's, counted on both sides like an entry's
+    /// forwards (the exit's target counters are not used).
+    is_l3: bool,
     /// Exit side.
     pub targets: Targets,
     /// Entry side.
     pub probe: Probe,
-    /// Bytes from the traffic file that belong to no `[[forward]]` rule of this run (rules
-    /// that were edited away), so the totals never go down across a restart. Entry side.
-    carry: Traffic,
     /// The id of the counters restored from the traffic file (`status`'s `counter_id`),
     /// empty without a file.
     counter_id: Mutex<String>,
@@ -444,6 +465,21 @@ impl Stats {
         } else {
             0
         };
+        // An l3 tunnel moves packets, not connections: its link is counted as one rule,
+        // the interface's address (or the carrier's) as the listen side and the peer's as
+        // the target, so `status` and the traffic file have one place for its bytes.
+        let rules = match &config.l3 {
+            Some(l3) => vec![ForwardStats::new(
+                l3.local_ip.as_deref().unwrap_or(&l3.addr),
+                l3.peer_ip.as_deref().unwrap_or(&l3.addr),
+                "l3",
+            )],
+            None => config
+                .forward
+                .iter()
+                .map(|f| ForwardStats::new(&f.listen, &f.target, f.protocol.name()))
+                .collect(),
+        };
         Arc::new(Self {
             started: Instant::now(),
             role: role_name(config.role),
@@ -461,16 +497,60 @@ impl Stats {
                 },
                 ..Peer::default()
             }),
-            forwards: config
-                .forward
-                .iter()
-                .map(|f| ForwardStats::new(&f.listen, &f.target, f.protocol.name()))
-                .collect(),
+            forwards: RwLock::new(ForwardSet {
+                rules,
+                carry: (0, 0),
+            }),
+            is_l3: config.l3.is_some(),
             targets: Targets::default(),
             probe: Probe::default(),
-            carry: Traffic::default(),
             counter_id: Mutex::new(String::new()),
         })
+    }
+
+    /// The `[[forward]]` rules' counters, in config order.
+    pub fn forwards(&self) -> Vec<Arc<ForwardStats>> {
+        read(&self.forwards).rules.clone()
+    }
+
+    #[cfg(test)]
+    pub fn set_forwards(&self, rules: Vec<Arc<ForwardStats>>) {
+        write(&self.forwards).rules = rules;
+    }
+
+    /// Makes `new` the rules (a reload): a rule with the same listen and protocol keeps its
+    /// counters (and takes its new target), the bytes of the rules that are gone go into
+    /// the carry, so the totals never go down. Returns the counters in `new`'s order.
+    pub fn replace_forwards(&self, new: &[crate::config::Forward]) -> Vec<Arc<ForwardStats>> {
+        let mut set = write(&self.forwards);
+        let mut old: Vec<Option<Arc<ForwardStats>>> = set.rules.drain(..).map(Some).collect();
+        let rules: Vec<Arc<ForwardStats>> = new
+            .iter()
+            .map(|f| {
+                let kept = old.iter_mut().find_map(|slot| {
+                    let same = slot
+                        .as_ref()
+                        .is_some_and(|s| s.listen == f.listen && s.protocol == f.protocol.name());
+                    same.then(|| slot.take()).flatten()
+                });
+                match kept {
+                    Some(stats) => {
+                        if stats.target() != f.target {
+                            stats.set_target(&f.target);
+                        }
+                        stats
+                    }
+                    None => ForwardStats::new(&f.listen, &f.target, f.protocol.name()),
+                }
+            })
+            .collect();
+        for gone in old.into_iter().flatten() {
+            let (up, down) = gone.traffic.get();
+            set.carry.0 += up;
+            set.carry.1 += down;
+        }
+        set.rules = rules.clone();
+        rules
     }
 
     /// Starts the byte counters from the traffic file at `path`, written by [`persist`] in
@@ -506,11 +586,13 @@ impl Stats {
         } else {
             let (mut up, mut down) = (0u64, 0u64);
             let mut taken = vec![false; file.forwards.len()];
-            for f in &self.forwards {
+            let mut set = write(&self.forwards);
+            for f in &set.rules {
+                let target = f.target();
                 let found = file.forwards.iter().enumerate().find(|(i, saved)| {
                     !taken[*i]
                         && saved.listen == f.listen
-                        && saved.target == f.target
+                        && saved.target == target
                         && saved.protocol == f.protocol
                 });
                 if let Some((i, saved)) = found {
@@ -520,7 +602,7 @@ impl Stats {
                     down += saved.bytes_down;
                 }
             }
-            self.carry.set(
+            set.carry = (
                 file.bytes_up.saturating_sub(up),
                 file.bytes_down.saturating_sub(down),
             );
@@ -536,14 +618,15 @@ impl Stats {
     /// What goes into the traffic file. Each counter is read once, and the totals are made
     /// from those same readings, so a file written while traffic flows always adds up.
     fn traffic_file(&self) -> TrafficFile {
-        let forwards: Vec<ForwardTraffic> = self
-            .forwards
+        let set = read(&self.forwards);
+        let forwards: Vec<ForwardTraffic> = set
+            .rules
             .iter()
             .map(|f| {
                 let (bytes_up, bytes_down) = f.traffic.get();
                 ForwardTraffic {
                     listen: f.listen.clone(),
-                    target: f.target.clone(),
+                    target: f.target(),
                     protocol: f.protocol.to_string(),
                     bytes_up,
                     bytes_down,
@@ -553,13 +636,14 @@ impl Stats {
         let (bytes_up, bytes_down) = if self.role == "exit" {
             self.targets.traffic.get()
         } else {
-            let (mut up, mut down) = self.carry.get();
+            let (mut up, mut down) = set.carry;
             for f in &forwards {
                 up += f.bytes_up;
                 down += f.bytes_down;
             }
             (up, down)
         };
+        drop(set);
         TrafficFile {
             version: TRAFFIC_FILE_VERSION,
             counter_id: lock(&self.counter_id).clone(),
@@ -571,12 +655,13 @@ impl Stats {
 
     /// The `status` document.
     pub fn snapshot(&self) -> Status {
-        let forwards: Vec<ForwardStatus> = self
-            .forwards
+        let set = read(&self.forwards);
+        let forwards: Vec<ForwardStatus> = set
+            .rules
             .iter()
             .map(|f| ForwardStatus {
                 listen: f.listen.clone(),
-                target: f.target.clone(),
+                target: f.target(),
                 protocol: f.protocol.to_string(),
                 tcp_open: f.tcp_open.load(Relaxed),
                 tcp_total: f.tcp_total.load(Relaxed),
@@ -590,7 +675,8 @@ impl Stats {
             .collect();
         // The carry (bytes of forwards that are gone) is part of the entry's sum; the exit
         // side's totals are its targets' and replace the sum below.
-        let (carry_up, carry_down) = self.carry.get();
+        let (carry_up, carry_down) = set.carry;
+        drop(set);
         let mut totals = Totals {
             bytes_up: carry_up,
             bytes_down: carry_down,
@@ -604,7 +690,7 @@ impl Stats {
             totals.udp_flows += f.udp_flows;
             totals.udp_total += f.udp_total;
         }
-        let exit = (self.role == "exit").then(|| {
+        let exit = (self.role == "exit" && !self.is_l3).then(|| {
             let t = &self.targets;
             totals.bytes_up = t.traffic.up.load(Relaxed);
             totals.bytes_down = t.traffic.down.load(Relaxed);
@@ -637,6 +723,22 @@ impl Stats {
             probe: self.probe.snapshot(),
         }
     }
+}
+
+/// The `[[forward]]` rules' counters, in config order, and the bytes of rules that are gone
+/// (edited away by a reload, or before a restart), so the totals never go down.
+#[derive(Debug)]
+struct ForwardSet {
+    rules: Vec<Arc<ForwardStats>>,
+    carry: (u64, u64),
+}
+
+fn read<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Version of the traffic file; a file of another version is not read.
@@ -889,6 +991,39 @@ pub struct ExitStatus {
 mod tests {
     use super::*;
 
+    /// An l3 tunnel's link is one rule on both sides; its bytes are the totals on both.
+    #[cfg(feature = "l3")]
+    #[test]
+    fn an_l3_tunnel_counts_its_link_as_one_rule_on_both_sides() {
+        for role in ["entry", "exit"] {
+            let text = format!(
+                "role = \"{role}\"\nmode = \"direct\"\n[tunnel]\ntoken = \"0123456789abcdef0123\"\n\
+                 [l3]\nmode = \"listen\"\naddr = \"0.0.0.0:51820\"\nlocal_ip = \"10.10.0.1/30\"\n\
+                 peer_ip = \"10.10.0.2\"\ncarrier = \"udp\"\n"
+            );
+            let stats = Stats::new(&Config::parse(&text).unwrap());
+            let rules = stats.forwards();
+            assert_eq!(rules.len(), 1, "{role}");
+            assert_eq!(
+                (
+                    rules[0].listen(),
+                    rules[0].target().as_str(),
+                    rules[0].protocol()
+                ),
+                ("10.10.0.1/30", "10.10.0.2", "l3")
+            );
+            rules[0].traffic.up.fetch_add(10, Relaxed);
+            rules[0].traffic.down.fetch_add(20, Relaxed);
+            let status = stats.snapshot();
+            assert_eq!(
+                (status.totals.bytes_up, status.totals.bytes_down),
+                (10, 20),
+                "{role}"
+            );
+            assert_eq!(status.forwards.len(), 1);
+        }
+    }
+
     const ENTRY: &str = r#"
         role = "entry"
         mode = "reverse"
@@ -908,7 +1043,8 @@ mod tests {
     #[test]
     fn forward_counters_add_up() {
         let stats = Stats::new(&Config::parse(ENTRY).unwrap());
-        let (web, dns) = (&stats.forwards[0], &stats.forwards[1]);
+        let forwards = stats.forwards();
+        let (web, dns) = (&forwards[0], &forwards[1]);
         let a = web.tcp_connection();
         let b = web.tcp_connection();
         web.traffic.add_up(100);
@@ -1040,9 +1176,10 @@ mod tests {
         let counting = {
             let (stats, stop) = (stats.clone(), stop.clone());
             std::thread::spawn(move || {
+                let forwards = stats.forwards();
                 while !stop.load(Relaxed) {
-                    stats.forwards[0].traffic.add_up(3);
-                    stats.forwards[1].traffic.add_down(5);
+                    forwards[0].traffic.add_up(3);
+                    forwards[1].traffic.add_down(5);
                 }
             })
         };
@@ -1074,9 +1211,9 @@ mod tests {
         first.restore(&path);
         let id = first.snapshot().counter_id.unwrap();
         assert_eq!(id.len(), 16);
-        first.forwards[0].traffic.add_up(100);
-        first.forwards[0].traffic.add_down(1000);
-        first.forwards[1].traffic.add_up(5);
+        first.forwards()[0].traffic.add_up(100);
+        first.forwards()[0].traffic.add_down(1000);
+        first.forwards()[1].traffic.add_up(5);
         write_traffic_file(&path, &first.traffic_file()).unwrap();
 
         // A new run: the same totals, per forward, under the same id.
@@ -1090,7 +1227,7 @@ mod tests {
             (100, 1000)
         );
         assert_eq!(s.forwards[1].bytes_up, 5);
-        again.forwards[1].traffic.add_down(7);
+        again.forwards()[1].traffic.add_down(7);
         assert_eq!(totals(&again), (105, 1007));
     }
 
@@ -1099,10 +1236,10 @@ mod tests {
         let path = traffic_path("carry");
         let first = Stats::new(&Config::parse(ENTRY).unwrap());
         first.restore(&path);
-        first.forwards[0].traffic.add_up(100);
-        first.forwards[0].traffic.add_down(1000);
-        first.forwards[1].traffic.add_up(50);
-        first.forwards[1].traffic.add_down(500);
+        first.forwards()[0].traffic.add_up(100);
+        first.forwards()[0].traffic.add_down(1000);
+        first.forwards()[1].traffic.add_up(50);
+        first.forwards()[1].traffic.add_down(500);
         write_traffic_file(&path, &first.traffic_file()).unwrap();
 
         // The tunnel is edited: only the first forward is left. The total stays, and goes on.
@@ -1114,7 +1251,7 @@ mod tests {
             (s.forwards[0].bytes_up, s.forwards[0].bytes_down),
             (100, 1000)
         );
-        edited.forwards[0].traffic.add_up(1);
+        edited.forwards()[0].traffic.add_up(1);
         assert_eq!(totals(&edited), (151, 1500));
         // Written again, the carry is still in the totals, and a third run sees it.
         write_traffic_file(&path, &edited.traffic_file()).unwrap();

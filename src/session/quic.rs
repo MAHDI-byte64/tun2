@@ -613,6 +613,11 @@ impl QuicStream {
             ready.await;
         }
     }
+
+    /// A datagram already received, if any (to gather several into one send).
+    pub fn try_recv_datagram(&self) -> Option<Bytes> {
+        self.inbox.lock().packets.pop_front()
+    }
 }
 
 impl Drop for QuicStream {

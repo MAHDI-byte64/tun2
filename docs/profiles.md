@@ -17,6 +17,7 @@ profile = "ultraspeed"            # balanced (default) | ultraspeed | gaming
 | Mux write coalescing | on | on | off |
 | Keepalive / ping | 30 s | 30 s | 10 s |
 | KCP FEC | off | off | 10 / 3 |
+| KCP send window (adaptive up to) | 1024 (4096) packets | 1024 (16384) | 512 (2048) |
 | UDP socket buffer | 1 MiB | 4 MiB | 1 MiB |
 | UDP flow queue | 128 packets | 512 packets | 64 packets |
 | UDP session buffer | 256 KiB | 1 MiB | 128 KiB |

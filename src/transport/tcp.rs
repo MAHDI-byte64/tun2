@@ -79,7 +79,30 @@ pub async fn connect(addr: &str, tuning: &Tuning) -> io::Result<TcpStream> {
             )
         })??;
     stream.set_nodelay(tuning.nodelay)?;
+    tune_socket_options(&SockRef::from(&stream), tuning);
     Ok(stream)
+}
+
+/// `tuning.tcp_buffer` and `tuning.tcp_congestion`, when set, on any TCP connection:
+/// tunnel, user or target. Both are best effort (the kernel caps the buffers at
+/// `net.core.rmem_max` / `wmem_max`, and may not have the algorithm).
+pub fn tune_socket_options(sock: &SockRef<'_>, tuning: &Tuning) {
+    if let Some(size) = tuning.tcp_buffer {
+        if let Err(e) = sock
+            .set_recv_buffer_size(size)
+            .and_then(|_| sock.set_send_buffer_size(size))
+        {
+            tracing::debug!(error = %e, size, "could not set the TCP socket buffers");
+        }
+    }
+    if let Some(name) = &tuning.tcp_congestion {
+        #[cfg(target_os = "linux")]
+        if let Err(e) = sock.set_tcp_congestion(name.as_bytes()) {
+            tracing::debug!(error = %e, name, "could not set the TCP congestion control");
+        }
+        #[cfg(not(target_os = "linux"))]
+        tracing::debug!(name, "tuning.tcp_congestion is Linux only; ignored");
+    }
 }
 
 /// Socket options for long-lived tunnel connections: nodelay plus TCP keepalive,
@@ -93,6 +116,7 @@ fn tune_tunnel_socket(stream: &TcpStream, tuning: &Tuning) -> io::Result<()> {
     let sock = SockRef::from(stream);
     sock.set_tcp_keepalive(&keepalive)?;
     super::mark_dscp(&sock, tuning.dscp);
+    tune_socket_options(&sock, tuning);
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(lowat) = tuning.notsent_lowat {
         // Only a latency optimisation: an old kernel without it is no reason to fail.
@@ -107,6 +131,31 @@ fn tune_tunnel_socket(stream: &TcpStream, tuning: &Tuning) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::config::Profile;
+
+    /// A buffer of our own size (the kernel reports twice what was asked, capped by its
+    /// sysctl) and a congestion control the kernel has.
+    #[tokio::test]
+    async fn tunnel_sockets_take_the_buffer_and_congestion_knobs() {
+        let tuning = Tuning {
+            tcp_buffer: Some(128 * 1024),
+            tcp_congestion: Some("cubic".into()),
+            ..Tuning::for_profile(Profile::Balanced)
+        };
+        let listener = TcpTransportListener::bind("127.0.0.1:0", &tuning)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dialer = TcpTransportDialer::new(&addr, &tuning);
+        let (dialed, accepted) = tokio::join!(dialer.dial(), listener.accept());
+        for stream in [&dialed.unwrap(), &accepted.unwrap().0] {
+            let sock = SockRef::from(stream);
+            assert!(sock.recv_buffer_size().unwrap() >= 128 * 1024);
+            assert!(sock.send_buffer_size().unwrap() >= 128 * 1024);
+            // The kernel pads the name to 16 bytes.
+            let name = sock.tcp_congestion().unwrap();
+            assert_eq!(name.split(|b| *b == 0).next(), Some(&b"cubic"[..]));
+        }
+    }
 
     #[tokio::test]
     async fn tunnel_sockets_get_the_unsent_limit() {

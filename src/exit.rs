@@ -96,7 +96,12 @@ pub async fn run(config: Config) -> Result<()> {
     // so it outlives any transport the fallback chain rotates through.
     #[cfg(unix)]
     if let Some(socket) = config.control_socket() {
-        let serve = crate::control::serve(socket, None::<crate::control::NoOpen>, stats.clone());
+        let serve = crate::control::serve(
+            socket,
+            None::<crate::control::NoOpen>,
+            None::<crate::control::NoReload>,
+            stats.clone(),
+        );
         tasks.spawn(serve);
     }
 

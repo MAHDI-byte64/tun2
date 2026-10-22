@@ -25,7 +25,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proxy_header::{Addresses, ProxyHeader, ProxyVersion};
@@ -315,24 +315,65 @@ pub fn put_datagram(packet: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-/// Reads one UDP packet framed by [`put_datagram`]. `None` when the channel ends
-/// cleanly between packets.
-pub async fn read_datagram<R: AsyncRead + Unpin>(stream: &mut R) -> io::Result<Option<Bytes>> {
-    let mut head = [0u8; 2];
-    if stream.read(&mut head[..1]).await? == 0 {
-        return Ok(None);
+/// Reads UDP packets framed by [`put_datagram`] from a stream, through one buffer: a
+/// read brings as many packets as the stream has, and each packet is a slice of the
+/// buffer rather than its own allocation.
+pub struct DatagramReader<R> {
+    inner: R,
+    buf: BytesMut,
+}
+
+impl<R: AsyncRead + Unpin> DatagramReader<R> {
+    const CHUNK: usize = 64 * 1024;
+
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: BytesMut::with_capacity(Self::CHUNK),
+        }
     }
-    stream.read_exact(&mut head[1..]).await?;
-    let len = u16::from_be_bytes(head) as usize;
-    if len > MAX_DATAGRAM {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "UDP packet larger than 65,507 bytes",
-        ));
+
+    /// The next packet; `None` when the stream ends cleanly between packets.
+    pub async fn next(&mut self) -> io::Result<Option<Bytes>> {
+        loop {
+            if let Some(packet) = self.try_next()? {
+                return Ok(Some(packet));
+            }
+            if self.buf.capacity() - self.buf.len() < Self::CHUNK / 4 {
+                self.buf.reserve(Self::CHUNK);
+            }
+            if self.inner.read_buf(&mut self.buf).await? == 0 {
+                return if self.buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream ended inside a UDP packet",
+                    ))
+                };
+            }
+        }
     }
-    let mut packet = vec![0u8; len];
-    stream.read_exact(&mut packet).await?;
-    Ok(Some(packet.into()))
+
+    /// A packet already read, if a whole one is buffered (to gather several into one
+    /// send).
+    pub fn try_next(&mut self) -> io::Result<Option<Bytes>> {
+        let Some(head) = self.buf.get(..2) else {
+            return Ok(None);
+        };
+        let len = u16::from_be_bytes([head[0], head[1]]) as usize;
+        if len > MAX_DATAGRAM {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UDP packet larger than 65,507 bytes",
+            ));
+        }
+        if self.buf.len() < 2 + len {
+            return Ok(None);
+        }
+        self.buf.advance(2);
+        Ok(Some(self.buf.split_to(len).freeze()))
+    }
 }
 
 #[cfg(test)]
@@ -500,18 +541,35 @@ mod tests {
             put_datagram(p, &mut wire).unwrap();
         }
         // Delivered in awkward pieces, as a stream would.
-        let (mut r, mut w) = tokio::io::duplex(7);
+        let (r, mut w) = tokio::io::duplex(7);
         let writer = tokio::spawn(async move {
             for chunk in wire.chunks(5) {
                 w.write_all(chunk).await.unwrap();
             }
         });
+        let mut r = DatagramReader::new(r);
         for p in &packets {
-            let got = read_datagram(&mut r).await.unwrap().unwrap();
+            let got = r.next().await.unwrap().unwrap();
             assert_eq!(&got[..], &p[..]);
         }
         writer.await.unwrap();
-        assert!(read_datagram(&mut r).await.unwrap().is_none(), "clean end");
+        assert!(r.next().await.unwrap().is_none(), "clean end");
+    }
+
+    #[tokio::test]
+    async fn a_reader_hands_out_what_is_already_buffered() {
+        let mut wire = Vec::new();
+        for p in [&b"ab"[..], b"", b"cde"] {
+            put_datagram(p, &mut wire).unwrap();
+        }
+        let mut r = DatagramReader::new(&wire[..]);
+        assert_eq!(r.try_next().unwrap(), None, "nothing read yet");
+        assert_eq!(&r.next().await.unwrap().unwrap()[..], b"ab");
+        // One read brought every packet: the rest come without waiting.
+        assert_eq!(&r.try_next().unwrap().unwrap()[..], b"");
+        assert_eq!(&r.try_next().unwrap().unwrap()[..], b"cde");
+        assert_eq!(r.try_next().unwrap(), None);
+        assert!(r.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -521,11 +579,11 @@ mod tests {
         assert!(out.is_empty());
         // A length above the maximum, or a packet cut short, is an error.
         let too_long = (MAX_DATAGRAM as u16 + 1).to_be_bytes();
-        assert!(read_datagram(&mut &too_long[..]).await.is_err());
+        assert!(DatagramReader::new(&too_long[..]).next().await.is_err());
         let cut = [0u8, 5, 1, 2];
-        assert!(read_datagram(&mut &cut[..]).await.is_err());
+        assert!(DatagramReader::new(&cut[..]).next().await.is_err());
         let half_header = [0u8];
-        assert!(read_datagram(&mut &half_header[..]).await.is_err());
+        assert!(DatagramReader::new(&half_header[..]).next().await.is_err());
     }
 
     #[tokio::test]

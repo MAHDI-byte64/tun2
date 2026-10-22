@@ -3,7 +3,9 @@
 Start with `kariz check -c /etc/kariz/config.toml` on both sides: it validates the file,
 prints the values in effect and lists warnings. On a running tunnel, `kariz status -c ...`
 says whether the other side is connected and, if not, the last error
-([Status](status.md)). Then read the logs:
+([Status](status.md)); `kariz reload -c ...` applies a changed set of forward rules to the
+running entry without a restart, or says why it cannot
+([details](configuration.md#reloading-the-forward-rules)). Then read the logs:
 
 ```bash
 journalctl -u kariz -f                      # with systemd

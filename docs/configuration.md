@@ -84,8 +84,9 @@ root certificates.
 |---|---|---|---|
 | `mode` | `normal`, `fast`, `fast2`, `fast3`, `manual` | `fast2` | Presets from gentle to aggressive (below). |
 | `nodelay`, `interval_ms`, `resend`, `no_congestion` | | from `fast2` | `manual` mode only. `interval_ms` 10-1000, `resend` at most 10. |
-| `send_window` | 16-32768 packets | 1024 | About bandwidth x RTT / 1300 fills the path; smaller queues less but keeps less speed under loss. |
-| `recv_window` | 128-32768 packets | 1024 | |
+| `send_window` | 16-32768 packets | profile: 1024 (`gaming` 512) | Where the send window starts (about bandwidth x RTT / 1300 packets fills a path). With `adaptive` on it moves from here; off, it is the window. |
+| `recv_window` | 128-32768 packets | profile: 4096 (`ultraspeed` 16384, `gaming` 2048) | What the other side may have in flight towards this one, and how far this side's adaptive send window may grow; memory is used only when the reader falls behind. Before 2.10.0: 1024. |
+| `adaptive` | `true`, `false` | `true` | The send window follows the path: it grows from `send_window` while it is the limit and the round trip (from the acks) stays flat, up to `recv_window`, and shrinks when the round trip inflates (a queue is building) or packets are resent. `false` keeps `send_window` fixed, as before 2.10.0. |
 | `mtu` | 576-1443 | 1350 | KCP packet size; at most 1429 with FEC. |
 | `fec_data`, `fec_parity` | 1-64 and 1-32, or both 0 | off (`gaming`: 10 and 3) | Reed-Solomon FEC per sending side: `fec_parity` parity packets per `fec_data` data packets. Both 0 turns it off. |
 | `datagrams` | `true`, `false` | `true` | UDP flows travel beside KCP. `false`: inside its reliable stream, as in v0.4 (never lost, but they wait for retransmissions). |
@@ -242,17 +243,36 @@ Overrides of the profile's values.
 | `udp_max_flows` | 1-65536 | 4096 | UDP flows (client addresses) per rule; packets from more clients are dropped (existing flows go on). Each flow is one stream of a tunnel connection. In the panel: *UDP clients per port* in the wizard and on a tunnel's edit page (2.6.0-beta.4 or newer on the entry server). |
 | `max_conns_per_ip` | 0 or more | 0 (off) | Entry side: user connections and UDP flows one client address may have open, over all rules; more are closed at once. Users on mobile networks often share one address, so keep it well above what one person uses. |
 | `dscp` | a name (`ef`, `af41`, `cs4`, ...) or 0-63 | off | DSCP mark on tunnel sockets and the exit's UDP sockets to targets. Not on QUIC sockets. See [UDP and games](udp-and-games.md#dscp). |
+| `udp_socket_buffer` | 64 KiB - 64 MiB | profile | `SO_RCVBUF` / `SO_SNDBUF` of the UDP sockets (forward rules, KCP, the exit's sockets to targets). The kernel caps it at `net.core.rmem_max` / `wmem_max`. 2.10.0 or newer. |
+| `tcp_buffer` | 64 KiB - 64 MiB | off (kernel autotuning) | `SO_RCVBUF` / `SO_SNDBUF` of every TCP connection (tunnel, users, targets). Setting it turns the kernel's autotuning off and is capped at `net.core.rmem_max` / `wmem_max` (about 208 KiB on a stock kernel), so leave it unset unless you raised those sysctls and the path's bandwidth x RTT needs it. 2.10.0 or newer. |
+| `tcp_congestion` | a kernel algorithm name (`bbr`, `cubic`, ...) | off (kernel default) | `TCP_CONGESTION` of every TCP connection (Linux). `bbr` keeps its speed under random loss where Cubic collapses, at the cost of filling the path's queue; the kernel must have the module (`modprobe tcp_bbr`). Has no effect on `kcp` and `quic`. 2.10.0 or newer. |
 
 ## `[control]`
 
 A local socket on each side, through which `kariz status` reads the running daemon's
-counters (both sides, see [Status](status.md)) and `kariz speedtest` uses its sessions
-(the entry side, see [Speed test](speedtest.md)). Linux only.
+counters (both sides, see [Status](status.md)), `kariz speedtest` uses its sessions (the
+entry side, see [Speed test](speedtest.md)) and `kariz reload` applies a changed set of
+forward rules (the entry side, [below](#reloading-the-forward-rules)). Linux only.
 
 | Key | Default | Notes |
 |---|---|---|
 | `socket` | the config file's path with `.sock` (`/etc/kariz/main.toml` gives `/etc/kariz/main.sock`) | Owner only. If it cannot be made, the tunnel runs without it and logs a warning. |
 | `traffic_file` | the config file's path with `.traffic` (`/etc/kariz/main.traffic`) | Where the byte counters (`status`'s `bytes_up` / `bytes_down`) are kept across restarts: written every 5 s while traffic flows and at shutdown, read back when the tunnel starts. Owner only. A file that cannot be written is logged, and the counters start at zero next time. |
+
+### Reloading the forward rules
+
+`kariz reload -c /etc/kariz/NAME.toml` (or `systemctl reload kariz@NAME`, or a `SIGHUP`)
+makes a running entry read its config file again and apply its `[[forward]]` rules without
+a restart, so the tunnel and the users' connections stay up. A rule that stays (same
+`listen` and `protocol`) keeps its listener and its connections; one whose `target`,
+`duplicate` or `proxy_protocol` changed keeps its port and applies the change to the
+connections opened from then on; a removed rule ends with its connections (its bytes stay in
+the totals); an added rule is bound, and one whose port cannot be bound is reported while
+the rest stands. `tuning.max_conns_per_ip` and `tuning.udp_max_flows` are applied too. When
+anything else in the file changed, the reload is refused with `restart needed: <section>`
+and nothing is applied; an exit answers `not an entry`. The command prints the report
+(`added`, `removed`, `changed`, and what could not be bound). The panel uses this when a
+tunnel's ports are edited ([Panel](panel.md#make-a-tunnel)). 2.10.0 or newer.
 
 ## `[log]`
 

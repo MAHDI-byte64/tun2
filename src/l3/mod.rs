@@ -32,7 +32,7 @@ use tracing::{info, warn};
 
 use crate::config::{Config, L3Carrier, L3Config, L3Mode, TransportKind};
 use crate::crypto::Crypto;
-use crate::stats::{Peer, Stats};
+use crate::stats::{Peer, Stats, Tally, Traffic};
 use crate::transport::Settings;
 
 use session::{L3Dialer, L3Listener, L3Params, L3Session};
@@ -149,14 +149,24 @@ impl L3Runner {
         };
 
         let peer = stats.peer.clone();
+        // The link's byte counters (`status`'s one forward entry for an l3 tunnel).
+        let traffic = stats
+            .forwards()
+            .first()
+            .map_or_else(|| Arc::new(Traffic::default()), |f| f.traffic.clone());
         match self.mode {
-            L3Mode::Dial => self.run_dial(&device, &peer).await,
-            L3Mode::Listen => self.run_listen(&device, &peer).await,
+            L3Mode::Dial => self.run_dial(&device, &peer, &traffic).await,
+            L3Mode::Listen => self.run_listen(&device, &peer, &traffic).await,
         }
     }
 
     /// Dial side: keep a session up, reconnecting on failure and rekeying periodically.
-    async fn run_dial(&self, device: &TunDevice, peer: &Arc<Peer>) -> io::Result<()> {
+    async fn run_dial(
+        &self,
+        device: &TunDevice,
+        peer: &Arc<Peer>,
+        traffic: &Traffic,
+    ) -> io::Result<()> {
         let dialer = L3Dialer::new(&self.params, &self.addr)?;
         loop {
             match dialer.dial().await {
@@ -164,7 +174,11 @@ impl L3Runner {
                     peer.link_up();
                     info!(peer = %self.addr, "l3 session established");
                     // The rekey timer ends the session so the next loop re-handshakes.
-                    let _ = timeout(REKEY_INTERVAL, pump(device, &session, self.gre_key)).await;
+                    let _ = timeout(
+                        REKEY_INTERVAL,
+                        pump(device, &session, self.gre_key, traffic),
+                    )
+                    .await;
                     info!("l3 session ended; re-handshaking");
                 }
                 Err(e) => {
@@ -178,7 +192,12 @@ impl L3Runner {
 
     /// Listen side: accept one peer at a time (a tunnel is point-to-point); when it ends,
     /// accept the next.
-    async fn run_listen(&self, device: &TunDevice, peer: &Arc<Peer>) -> io::Result<()> {
+    async fn run_listen(
+        &self,
+        device: &TunDevice,
+        peer: &Arc<Peer>,
+        traffic: &Traffic,
+    ) -> io::Result<()> {
         let listener = L3Listener::bind(&self.params, &self.addr).await?;
         info!(addr = ?listener.local_addr().ok(), "l3 listening");
         loop {
@@ -186,7 +205,7 @@ impl L3Runner {
                 Ok(session) => {
                     peer.link_up();
                     info!("l3 session established");
-                    if let Err(e) = pump(device, &session, self.gre_key).await {
+                    if let Err(e) = pump(device, &session, self.gre_key, traffic).await {
                         warn!(error = %e, "l3 session ended");
                     }
                 }
@@ -206,11 +225,19 @@ impl L3Runner {
 
 /// Moves packets between `device` and `session` until either side ends. Each packet from
 /// the interface is GRE-wrapped and sealed; each sealed packet is opened, GRE-stripped and
-/// written to the interface. A packet whose GRE key does not match is dropped.
-async fn pump(device: &TunDevice, session: &L3Session, gre_key: u32) -> io::Result<()> {
+/// written to the interface. A packet whose GRE key does not match is dropped. The
+/// packets' own bytes (without the GRE and carrier headers) are counted on `traffic`:
+/// interface to tunnel as up, tunnel to interface as down.
+async fn pump(
+    device: &TunDevice,
+    session: &L3Session,
+    gre_key: u32,
+    traffic: &Traffic,
+) -> io::Result<()> {
     let layer = device.layer();
     let up = async {
         let mut buf = vec![0u8; PACKET_BUFFER];
+        let mut tally = Tally::new(&traffic.up);
         loop {
             let n = device.recv(&mut buf).await?;
             let mut out = Vec::with_capacity(gre::HEADER_LEN + n);
@@ -224,10 +251,13 @@ async fn pump(device: &TunDevice, session: &L3Session, gre_key: u32) -> io::Resu
                 Layer::Ethernet => gre::encode_eth(gre_key, &buf[..n], &mut out),
             }
             // A full carrier drops the packet, as a congested link would.
-            session.send_gre(&out);
+            if session.send_gre(&out) {
+                tally.add(n);
+            }
         }
     };
     let down = async {
+        let mut tally = Tally::new(&traffic.down);
         loop {
             let Some(packet): Option<Bytes> = session.recv_gre().await else {
                 return Ok(());
@@ -239,6 +269,7 @@ async fn pump(device: &TunDevice, session: &L3Session, gre_key: u32) -> io::Resu
             if let Some((key, inner)) = decoded {
                 if key == gre_key {
                     device.send(inner).await?;
+                    tally.add(inner.len());
                 }
             }
         }
@@ -323,6 +354,16 @@ fn synthetic_config(kind: TransportKind, token: &str, l3: &L3Config) -> io::Resu
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let runner = L3Runner::from_config(&config)?;
     let stats = Stats::new(&config);
+    // The byte counters go on from where the last run left them (docs/status.md).
+    if let Some(path) = config.traffic_file() {
+        stats.restore(&path);
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::stats::persist(stats, path).await {
+                warn!(error = %format!("{e:#}"), "the traffic file is not being written");
+            }
+        });
+    }
 
     // Serve the control socket, exactly as the entry/exit modes do, so `kariz status` and the
     // panel can read this end's connected / last-error state. Without it an l3 tunnel can be
@@ -334,6 +375,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tokio::spawn(crate::control::serve(
             socket,
             None::<crate::control::NoOpen>,
+            None::<crate::control::NoReload>,
             stats.clone(),
         ));
     }

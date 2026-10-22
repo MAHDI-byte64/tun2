@@ -233,6 +233,8 @@ pub(super) enum CarrierSocket {
 }
 
 impl CarrierSocket {
+    /// The raw carriers go packet by packet; the UDP carrier batches (below).
+    #[cfg(all(feature = "rawlink", target_os = "linux"))]
     /// Sends one sealed packet to the connected peer (dialer side), dropping it on a full
     /// buffer as a congested link would.
     pub(super) fn try_send(&self, packet: &[u8]) -> io::Result<usize> {
@@ -249,6 +251,8 @@ impl CarrierSocket {
         }
     }
 
+    /// The raw carriers go packet by packet; the UDP carrier batches (below).
+    #[cfg(all(feature = "rawlink", target_os = "linux"))]
     /// Sends one sealed packet to `peer` (listener side, one socket for every peer).
     pub(super) fn try_send_to(&self, packet: &[u8], peer: SocketAddr) -> io::Result<usize> {
         match self {
@@ -264,21 +268,50 @@ impl CarrierSocket {
         }
     }
 
-    /// Receives one sealed packet from the connected peer (dialer side).
-    pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+    /// Sends several sealed packets at once (one call for the UDP carrier), to `peer` or,
+    /// with `None`, to the connected peer; the ones the socket has no room for are dropped.
+    pub(super) fn try_send_many(
+        &self,
+        packets: &[&[u8]],
+        peer: Option<SocketAddr>,
+    ) -> io::Result<usize> {
         match self {
-            Self::Udp(s) => s.recv(buf).await,
+            Self::Udp(s) => crate::batch::send_now(s, packets, peer),
             #[cfg(all(feature = "rawlink", target_os = "linux"))]
-            Self::Icmp(s) => s.recv(buf).await,
-            #[cfg(all(feature = "rawlink", target_os = "linux"))]
-            Self::Faketcp(s) => s.recv(buf).await,
-            #[cfg(all(feature = "rawlink", target_os = "linux"))]
-            Self::Proto47(s) => s.recv(buf).await,
-            #[cfg(all(feature = "rawlink", target_os = "linux"))]
-            Self::Spoof(s) => s.recv(buf).await,
+            _ => {
+                let mut sent = 0;
+                for packet in packets {
+                    let r = match peer {
+                        Some(peer) => self.try_send_to(packet, peer),
+                        None => self.try_send(packet),
+                    };
+                    match r {
+                        Ok(_) => sent += 1,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(sent)
+            }
         }
     }
 
+    /// Receives what the socket has, up to the batch's size (one call for the UDP
+    /// carrier; the raw carriers bring one packet at a time).
+    pub(super) async fn recv_batch(&self, batch: &mut crate::batch::RecvBatch) -> io::Result<()> {
+        match self {
+            Self::Udp(s) => batch.recv(s).await,
+            #[cfg(all(feature = "rawlink", target_os = "linux"))]
+            _ => {
+                let (n, from) = self.recv_from(batch.first_buffer()).await?;
+                batch.set_one(n, from);
+                Ok(())
+            }
+        }
+    }
+
+    /// The raw carriers go packet by packet; the UDP carrier batches (below).
+    #[cfg(all(feature = "rawlink", target_os = "linux"))]
     /// Receives one sealed packet and the peer it came from (listener side).
     pub(super) async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         match self {

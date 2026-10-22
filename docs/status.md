@@ -148,6 +148,12 @@ targets (connection counts are 0), and there is an `exit` object:
 | `exit.dial_failures` | targets that could not be reached |
 | `exit.last_dial_error` | `{ "secs_ago", "text" }` with the target and the reason, or `null` |
 
+An `l3` (GRE) tunnel (2.10.0 or newer) has one entry in `forwards` on both sides, protocol
+`l3`, with the interface's address as `listen` and the peer's as `target`: `bytes_up` is what
+went from the interface into the tunnel and `bytes_down` what came out of it (the packets
+themselves, without the GRE and carrier headers). Its `totals` are that entry's, on the exit
+side too, and the traffic file keeps them across restarts like a forward rule's.
+
 ### `probe`: can a user get through
 
 A tunnel can be connected and still let no one through: every session full, or the target

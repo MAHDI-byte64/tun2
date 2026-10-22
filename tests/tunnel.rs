@@ -526,6 +526,16 @@ struct Side {
 
 impl Side {
     fn start(text: &str) -> Self {
+        let config = Config::parse(text).unwrap_or_else(|e| panic!("{e:#}\n{text}"));
+        Self::run(config)
+    }
+
+    /// A side loaded from a config file, as the daemon does: it can be told to reload it.
+    fn start_from_file(path: &std::path::Path) -> Self {
+        Self::run(Config::load(path).unwrap_or_else(|e| panic!("{e:#}")))
+    }
+
+    fn run(config: Config) -> Self {
         if std::env::var_os("KARIZ_TEST_LOG").is_some() {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
@@ -537,7 +547,6 @@ impl Side {
                 .with_thread_names(true)
                 .try_init();
         }
-        let config = Config::parse(text).unwrap_or_else(|e| panic!("{e:#}\n{text}"));
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2117,13 +2126,15 @@ struct Game {
     longest_loss: usize,
     /// Round trip of every packet by sequence number; `None`: never came back.
     by_seq: Vec<Option<Duration>>,
+    /// The interval the packets were sent at.
+    every: Duration,
 }
 
 impl Game {
     /// Where the longest loss run starts, and when packets slower than `slow` were
     /// sent (seconds into the run), for `KARIZ_BENCH_DETAIL`.
     fn detail(&self, slow: Duration) -> String {
-        let every = 1.0 / 64.0;
+        let every = self.every.as_secs_f64();
         let mut longest = (0, 0);
         let mut run_start = 0;
         for (seq, rtt) in self.by_seq.iter().enumerate() {
@@ -2170,7 +2181,12 @@ impl std::fmt::Display for Game {
 /// Game traffic: 128-byte packets at 64 Hz on one flow for
 /// `duration`, each echoed by the target, without waiting for answers.
 async fn game(port: u16, duration: Duration) -> Game {
-    let every = Duration::from_micros(15_625);
+    udp_flow(port, 128, Duration::from_micros(15_625), duration).await
+}
+
+/// One UDP flow of `size`-byte packets, one every `every` for `duration`, each echoed by the
+/// target, sent without waiting for answers (a lost packet is lost, not waited for).
+async fn udp_flow(port: u16, size: usize, every: Duration, duration: Duration) -> Game {
     let count = (duration.as_secs_f64() / every.as_secs_f64()) as u32;
     let sock = std::sync::Arc::new(udp_client(port).await);
     let deadline = Instant::now() + duration + Duration::from_secs(2);
@@ -2178,7 +2194,7 @@ async fn game(port: u16, duration: Duration) -> Game {
         let sock = sock.clone();
         tokio::spawn(async move {
             let mut got = Vec::new();
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; 65_536];
             while let Ok(Ok(4..)) =
                 tokio::time::timeout_at(deadline.into(), sock.recv(&mut buf)).await
             {
@@ -2191,8 +2207,9 @@ async fn game(port: u16, duration: Duration) -> Game {
         })
     };
     let mut sent = Vec::new();
-    let mut packet = [0u8; 128];
+    let mut packet = vec![0u8; size.max(4)];
     let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     for seq in 0..count {
         interval.tick().await;
         packet[..4].copy_from_slice(&seq.to_be_bytes());
@@ -2218,6 +2235,7 @@ async fn game(port: u16, duration: Duration) -> Game {
         sent: count as usize,
         longest_loss,
         by_seq,
+        every,
     }
 }
 
@@ -2443,6 +2461,112 @@ async fn status_of(socket: &std::path::Path) -> kariz::stats::Status {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("no control socket at {}", socket.display());
+}
+
+/// `kariz reload` on an entry loaded from a file: the forward rules of the file are
+/// applied to the running daemon, and a connection through a rule that stays is kept.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_applies_the_file_s_forward_rules_without_a_restart() {
+    let target = echo_server().await;
+    let tunnel_port = free_port();
+    let (a, b, c) = (free_port(), free_port(), free_port());
+    let dir = std::env::temp_dir().join(format!("kariz-reload-{tunnel_port}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("entry.toml");
+    let socket = dir.join("entry.sock");
+    let entry_text = |rules: &[(u16, u16)], remote: u16| {
+        let rules: String = rules
+            .iter()
+            .map(|(listen, target)| {
+                format!(
+                    "[[forward]]\nlisten = \"127.0.0.1:{listen}\"\ntarget = \"127.0.0.1:{target}\"\n"
+                )
+            })
+            .collect();
+        format!(
+            "role = \"entry\"\nmode = \"direct\"\n{rules}[tunnel]\nremote = \"127.0.0.1:{remote}\"\n\
+             token = \"{TOKEN}\"\ntransport = \"tcpmux\"\n[control]\nsocket = {:?}\n",
+            socket.display().to_string()
+        )
+    };
+    let exit = format!(
+        "role = \"exit\"\nmode = \"direct\"\n[tunnel]\nlisten = \"127.0.0.1:{tunnel_port}\"\n\
+         token = \"{TOKEN}\"\ntransport = \"tcpmux\"\n"
+    );
+    let _exit = Side::start(&exit);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(&path, entry_text(&[(a, target), (b, target)], tunnel_port)).unwrap();
+    let _entry = Side::start_from_file(&path);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // One connection through a, kept open across the reloads.
+    let mut kept = TcpStream::connect(("127.0.0.1", a)).await.unwrap();
+    kept.write_all(b"before").await.unwrap();
+    let mut back = [0; 6];
+    tokio::time::timeout(Duration::from_secs(5), kept.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&back, b"before");
+
+    let reload = || async {
+        for _ in 0..50 {
+            if let Ok(c) = kariz::control::connect(&socket).await {
+                return kariz::control::reload(c).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("no control socket at {}", socket.display());
+    };
+    // b retargeted, c added.
+    std::fs::write(
+        &path,
+        entry_text(&[(a, target), (b, 9), (c, target)], tunnel_port),
+    )
+    .unwrap();
+    let report = reload().await.unwrap();
+    assert_eq!(report.added, vec![format!("127.0.0.1:{c}")]);
+    assert_eq!(report.changed, vec![format!("127.0.0.1:{b}")]);
+    assert!(
+        report.removed.is_empty() && report.failed.is_empty(),
+        "{report}"
+    );
+    kept.write_all(b"after!").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), kept.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &back, b"after!",
+        "the connection through a survived the reload"
+    );
+    let payload = pattern(5000);
+    assert_eq!(echo_roundtrip(c, &payload).await.unwrap(), payload);
+
+    // Something else changed: refused.
+    std::fs::write(
+        &path,
+        entry_text(&[(a, target), (b, 9), (c, target)], tunnel_port + 1),
+    )
+    .unwrap();
+    let err = reload().await.unwrap_err();
+    assert!(
+        err.to_string().starts_with("restart needed: tunnel"),
+        "{err}"
+    );
+
+    // a removed: its connection ends and its port refuses.
+    std::fs::write(&path, entry_text(&[(b, 9), (c, target)], tunnel_port)).unwrap();
+    let report = reload().await.unwrap();
+    assert_eq!(report.removed, vec![format!("127.0.0.1:{a}")]);
+    let n = tokio::time::timeout(Duration::from_secs(5), kept.read(&mut back))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0, "the removed rule's connection ends");
+    assert!(TcpStream::connect(("127.0.0.1", a)).await.is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `status` on both sides counts what went through, and says the other side is there.
@@ -2801,5 +2925,205 @@ async fn kcp_transfer_survives_loss() {
     });
     for run in runs {
         run.await.unwrap();
+    }
+}
+
+/// Download rate in Mbit/s like [`download`], but `None` when the connection fails or ends
+/// early (a benchmark row, not a test: the table says "failed" and the run goes on).
+async fn download_rate(port: u16, warmup: Duration, window: Duration) -> Option<f64> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let from = Instant::now() + warmup;
+    let until = from + window;
+    let mut total = 0;
+    while let Ok(read) = tokio::time::timeout_at(until.into(), s.read(&mut buf)).await {
+        match read {
+            Ok(n) if n > 0 => {
+                if Instant::now() >= from {
+                    total += n;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(total as f64 * 8.0 / window.as_secs_f64() / 1e6)
+}
+
+/// [`download_rate`] over `connections` downloads at once; `None` if any of them failed.
+async fn download_rates(
+    port: u16,
+    connections: usize,
+    warmup: Duration,
+    window: Duration,
+) -> Option<f64> {
+    let runs: Vec<_> = (0..connections)
+        .map(|_| tokio::spawn(download_rate(port, warmup, window)))
+        .collect();
+    let mut total = 0.0;
+    for run in runs {
+        total += run.await.unwrap()?;
+    }
+    Some(total)
+}
+
+/// One row of the benchmark table.
+struct BenchRow {
+    name: String,
+    one: Option<f64>,
+    eight: Option<f64>,
+    udp: Game,
+}
+
+impl BenchRow {
+    fn markdown(&self) -> String {
+        let rate = |r: Option<f64>| r.map_or("failed".to_string(), |r| format!("{r:.1}"));
+        let ms = |p| percentile(&self.udp.rtts, p).as_secs_f64() * 1000.0;
+        let (p50, p99, delivered) = if self.udp.rtts.is_empty() {
+            ("-".to_string(), "-".to_string(), 0.0)
+        } else {
+            (
+                format!("{:.1}", ms(0.5)),
+                format!("{:.1}", ms(0.99)),
+                100.0 * self.udp.rtts.len() as f64 / self.udp.sent as f64,
+            )
+        };
+        format!(
+            "| {} | {} | {} | {p50} | {p99} | {delivered:.2} |",
+            self.name,
+            rate(self.one),
+            rate(self.eight)
+        )
+    }
+}
+
+const BENCH_HEADER: &str = "| transport profile path | 1 stream Mbit/s | 8 streams Mbit/s | \
+                            UDP p50 ms | UDP p99 ms | UDP delivered % |\n\
+                            |---|---:|---:|---:|---:|---:|";
+
+/// The benchmark matrix behind `scripts/bench.sh`: four transports, the three profiles and
+/// five paths (localhost; 40 ms RTT; 40 ms with 1 % loss; 100 ms with 2 ms jitter and
+/// 0.3 % loss; 40 ms at 50 Mbit/s with a 50 ms queue), each measured with a one-stream
+/// download, an eight-stream download and a UDP flow of 1200-byte packets at 4000 a second
+/// (echoed; round trips and delivery). Each measurement runs `KARIZ_BENCH_SECS` seconds
+/// (default 10). `cargo test --release --test tunnel bench_matrix -- --ignored --nocapture`.
+/// `KARIZ_BENCH_ONLY=kcp,quic` keeps the rows whose name (`transport profile path`) contains
+/// one of the comma-separated parts (`=a|b` takes exact names); `KARIZ_BENCH_OUT=file` also
+/// writes the markdown table there; `KARIZ_BENCH_SEED` changes the links' random draws.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_matrix() {
+    link::fine_timers();
+    let transports = [
+        ("tcpmux", Setup::tcp("direct").transport("tcpmux").mux()),
+        ("wss", Setup::wss("direct")),
+        ("kcp", Setup::kcp("direct")),
+        ("quic", Setup::quic("direct")),
+    ];
+    let profiles = ["balanced", "ultraspeed", "gaming"];
+    let ms = Duration::from_millis;
+    let paths: [(&str, Option<Impairment>); 5] = [
+        ("local", None),
+        (
+            "wan40",
+            Some(Impairment {
+                delay: ms(20),
+                ..Default::default()
+            }),
+        ),
+        (
+            "wan40-loss1",
+            Some(Impairment {
+                delay: ms(20),
+                loss: 0.01,
+                ..Default::default()
+            }),
+        ),
+        (
+            "wan100-jitter",
+            Some(Impairment {
+                delay: ms(50),
+                jitter: ms(2),
+                loss: 0.003,
+                ..Default::default()
+            }),
+        ),
+        (
+            "rate50",
+            Some(Impairment {
+                delay: ms(20),
+                rate: 50_000_000,
+                queue: ms(50),
+                ..Default::default()
+            }),
+        ),
+    ];
+    let only = std::env::var("KARIZ_BENCH_ONLY").unwrap_or_default();
+    let selected = |name: &str| match only.strip_prefix('=') {
+        Some(names) => names.split('|').any(|n| n == name),
+        None => only.split(',').any(|part| name.contains(part)),
+    };
+    let seed = std::env::var("KARIZ_BENCH_SEED")
+        .ok()
+        .map(|s| s.parse().expect("seed"));
+    let secs = std::env::var("KARIZ_BENCH_SECS").map_or(10, |s| s.parse().expect("seconds"));
+    let measure = Duration::from_secs(secs);
+    let warmup = Duration::from_secs(2);
+    println!(
+        "{secs} s per measurement; UDP: 1200-byte packets at 4000/s on one flow, echoed\n\
+         {BENCH_HEADER}"
+    );
+    let mut rows = Vec::new();
+    for (transport, setup) in transports {
+        for profile in profiles {
+            for (path, imp) in paths {
+                let name = format!("{transport} {profile} {path}");
+                if !selected(&name) {
+                    continue;
+                }
+                let setup = setup.profile(profile);
+                let target = download_server().await;
+                let tunnel = match imp {
+                    None => start(setup, TOKEN, TOKEN, target).await,
+                    Some(mut imp) => {
+                        if let Some(seed) = seed {
+                            imp.seed = seed;
+                        }
+                        start_via(setup, setup, TOKEN, TOKEN, target, |upstream| {
+                            if is_udp(setup) {
+                                let link = UdpLink::start(upstream, imp);
+                                (link.port, Some(Box::new(link) as Proxy))
+                            } else {
+                                let link = TcpLink::start(upstream, imp);
+                                (link.port, Some(Box::new(link) as Proxy))
+                            }
+                        })
+                        .await
+                    }
+                };
+                // Sessions up and the datagram path's probes across before measuring.
+                let _ = game(tunnel.user_port, Duration::from_secs(2)).await;
+                let one = download_rate(tunnel.user_port, warmup, measure).await;
+                let eight = download_rates(tunnel.user_port, 8, warmup, measure).await;
+                let udp =
+                    udp_flow(tunnel.user_port, 1200, Duration::from_micros(250), measure).await;
+                drop(tunnel);
+                let row = BenchRow {
+                    name,
+                    one,
+                    eight,
+                    udp,
+                };
+                println!("{}", row.markdown());
+                rows.push(row);
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("KARIZ_BENCH_OUT") {
+        let mut table = format!("{BENCH_HEADER}\n");
+        for row in &rows {
+            table += &row.markdown();
+            table.push('\n');
+        }
+        std::fs::write(&path, table).expect("KARIZ_BENCH_OUT");
     }
 }

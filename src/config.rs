@@ -260,7 +260,7 @@ impl ForwardProtocol {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub role: Role,
@@ -282,9 +282,12 @@ pub struct Config {
     /// The file this was loaded from, if it was (see [`Config::load`]).
     #[serde(skip)]
     pub path: Option<PathBuf>,
+    /// The text it was loaded from (what a reload compares against).
+    #[serde(skip)]
+    pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     #[serde(default)]
@@ -345,7 +348,7 @@ fn default_fallback_dwell() -> u64 {
 
 /// `[control]`: the entry side's local control socket, through which `kariz speedtest`
 /// uses the running daemon's live sessions (Unix only).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     /// Where the socket goes. Default: the config file's path with `.sock` instead of
@@ -358,7 +361,7 @@ pub struct ControlConfig {
 }
 
 /// `[tunnel.kcp]`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct KcpConfig {
     #[serde(default)]
@@ -368,11 +371,15 @@ pub struct KcpConfig {
     pub interval_ms: Option<u32>,
     pub resend: Option<u32>,
     pub no_congestion: Option<bool>,
-    /// In packets.
-    #[serde(default = "default_kcp_window")]
-    pub send_window: u16,
-    #[serde(default = "default_kcp_window")]
-    pub recv_window: u16,
+    /// In packets; unset: the profile's default (`Config::kcp`: 1024 / 1024 / 512 to
+    /// send and 4096 / 16384 / 2048 to receive for `balanced` / `ultraspeed` / `gaming`).
+    pub send_window: Option<u16>,
+    pub recv_window: Option<u16>,
+    /// The send window follows the path: from `send_window` up to `recv_window` while it
+    /// is the limit and the round trip stays flat, down when the round trip inflates or
+    /// packets are resent. `false` keeps `send_window` fixed.
+    #[serde(default = "default_true")]
+    pub adaptive: bool,
     /// KCP packet size (its 24-byte header included); the UDP packet adds 29 bytes of
     /// protection, 43 with FEC.
     #[serde(default = "default_kcp_mtu")]
@@ -392,10 +399,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_kcp_window() -> u16 {
-    1024
-}
-
 fn default_kcp_mtu() -> usize {
     1350
 }
@@ -409,8 +412,9 @@ impl Default for KcpConfig {
             interval_ms: None,
             resend: None,
             no_congestion: None,
-            send_window: default_kcp_window(),
-            recv_window: default_kcp_window(),
+            send_window: None,
+            recv_window: None,
+            adaptive: true,
             mtu: default_kcp_mtu(),
             fec_data: None,
             fec_parity: None,
@@ -492,7 +496,7 @@ impl KcpConfig {
 /// `[tunnel.stealth]`: the record-padding and timing-jitter knobs of the `stealth`
 /// transport. Padding applies only to stealth links (both ends know the transport), so no
 /// other transport's wire is touched.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StealthConfig {
     /// Add random padding inside the AEAD record so record sizes do not leak the traffic
@@ -522,7 +526,7 @@ impl Default for StealthConfig {
 }
 
 /// `[tunnel.faketcp]`: the raw-socket fake-TCP carrier (Linux, root). All keys optional.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FaketcpConfig {
     /// The TCP flag pattern this end's segments carry: one of `A`, `PA`, `PA,A` or
@@ -560,7 +564,7 @@ impl Default for FaketcpConfig {
 const FAKETCP_FLAGS: &[&str] = &["A", "PA", "PA,A", "PA,A,PA,PAU"];
 
 /// `[tunnel.icmp]`: the raw ICMP-echo carrier (Linux, root). All keys optional.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IcmpConfig {
     /// Install and remove the iptables rules that suppress the kernel's automatic echo
@@ -580,7 +584,7 @@ impl Default for IcmpConfig {
 
 /// `[tunnel.proto47]`: the raw IP protocol-47 (GRE) carrier (Linux, root). Only meaningful
 /// as an `[l3]` carrier. All keys optional.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Proto47Config {
     /// Install and remove the best-effort iptables rule that accepts protocol 47 under a
@@ -667,7 +671,7 @@ impl SpoofShape {
 /// `[tunnel.spoof]`: the source-spoofing carrier (Linux, root). Both ends forge their
 /// source IP and must be told the other's real address, so neither side learns the peer
 /// from the (forged) packets. All keys optional except, in practice, a non-empty `pool`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SpoofConfig {
     /// The on-wire packet shape (`udp`, `tcp`, `icmp`, `gre`, `ipip` or `proto58`).
@@ -805,7 +809,7 @@ fn parse_pool_entry(entry: &str) -> Result<Vec<Ipv4Addr>> {
 /// `[tunnel.helper]`: credentials and paths for a managed helper transport (`naive`,
 /// `xhttp`, `reality`). Which keys are required depends on the transport; see
 /// [`Config::validate_helper`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HelperConfig {
     /// Override the helper binary path (default: the installed pinned path).
@@ -840,7 +844,7 @@ pub struct HelperConfig {
 /// `[l3]`: the layer-3 / GRE direct tunnel. Creates a TUN interface on each host and
 /// carries whole IP packets, GRE-encapsulated and sealed inside the tunnel's own session,
 /// over an unreliable carrier. Linux only, root.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct L3Config {
     /// `dial` reaches out; `listen` waits for the inbound connection. Either host may
@@ -937,7 +941,7 @@ impl L3Carrier {
 }
 
 /// `[tunnel.quic]`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct QuicConfig {
     #[serde(default)]
@@ -994,7 +998,7 @@ impl Congestion {
 
 /// `[tunnel.mux]`: many user connections over a few long-lived tunnel connections.
 /// Unset values come from the profile, see [`MuxSettings`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MuxConfig {
     /// Default: on for `tcpmux`, `ws` and `wss`, off for `tcp`.
@@ -1025,7 +1029,7 @@ pub struct MuxConfig {
 }
 
 /// `[tunnel.ws]`: WebSocket upgrade request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WsConfig {
     #[serde(default = "default_ws_path")]
@@ -1050,7 +1054,7 @@ fn default_ws_path() -> String {
 }
 
 /// `[tunnel.tls]`: TLS settings for `wss`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Dialing side: server name to present, instead of the `remote` host.
@@ -1070,7 +1074,7 @@ fn default_pool() -> usize {
     8
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Forward {
     /// Address users connect to on the entry side, e.g. `0.0.0.0:443`.
@@ -1108,7 +1112,7 @@ const DUPLICATE_COPIES: std::ops::RangeInclusive<u8> = 1..=3;
 const MAX_DUPLICATE_GAP_MS: u8 = 50;
 
 /// Optional per-field overrides applied on top of the selected profile.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TuningOverrides {
     pub nodelay: Option<bool>,
@@ -1127,6 +1131,14 @@ pub struct TuningOverrides {
     pub max_conns_per_ip: Option<u32>,
     /// DSCP mark for tunnel sockets and the exit's UDP sockets to targets (unset: none).
     pub dscp: Option<Dscp>,
+    /// `SO_RCVBUF` / `SO_SNDBUF` of UDP sockets (the profile's value when unset).
+    pub udp_socket_buffer: Option<usize>,
+    /// `SO_RCVBUF` / `SO_SNDBUF` of TCP connections (tunnel, user and target); unset: the
+    /// kernel's autotuning.
+    pub tcp_buffer: Option<usize>,
+    /// `TCP_CONGESTION` of TCP connections (`bbr`, `cubic`, ...; Linux); unset: the
+    /// kernel's default.
+    pub tcp_congestion: Option<String>,
 }
 
 /// A DSCP codepoint as written in `[tuning] dscp`: a name (`"ef"`, `"af41"`, `"cs4"`,
@@ -1188,7 +1200,7 @@ const DSCP_NAMES: [(&str, u8); 24] = [
     ("default", 0),
 ];
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
@@ -1223,7 +1235,7 @@ fn default_log_level() -> String {
 }
 
 /// Effective tuning values after applying profile defaults and overrides.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tuning {
     pub nodelay: bool,
     pub buffer_size: usize,
@@ -1244,6 +1256,10 @@ pub struct Tuning {
     /// DSCP codepoint for tunnel sockets and the exit's UDP sockets to targets;
     /// `None` leaves the OS default (0).
     pub dscp: Option<u8>,
+    /// `SO_RCVBUF` / `SO_SNDBUF` for TCP connections; `None`: the kernel's autotuning.
+    pub tcp_buffer: Option<usize>,
+    /// `TCP_CONGESTION` for TCP connections; `None`: the kernel's default.
+    pub tcp_congestion: Option<String>,
 }
 
 /// UDP forwarding limits and buffers (phase 3).
@@ -1298,6 +1314,8 @@ impl Tuning {
             max_conns_per_ip: None,
             notsent_lowat: None,
             dscp: None,
+            tcp_buffer: None,
+            tcp_congestion: None,
         }
     }
 
@@ -1332,6 +1350,15 @@ impl Tuning {
         // An invalid value is reported by `Config::validate`.
         if let Some(d) = &o.dscp {
             self.dscp = d.codepoint();
+        }
+        if let Some(v) = o.udp_socket_buffer {
+            self.udp.socket_buffer = v;
+        }
+        if o.tcp_buffer.is_some() {
+            self.tcp_buffer = o.tcp_buffer;
+        }
+        if o.tcp_congestion.is_some() {
+            self.tcp_congestion.clone_from(&o.tcp_congestion);
         }
         self
     }
@@ -1441,6 +1468,8 @@ const MUX_STREAM_WINDOW: std::ops::RangeInclusive<usize> = 16 * 1024..=16 * 1024
 const KCP_INTERVAL_MS: std::ops::RangeInclusive<u32> = 10..=1000;
 const KCP_MAX_RESEND: u32 = 10;
 const KCP_SEND_WINDOW: std::ops::RangeInclusive<u16> = 16..=32768;
+/// `tuning.udp_socket_buffer` and `tuning.tcp_buffer`, in bytes.
+const SOCKET_BUFFER: std::ops::RangeInclusive<usize> = 64 * 1024..=64 * 1024 * 1024;
 /// KCP needs 128 to receive its largest messages.
 const KCP_RECV_WINDOW: std::ops::RangeInclusive<u16> = 128..=32768;
 /// The upper bound keeps the UDP packet (29 bytes of protection added) within 1472 bytes,
@@ -1493,7 +1522,79 @@ impl Config {
         let mut config = Self::parse(&text)
             .with_context(|| format!("invalid config file {}", path.display()))?;
         config.path = Some(path.to_path_buf());
+        config.text = Some(text);
         Ok(config)
+    }
+
+    /// Whether two config texts mean the same: a default written out or left out, a table
+    /// in another order, make no difference. By their text when one does not parse.
+    pub fn same_as(old: &str, new: &str) -> bool {
+        match (Self::parse(old), Self::parse(new)) {
+            (Ok(mut a), Ok(mut b)) => {
+                a.path = None;
+                a.text = None;
+                b.path = None;
+                b.text = None;
+                a == b
+            }
+            _ => old == new,
+        }
+    }
+
+    /// Whether two config texts differ only in what a running entry can apply without a
+    /// restart: the `[[forward]]` rules, `tuning.max_conns_per_ip` and
+    /// `tuning.udp_max_flows`. `Err` names the top-level key that differs otherwise.
+    pub fn same_but_forwards(old: &str, new: &str) -> std::result::Result<(), String> {
+        // By meaning first: a default written out or left out, a table in another order,
+        // are the same config (the panel's edit page and its wizard do not spell a file the
+        // same way).
+        if let (Ok(a), Ok(b)) = (Self::parse(old), Self::parse(new)) {
+            let strip = |mut c: Config| {
+                c.forward.clear();
+                c.tuning.max_conns_per_ip = None;
+                c.tuning.udp_max_flows = None;
+                c.path = None;
+                c.text = None;
+                c
+            };
+            if strip(a) == strip(b) {
+                return Ok(());
+            }
+        }
+        fn strip(text: &str) -> std::result::Result<toml::Value, String> {
+            let mut value: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+            if let Some(table) = value.as_table_mut() {
+                table.remove("forward");
+                if let Some(tuning) = table.get_mut("tuning").and_then(|t| t.as_table_mut()) {
+                    tuning.remove("max_conns_per_ip");
+                    tuning.remove("udp_max_flows");
+                }
+                if table
+                    .get("tuning")
+                    .and_then(|t| t.as_table())
+                    .is_some_and(|t| t.is_empty())
+                {
+                    table.remove("tuning");
+                }
+            }
+            Ok(value)
+        }
+        let (old, new) = (strip(old)?, strip(new)?);
+        if old == new {
+            return Ok(());
+        }
+        let (old, new) = (old.as_table(), new.as_table());
+        let keys = old
+            .into_iter()
+            .chain(new)
+            .flat_map(|t| t.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let differing = keys
+            .into_iter()
+            .find(|k| old.and_then(|t| t.get(k)) != new.and_then(|t| t.get(k)))
+            .unwrap_or_else(|| "the config".into());
+        Err(differing)
     }
 
     /// Where the control socket is: `[control] socket`, else next to the config file it
@@ -1715,6 +1816,32 @@ impl Config {
         if tuning.threads == Some(0) {
             bail!("tuning.threads must be at least 1");
         }
+        if !SOCKET_BUFFER.contains(&tuning.udp.socket_buffer) {
+            bail!(
+                "tuning.udp_socket_buffer must be between {} and {} bytes",
+                SOCKET_BUFFER.start(),
+                SOCKET_BUFFER.end()
+            );
+        }
+        if tuning
+            .tcp_buffer
+            .is_some_and(|b| !SOCKET_BUFFER.contains(&b))
+        {
+            bail!(
+                "tuning.tcp_buffer must be between {} and {} bytes",
+                SOCKET_BUFFER.start(),
+                SOCKET_BUFFER.end()
+            );
+        }
+        if let Some(cc) = &tuning.tcp_congestion {
+            let name_ok = (1..=16).contains(&cc.len())
+                && cc
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !name_ok {
+                bail!("tuning.tcp_congestion must be a kernel algorithm name (bbr, cubic, ...)");
+            }
+        }
         let udp_timeout = tuning.udp.timeout.as_secs();
         if !UDP_TIMEOUT_SECS.contains(&udp_timeout) {
             bail!(
@@ -1797,7 +1924,7 @@ impl Config {
             ("send_window", k.send_window, KCP_SEND_WINDOW),
             ("recv_window", k.recv_window, KCP_RECV_WINDOW),
         ] {
-            if !range.contains(&window) {
+            if window.is_some_and(|w| !range.contains(&w)) {
                 bail!(
                     "tunnel.kcp.{name} must be between {} and {} packets",
                     range.start(),
@@ -1838,6 +1965,17 @@ impl Config {
     /// path); a user who wants it can still set `[tunnel.kcp] fec_data`/`fec_parity`.
     pub fn kcp(&self) -> KcpConfig {
         let mut k = self.tunnel.kcp.clone().unwrap_or_default();
+        // The send window is where the adaptive window starts (about bandwidth x RTT /
+        // 1300 packets fills a path); the receive window is how far it may grow, and
+        // what the peer may have in flight towards this side, which costs memory only
+        // when the reader falls behind.
+        let (send, recv) = match self.profile {
+            Profile::Balanced => (1024, 4096),
+            Profile::Ultraspeed => (1024, 16384),
+            Profile::Gaming => (512, 2048),
+        };
+        k.send_window.get_or_insert(send);
+        k.recv_window.get_or_insert(recv);
         let unset = k.fec_data.is_none() && k.fec_parity.is_none();
         if self.profile == Profile::Gaming
             && self.tunnel.transport != TransportKind::Udp
@@ -2770,6 +2908,75 @@ mod tests {
         assert_eq!(t.keepalive, Duration::from_secs(10));
     }
 
+    #[test]
+    fn socket_knobs_are_optional_and_checked() {
+        let base = with_transport("entry", "tcp", "");
+        let c = Config::parse(&base).unwrap();
+        let t = c.tuning();
+        assert_eq!((t.tcp_buffer, t.tcp_congestion.as_deref()), (None, None));
+        assert_eq!(t.udp.socket_buffer, 1 << 20);
+        let text = format!(
+            "{base}\n[tuning]\nudp_socket_buffer = 2097152\ntcp_buffer = 4194304\n\
+             tcp_congestion = \"bbr\"\n"
+        );
+        let t = Config::parse(&text).unwrap().tuning();
+        assert_eq!(t.udp.socket_buffer, 2 << 20);
+        assert_eq!(t.tcp_buffer, Some(4 << 20));
+        assert_eq!(t.tcp_congestion.as_deref(), Some("bbr"));
+        for (line, key) in [
+            ("udp_socket_buffer = 1024", "tuning.udp_socket_buffer"),
+            ("tcp_buffer = 999999999999", "tuning.tcp_buffer"),
+            ("tcp_congestion = \"B B R\"", "tuning.tcp_congestion"),
+            ("tcp_congestion = \"\"", "tuning.tcp_congestion"),
+        ] {
+            let text = format!("{base}\n[tuning]\n{line}\n");
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(err.contains(key), "{line}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_reload_tells_forward_changes_from_the_rest() {
+        let base = "role = \"entry\"\nmode = \"direct\"\n[tunnel]\nremote = \"1.2.3.4:5000\"\n\
+                    token = \"0123456789abcdef0123\"\n[tuning]\nmax_conns_per_ip = 10\n\
+                    [[forward]]\nlisten = \"0.0.0.0:80\"\ntarget = \"127.0.0.1:80\"\n";
+        let same = base.replace("127.0.0.1:80", "127.0.0.1:81")
+            + "[[forward]]\nlisten = \"0.0.0.0:443\"\ntarget = \"127.0.0.1:443\"\n";
+        assert_eq!(Config::same_but_forwards(base, &same), Ok(()));
+        let limits = base.replace(
+            "max_conns_per_ip = 10",
+            "max_conns_per_ip = 20\nudp_max_flows = 100",
+        );
+        assert_eq!(Config::same_but_forwards(base, &limits), Ok(()));
+        let no_tuning = base.replace("[tuning]\nmax_conns_per_ip = 10\n", "");
+        assert_eq!(Config::same_but_forwards(base, &no_tuning), Ok(()));
+        // The same by meaning: a default written out, a table spelled in another order.
+        let spelled_out = format!(
+            "profile = \"balanced\"\n{}",
+            base.replace("[tunnel]\n", "[tunnel]\nencryption = \"auto\"\n")
+        );
+        assert_eq!(Config::same_but_forwards(base, &spelled_out), Ok(()));
+        let other = base.replace("1.2.3.4:5000", "1.2.3.4:5001");
+        assert_eq!(
+            Config::same_but_forwards(base, &other),
+            Err("tunnel".into())
+        );
+        let profile = format!("profile = \"gaming\"\n{base}");
+        assert_eq!(
+            Config::same_but_forwards(base, &profile),
+            Err("profile".into())
+        );
+        let tuning = base.replace(
+            "max_conns_per_ip = 10",
+            "max_conns_per_ip = 10\nbuffer_size = 4096",
+        );
+        assert_eq!(
+            Config::same_but_forwards(base, &tuning),
+            Err("tuning".into())
+        );
+        assert!(Config::same_but_forwards(base, "not = [toml").is_err());
+    }
+
     /// A config for `transport`, with extra `[tunnel]` lines and sub-tables appended.
     fn with_transport(role: &str, transport: &str, extra: &str) -> String {
         let (tunnel, forward) = if role == "entry" {
@@ -3440,7 +3647,24 @@ keepalive_secs = 1
         assert!(c.warnings().is_empty());
         let k = KcpConfig::default();
         assert_eq!(k.mode, KcpMode::Fast2);
-        assert_eq!((k.send_window, k.recv_window, k.mtu), (1024, 1024, 1350));
+        assert_eq!((k.send_window, k.recv_window, k.mtu), (None, None, 1350));
+        let c = Config::parse(&with_transport("entry", "kcp", "")).unwrap();
+        assert_eq!(
+            (c.kcp().send_window, c.kcp().recv_window),
+            (Some(1024), Some(4096))
+        );
+        assert!(c.kcp().adaptive);
+        for (profile, send, recv) in [("ultraspeed", 1024, 16384), ("gaming", 512, 2048)] {
+            let text = format!(
+                "profile = \"{profile}\"\n{}",
+                with_transport("entry", "kcp", "")
+            );
+            let c = Config::parse(&text).unwrap();
+            assert_eq!(
+                (c.kcp().send_window, c.kcp().recv_window),
+                (Some(send), Some(recv))
+            );
+        }
         assert_eq!(
             k.timing(),
             KcpTiming {
@@ -3465,7 +3689,10 @@ keepalive_secs = 1
             "[tunnel.kcp]\nmode = \"normal\"\nsend_window = 256\nrecv_window = 512\nmtu = 1200",
         );
         let k = Config::parse(&text).unwrap().tunnel.kcp.unwrap();
-        assert_eq!((k.send_window, k.recv_window, k.mtu), (256, 512, 1200));
+        assert_eq!(
+            (k.send_window, k.recv_window, k.mtu),
+            (Some(256), Some(512), 1200)
+        );
         assert_eq!(k.fec(), None);
         assert_eq!(k.timing().interval_ms, 40);
         assert!(!k.timing().nodelay);

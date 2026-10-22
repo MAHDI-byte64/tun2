@@ -57,6 +57,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Make the running entry side read its config file again and apply its `[[forward]]`
+    /// rules (and `tuning.max_conns_per_ip` / `udp_max_flows`) without a restart: the
+    /// rules that stay keep their connections. Anything else changed in the file is
+    /// refused: restart for that. `systemctl reload kariz@NAME` runs this.
+    Reload {
+        #[arg(short, long, default_value = "/etc/kariz/config.toml")]
+        config: PathBuf,
+    },
     /// Generate a random token for `tunnel.token`.
     Token,
     /// Print the `tunnel.tls.pin_sha256` value of a certificate (PEM file), for dialing
@@ -183,6 +191,7 @@ fn main() -> Result<()> {
             watch,
             json,
         } => status(&config, watch, json),
+        Command::Reload { config } => reload(&config),
         Command::Token => {
             let mut bytes = [0u8; 24];
             getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -503,6 +512,58 @@ fn status(_: &Path, _: bool, _: bool) -> Result<()> {
     bail!("`kariz status` needs a Linux server: it talks to the running daemon over a Unix socket")
 }
 
+/// `kariz reload`: asks the running daemon of this config to apply its forward rules
+/// again. Exit code 2 when the daemon refuses (something else changed: restart), 3 when
+/// it is not running.
+#[cfg(unix)]
+fn reload(path: &Path) -> Result<()> {
+    let config = Config::load(path)?;
+    let socket = config
+        .control_socket()
+        .context("this config has no control socket")?;
+    let name = path
+        .file_stem()
+        .map_or("tunnel".into(), |s| s.to_string_lossy().into_owned());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let connection = kariz::control::connect(&socket).await?;
+        kariz::control::reload(connection).await
+    });
+    match result {
+        Ok(report) => {
+            println!("{name}: reloaded; {report}");
+            if !report.failed.is_empty() {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            eprintln!(
+                "kariz reload: {name} is not running (nothing answers on {}); \
+                 see `systemctl status kariz@{name}`",
+                socket.display()
+            );
+            std::process::exit(3);
+        }
+        Err(e) => {
+            eprintln!("kariz reload: {name}: {e} (restart it: `systemctl restart kariz@{name}`)");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn reload(_: &Path) -> Result<()> {
+    bail!("`kariz reload` needs a Linux server: it talks to the running daemon over a Unix socket")
+}
+
 /// `kariz speedtest`: asks the running daemon of this config for a test and shows it.
 #[cfg(unix)]
 fn speedtest(config: &Config, options: Options) -> Result<()> {
@@ -579,7 +640,31 @@ fn run(config: Config) -> Result<()> {
     }
     let runtime = builder.enable_all().build()?;
 
+    #[cfg(unix)]
+    let control_socket = config.control_socket();
     runtime.block_on(async move {
+        // SIGHUP asks the daemon, through its own control socket, to apply its forward
+        // rules again (every role takes the signal, so it never kills an exit side; the
+        // exit answers that it is not an entry).
+        #[cfg(unix)]
+        if let Some(socket) = control_socket {
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+                    return;
+                };
+                while hangup.recv().await.is_some() {
+                    let reloaded = async {
+                        let connection = kariz::control::connect(&socket).await?;
+                        kariz::control::reload(connection).await
+                    };
+                    match reloaded.await {
+                        Ok(report) => tracing::info!(%report, "reloaded on SIGHUP"),
+                        Err(e) => tracing::warn!(error = %e, "SIGHUP: not reloaded"),
+                    }
+                }
+            });
+        }
         tokio::select! {
             result = kariz::run(config) => result,
             _ = shutdown_signal() => {
@@ -689,8 +774,8 @@ fn print_summary(config: &Config) {
             t.interval_ms,
             t.resend,
             t.no_congestion,
-            kcp.send_window,
-            kcp.recv_window,
+            kcp.send_window.unwrap_or(0),
+            kcp.recv_window.unwrap_or(0),
             kcp.mtu,
             match kcp.fec() {
                 Some((data, parity)) => format!("{data}+{parity}"),
@@ -720,11 +805,18 @@ fn print_summary(config: &Config) {
         }
     }
     println!(
-        "  tuning    : nodelay={} buffer={}B keepalive={}s",
+        "  tuning    : nodelay={} buffer={}B keepalive={}s udp_socket_buffer={}B",
         tuning.nodelay,
         tuning.buffer_size,
-        tuning.keepalive.as_secs()
+        tuning.keepalive.as_secs(),
+        tuning.udp.socket_buffer
     );
+    if let Some(size) = tuning.tcp_buffer {
+        println!("  tcp buffer: {size}B (SO_RCVBUF/SO_SNDBUF; the kernel caps it at net.core.rmem_max / wmem_max and stops autotuning)");
+    }
+    if let Some(name) = &tuning.tcp_congestion {
+        println!("  tcp cc    : {name} (TCP_CONGESTION; needs the kernel module)");
+    }
     if let Some(dscp) = tuning.dscp {
         let name = Dscp::name_of(dscp).map_or(String::new(), |n| format!(" ({n})"));
         let sockets = if config.tunnel.transport == TransportKind::Quic {

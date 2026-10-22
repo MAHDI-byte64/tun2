@@ -128,7 +128,10 @@ journalctl -u kariz -f
 ```
 
 The unit reads `/etc/kariz/config.toml`, restarts Kariz if it stops, and grants the
-capabilities for ports below 1024.
+capabilities for ports below 1024. After a change to the `[[forward]]` rules alone,
+`sudo systemctl reload kariz` applies them to the running entry without dropping anything
+([details](configuration.md#reloading-the-forward-rules)); any other change needs
+`sudo systemctl restart kariz`.
 
 ## Next
 

@@ -13,6 +13,7 @@ pub mod session;
 pub mod transport;
 
 mod auto;
+pub mod batch;
 mod channel;
 mod entry;
 mod exit;

@@ -18,21 +18,21 @@ use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use socket2::SockRef;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tracing::{debug, warn};
 
 use crate::channel::Channel;
 use crate::config::{Tuning, UdpTuning};
 use crate::crypto::datagram::ReplayWindow;
-use crate::limit::{PerIp, Slot};
+use crate::limit::{Limits, PerIp, Slot};
 use crate::mux::Transport;
 use crate::proto::{self, Duplicate, MAX_DATAGRAM};
 use crate::relay::Counters;
@@ -41,8 +41,13 @@ use crate::stats::{ForwardStats, Tally};
 
 /// Receive buffer for one packet: the largest UDP payload fits.
 const PACKET_BUFFER: usize = 64 * 1024;
+/// Packets a rule's socket receives in one call at most (its buffers grow to this many
+/// while receives come back full: a busy rule holds `SERVE_BATCH` × 64 KiB).
+const SERVE_BATCH: usize = 16;
 /// Packets gathered into one write on a channel without mux.
 const WRITE_BATCH: usize = 64 * 1024;
+/// Packets from the tunnel delivered to the local side in one send call at most.
+const REPLY_BATCH: usize = 32;
 /// A client whose flow could not be opened is ignored this long.
 const FAILED_BACKOFF: Duration = Duration::from_secs(5);
 /// At most one "too many flows" warning per rule in this interval.
@@ -62,6 +67,16 @@ pub trait PacketSource: Send {
 /// Where a flow's packets go outside the tunnel.
 pub trait PacketSink: Send + Sync {
     fn send(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Sends several packets, in order; a sink that can send them in one call does.
+    fn send_many(&self, packets: &[Bytes]) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            for packet in packets {
+                self.send(packet).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Bytes in front of every packet of a flow with duplication.
@@ -184,15 +199,22 @@ where
             sleep(idle - quiet).await;
         }
     };
-    let deliver = |packet: Bytes, tally: &mut Tally<'_>| {
-        tally.add(packet.len());
-        let sink = &sink;
-        async move {
-            if let Err(e) = sink.send(&packet).await {
-                debug!(error = %e, "UDP packet not delivered");
-            }
+    /// Strips the number of a packet of a flow with duplication, dropping a copy.
+    fn accept(dedup: &mut Option<Dedup>, packet: Bytes) -> Option<Bytes> {
+        match dedup {
+            Some(dedup) => dedup.accept(packet),
+            None => Some(packet),
         }
-    };
+    }
+    /// Delivers the packets from the tunnel to the local side in one call.
+    async fn deliver<S: PacketSink>(sink: &S, packets: &[Bytes], tally: &mut Tally<'_>) {
+        for packet in packets {
+            tally.add(packet.len());
+        }
+        if let Err(e) = sink.send_many(packets).await {
+            debug!(error = %e, "UDP packets not delivered");
+        }
+    }
 
     match channel {
         Channel::Stream(stream) => {
@@ -236,26 +258,30 @@ where
             let down = async {
                 let mut tally = Tally::new(counters.written);
                 let mut dedup = duplicate.map(|_| Dedup::default());
+                let mut out = Vec::with_capacity(REPLY_BATCH);
                 loop {
-                    match stream.recv_datagram().await {
-                        Ok(Some(packet)) => {
-                            touch();
-                            let packet = match &mut dedup {
-                                Some(dedup) => match dedup.accept(packet) {
-                                    Some(packet) => packet,
-                                    None => continue,
-                                },
-                                None => packet,
-                            };
-                            deliver(packet, &mut tally).await;
-                        }
+                    let first = match stream.recv_datagram().await {
+                        Ok(Some(packet)) => packet,
                         Ok(None) => return Ok(()),
                         // v0.2 peers reset UDP opens as a protocol error.
                         Err(_) if stream.reset_reason() == Some(ResetReason::Protocol) => {
                             return Err(ResetReason::Unsupported.to_error())
                         }
                         Err(e) => return Err(e),
+                    };
+                    touch();
+                    // Whatever else has arrived goes out in the same call.
+                    out.clear();
+                    let mut next = Some(first);
+                    while let Some(packet) = next {
+                        out.extend(accept(&mut dedup, packet));
+                        next = if out.len() < REPLY_BATCH {
+                            stream.try_recv_datagram()
+                        } else {
+                            None
+                        };
                     }
+                    deliver(&sink, &out, &mut tally).await;
                 }
             };
             let result = tokio::select! {
@@ -267,7 +293,7 @@ where
             result
         }
         Channel::Link(link) => {
-            let (mut reader, mut writer) = link.into_halves();
+            let (reader, mut writer) = link.into_halves();
             let up = async {
                 let mut tally = Tally::new(counters.read);
                 let mut batch = Vec::with_capacity(WRITE_BATCH);
@@ -301,16 +327,21 @@ where
             let down = async {
                 let mut tally = Tally::new(counters.written);
                 let mut dedup = duplicate.map(|_| Dedup::default());
-                while let Some(packet) = proto::read_datagram(&mut reader).await? {
+                let mut reader = proto::DatagramReader::new(reader);
+                let mut out = Vec::with_capacity(REPLY_BATCH);
+                while let Some(first) = reader.next().await? {
                     touch();
-                    let packet = match &mut dedup {
-                        Some(dedup) => match dedup.accept(packet) {
-                            Some(packet) => packet,
-                            None => continue,
-                        },
-                        None => packet,
-                    };
-                    deliver(packet, &mut tally).await;
+                    out.clear();
+                    let mut next = Some(first);
+                    while let Some(packet) = next {
+                        out.extend(accept(&mut dedup, packet));
+                        next = if out.len() < REPLY_BATCH {
+                            reader.try_next()?
+                        } else {
+                            None
+                        };
+                    }
+                    deliver(&sink, &out, &mut tally).await;
                 }
                 Ok(())
             };
@@ -418,6 +449,14 @@ impl PacketSink for ConnectedSink {
             r => r.map(|_| ()),
         }
     }
+
+    async fn send_many(&self, packets: &[Bytes]) -> io::Result<()> {
+        let slices: Vec<&[u8]> = packets.iter().map(|p| &p[..]).collect();
+        match crate::batch::send_all(&self.0, &slices, None).await {
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Ok(()),
+            r => r,
+        }
+    }
 }
 
 // ---- Entry side ----
@@ -508,6 +547,48 @@ impl PacketSink for ReplyTo {
     async fn send(&self, packet: &[u8]) -> io::Result<()> {
         self.socket.send_to(packet, self.client).await.map(|_| ())
     }
+
+    async fn send_many(&self, packets: &[Bytes]) -> io::Result<()> {
+        let slices: Vec<&[u8]> = packets.iter().map(|p| &p[..]).collect();
+        crate::batch::send_all(&self.socket, &slices, Some(self.client)).await
+    }
+}
+
+/// What a rule's new flows need, which a reload may change under a running rule: the
+/// target, the encoded open request that names it, and the duplication.
+pub struct Rule {
+    inner: RwLock<RuleInner>,
+}
+
+struct RuleInner {
+    target: String,
+    open: Bytes,
+    duplicate: Option<Duplicate>,
+}
+
+impl Rule {
+    pub fn new(target: &str, open: Bytes, duplicate: Option<Duplicate>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new(RuleInner {
+                target: target.to_string(),
+                open,
+                duplicate,
+            }),
+        })
+    }
+
+    /// New values for the flows opened from now on; the ones open keep theirs.
+    pub fn set(&self, target: &str, open: Bytes, duplicate: Option<Duplicate>) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.target = target.to_string();
+        inner.open = open;
+        inner.duplicate = duplicate;
+    }
+
+    fn get(&self) -> (String, Bytes, Option<Duplicate>) {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        (inner.target.clone(), inner.open.clone(), inner.duplicate)
+    }
 }
 
 /// Binds the UDP socket of a forward rule.
@@ -554,72 +635,107 @@ impl Flows {
 }
 
 /// Entry side: serves one UDP forward rule on `socket`. `open` opens a tunnel path for a
-/// new flow (the open request is the caller's, and carries `duplicate`). A flow holds a
-/// slot of `per_ip` while it lives. `datagram_only`: the `udp` transport forwards without
-/// a reliable fallback (see [`relay`]). Runs until the socket fails.
+/// new flow, for the encoded open request the rule holds now. A flow holds a slot of the
+/// per-address limit in `limits` while it lives. `datagram_only`: the `udp` transport
+/// forwards without a reliable fallback (see [`relay`]). Runs until the socket fails or
+/// `stop` says so (a reload that removed the rule); then every flow ends too.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve<O, F>(
     socket: UdpSocket,
     udp: UdpTuning,
-    target: String,
-    duplicate: Option<Duplicate>,
+    rule: Arc<Rule>,
     datagram_only: bool,
     stats: Arc<ForwardStats>,
-    per_ip: Option<Arc<PerIp>>,
+    limits: Arc<Limits>,
     open: O,
+    mut stop: watch::Receiver<bool>,
 ) -> io::Result<()>
 where
-    O: Fn() -> F + Send + Sync + 'static,
+    O: Fn(Bytes) -> F + Send + Sync + 'static,
     F: Future<Output = io::Result<Channel>> + Send + 'static,
 {
     let socket = Arc::new(socket);
     let flows = Arc::new(Mutex::new(Flows::default()));
     let open = Arc::new(open);
-    let mut buf = vec![0u8; PACKET_BUFFER];
+    // Packets come in batches: one call brings all that wait. Each is copied out at its
+    // real length (a slice of a shared arena would keep the whole arena alive for as long
+    // as one packet sat in an idle flow's queue).
+    let mut batch = crate::batch::RecvBatch::new(PACKET_BUFFER, 1, SERVE_BATCH);
     loop {
-        let (n, client) = match socket.recv_from(&mut buf).await {
-            Ok(v) => v,
+        let received = tokio::select! {
+            r = batch.recv(&socket) => r,
+            _ = stop.changed() => return Ok(()),
+        };
+        match received {
+            Ok(()) => {}
             // Linux reports ICMP errors for earlier replies here; not fatal.
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => continue,
             Err(e) => return Err(e),
-        };
-        let packet = Bytes::copy_from_slice(&buf[..n]);
+        }
+        let per_ip = limits.per_ip();
+        let max_flows = limits.max_flows();
         let mut guard = flows.lock().unwrap_or_else(|e| e.into_inner());
         let table = &mut *guard;
         let now = Instant::now();
-        match table.map.get(&client) {
-            Some(FlowState::Active { queue, .. }) => match queue.push(packet) {
-                Ok(()) => continue,
-                // The flow is behind: drop, as the network would.
-                Err(PushError::Full) => continue,
-                // The flow just ended; start a new one.
-                Err(PushError::Closed(p)) => {
-                    if let Some(slot) = slot_for(table, client, per_ip.as_ref(), &stats) {
-                        let rule = (&udp, target.as_str(), duplicate, datagram_only, &stats);
-                        start_flow(table, client, p, slot, &socket, rule, &flows, &open);
+        for (data, client) in batch.packets() {
+            let packet = Bytes::copy_from_slice(data);
+            match table.map.get(&client) {
+                Some(FlowState::Active { queue, .. }) => match queue.push(packet) {
+                    Ok(()) => continue,
+                    // The flow is behind: drop, as the network would.
+                    Err(PushError::Full) => continue,
+                    // The flow just ended; start a new one.
+                    Err(PushError::Closed(p)) => {
+                        if let Some(slot) = slot_for(table, client, per_ip.as_ref(), &stats) {
+                            let flow = FlowSetup {
+                                udp: &udp,
+                                rule: &rule,
+                                datagram_only,
+                                stats: &stats,
+                                stop: &stop,
+                            };
+                            start_flow(table, client, p, slot, &socket, flow, &flows, &open);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            },
-            Some(FlowState::Failed { until }) if now < *until => continue,
-            _ => {}
-        }
-        if table.active >= udp.max_flows {
-            let due = table
-                .last_full_warning
-                .map_or(true, |t| now.duration_since(t) >= FULL_WARN_INTERVAL);
-            if due {
-                table.last_full_warning = Some(now);
-                warn!(%target, max = udp.max_flows, "too many UDP flows (tuning.udp_max_flows), dropping packets from new clients; the ones open go on");
+                },
+                Some(FlowState::Failed { until }) if now < *until => continue,
+                _ => {}
             }
-            continue;
+            if table.active >= max_flows {
+                let due = table
+                    .last_full_warning
+                    .map_or(true, |t| now.duration_since(t) >= FULL_WARN_INTERVAL);
+                if due {
+                    table.last_full_warning = Some(now);
+                    let (target, _, _) = rule.get();
+                    warn!(%target, max = max_flows, "too many UDP flows (tuning.udp_max_flows), dropping packets from new clients; the ones open go on");
+                }
+                continue;
+            }
+            let Some(slot) = slot_for(table, client, per_ip.as_ref(), &stats) else {
+                continue;
+            };
+            let flow = FlowSetup {
+                udp: &udp,
+                rule: &rule,
+                datagram_only,
+                stats: &stats,
+                stop: &stop,
+            };
+            start_flow(table, client, packet, slot, &socket, flow, &flows, &open);
         }
-        let Some(slot) = slot_for(table, client, per_ip.as_ref(), &stats) else {
-            continue;
-        };
-        let rule = (&udp, target.as_str(), duplicate, datagram_only, &stats);
-        start_flow(table, client, packet, slot, &socket, rule, &flows, &open);
     }
+}
+
+/// What a new flow is started with: the rule's tuning, its cell, `datagram_only` (see
+/// [`relay`]), its counters and the rule's stop signal.
+struct FlowSetup<'a> {
+    udp: &'a UdpTuning,
+    rule: &'a Arc<Rule>,
+    datagram_only: bool,
+    stats: &'a Arc<ForwardStats>,
+    stop: &'a watch::Receiver<bool>,
 }
 
 /// The per-address slot for a new flow of `client` (`Some(None)` without a limit), or
@@ -646,8 +762,7 @@ fn slot_for(
     None
 }
 
-/// Starts a flow for `client` with `packet` as its first packet. `rule`: the rule's
-/// tuning, target, duplication, `datagram_only` (see [`relay`]) and counters.
+/// Starts a flow for `client` with `packet` as its first packet.
 #[allow(clippy::too_many_arguments)]
 fn start_flow<O, F>(
     table: &mut Flows,
@@ -655,20 +770,20 @@ fn start_flow<O, F>(
     packet: Bytes,
     slot: Option<Slot>,
     socket: &Arc<UdpSocket>,
-    rule: (
-        &UdpTuning,
-        &str,
-        Option<Duplicate>,
-        bool,
-        &Arc<ForwardStats>,
-    ),
+    flow: FlowSetup<'_>,
     flows: &Arc<Mutex<Flows>>,
     open: &Arc<O>,
 ) where
-    O: Fn() -> F + Send + Sync + 'static,
+    O: Fn(Bytes) -> F + Send + Sync + 'static,
     F: Future<Output = io::Result<Channel>> + Send + 'static,
 {
-    let (udp, target, duplicate, datagram_only, stats) = rule;
+    let FlowSetup {
+        udp,
+        rule,
+        datagram_only,
+        stats,
+        stop,
+    } = flow;
     if matches!(table.map.get(&client), Some(FlowState::Active { .. })) {
         table.active -= 1;
     }
@@ -681,16 +796,17 @@ fn start_flow<O, F>(
     table.active += 1;
 
     let (socket, flows, open) = (socket.clone(), flows.clone(), open.clone());
-    let (idle, target, stats) = (udp.timeout, target.to_owned(), stats.clone());
+    let (target, open_request, duplicate) = rule.get();
+    let (idle, stats, mut stop) = (udp.timeout, stats.clone(), stop.clone());
     tokio::spawn(async move {
         debug!(%client, %target, "UDP flow opened");
         let _open = stats.udp_flow();
         let _slot = slot;
         let mut opened = false;
-        let result = async {
+        let flow = async {
             // Boxed: opening (dial, handshake, waiting for a session) needs far more state
             // than relaying, and an unboxed future would reserve that for the flow's life.
-            let channel = Box::pin(open()).await?;
+            let channel = Box::pin(open(open_request)).await?;
             opened = true;
             let counters = Counters {
                 read: &stats.traffic.up,
@@ -698,8 +814,12 @@ fn start_flow<O, F>(
             };
             let sink = ReplyTo { socket, client };
             relay(channel, rx, sink, idle, duplicate, datagram_only, counters).await
-        }
-        .await;
+        };
+        // The rule was removed by a reload: the flow ends, as it would on a restart.
+        let result = tokio::select! {
+            r = flow => r,
+            _ = stop.changed() => Ok(()),
+        };
         let open_failed = match &result {
             Err(e) if !opened => {
                 warn!(%client, %target, error = %e, "could not open a UDP flow");
@@ -759,13 +879,13 @@ mod tests {
     async fn serve_limited(
         max_flows: usize,
         fail: bool,
-        per_ip: Option<Arc<PerIp>>,
+        per_ip: Option<u32>,
     ) -> (SocketAddr, Arc<AtomicUsize>, Arc<ForwardStats>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let opener = move || {
+        let opener = move |_open: Bytes| {
             c.fetch_add(1, Ordering::SeqCst);
             async move {
                 if fail {
@@ -776,15 +896,22 @@ mod tests {
             }
         };
         let stats = ForwardStats::new("127.0.0.1:0", "target", "udp");
+        let limits = Limits::new(None, max_flows);
+        if let Some(limit) = per_ip {
+            limits.set(Some(limit), max_flows);
+        }
+        let (_stop, stopped) = watch::channel(false);
+        // Kept for the test's life, so the rule is never told to stop.
+        std::mem::forget(_stop);
         tokio::spawn(serve(
             socket,
             tuning(max_flows),
-            "target".into(),
-            None,
+            Rule::new("target", Bytes::new(), None),
             false,
             stats.clone(),
-            per_ip,
+            limits,
             opener,
+            stopped,
         ));
         (addr, calls, stats)
     }
@@ -820,8 +947,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_address_gets_only_its_share_of_flows() {
-        let limit = PerIp::new(2);
-        let (addr, calls, stats) = serve_limited(10, false, Some(limit)).await;
+        let (addr, calls, stats) = serve_limited(10, false, Some(2)).await;
         // Five clients from one address (127.0.0.1): two flows, the rest refused.
         let mut clients = Vec::new();
         for _ in 0..5 {
@@ -843,8 +969,8 @@ mod tests {
              target = \"127.0.0.1:53\"\nprotocol = \"udp\"\n",
         )
         .unwrap();
-        let mut all = crate::stats::Stats::new(&config);
-        Arc::get_mut(&mut all).unwrap().forwards = vec![stats.clone()];
+        let all = crate::stats::Stats::new(&config);
+        all.set_forwards(vec![stats.clone()]);
         all.snapshot().forwards.remove(0)
     }
 

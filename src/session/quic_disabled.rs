@@ -91,4 +91,8 @@ impl QuicStream {
     pub async fn recv_datagram(&self) -> io::Result<Option<Bytes>> {
         match *self {}
     }
+
+    pub fn try_recv_datagram(&self) -> Option<Bytes> {
+        match *self {}
+    }
 }

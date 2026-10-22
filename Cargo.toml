@@ -1,6 +1,6 @@
 [package]
 name = "kariz"
-version = "2.9.3"
+version = "2.10.0"
 edition = "2021"
 rust-version = "1.80"
 description = "High-performance, resource-efficient tunnel core for server-to-server links, built to resist DPI."
@@ -32,6 +32,8 @@ blake3 = "1.8"
 bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
+# sendmmsg / recvmmsg on Linux (src/batch.rs); already in the tree through tokio.
+libc = "0.2"
 httparse = "1.10"
 # transport = "faketcp" / "icmp": build and parse IP/TCP/ICMP (etherparse) and the raw
 # sockets / getifaddrs (nix). Both pinned to an MSRV-1.80-safe line: etherparse 0.17 has

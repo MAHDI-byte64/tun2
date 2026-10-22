@@ -275,8 +275,8 @@ async fn transfer_with_loss(fec: Option<(usize, usize)>) -> (KcpStats, KcpStats)
     // A window near the path's capacity, as it would be configured for it, and the
     // gentle preset: with a 30 ms minimum timeout (the fast ones) KCP also resends many
     // segments that only had their acks delayed, which would drown what FEC saves.
-    params.config.send_window = 256;
-    params.config.recv_window = 256;
+    params.config.send_window = Some(256);
+    params.config.recv_window = Some(256);
     params.config.mode = crate::config::KcpMode::Normal;
     let l = KcpListener::bind("127.0.0.1:0", &params, &tuning())
         .await

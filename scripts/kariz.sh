@@ -509,6 +509,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/kariz run -c /etc/kariz/%i.toml
+ExecReload=/usr/local/bin/kariz reload -c /etc/kariz/%i.toml
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576

@@ -69,6 +69,7 @@ cargo build --release --no-default-features --features quic,kcp
 ## اجرای بنچمارک‌ها
 
 ```bash
+scripts/bench.sh run before                                                # the matrix
 cargo test --release --test tunnel throughput -- --ignored --nocapture     # localhost
 cargo test --release --test tunnel udp_ -- --ignored --nocapture           # UDP rates
 cargo test --release --test tunnel lossy_link -- --ignored --nocapture     # lossy path
@@ -77,3 +78,5 @@ scripts/rss.sh tcpmux 100                                                  # mem
 ```
 
 `KARIZ_BENCH_ONLY=kcp` بنچمارک‌های `lossy_link` و `game_traffic` را به ردیف‌هایی محدود می‌کند که نامشان `kcp` دارد. `KARIZ_BENCH_LOSS=1` یک نرخ اتلاف را اجرا می‌کند.
+
+**ماتریس** (`bench_matrix`، که `scripts/bench.sh` اجرایش می‌کند) همان چیزی است که دو بیلد را با آن مقایسه می‌کنیم: چهار ترنسپورت (`tcpmux`، `wss`، `kcp`، `quic`) × سه پروفایل × پنج مسیر (localhost؛ RTT ۴۰ میلی‌ثانیه؛ ۴۰ میلی‌ثانیه با ۱٪ اتلاف؛ ۱۰۰ میلی‌ثانیه با ۲ میلی‌ثانیه جیتر و ۰٫۳٪ اتلاف؛ ۴۰ میلی‌ثانیه با ۵۰ مگابیت بر ثانیه و صف ۵۰ میلی‌ثانیه)، هر کدام با یک دانلود تک‌جریانه، یک دانلود هشت‌جریانه و یک جریان UDP از بسته‌های ۱۲۰۰ بایتی با نرخ ۴۰۰۰ در ثانیه (اکو می‌شوند، پس جدول رفت‌وبرگشت و درصد تحویل را هم دارد). `scripts/bench.sh run <label>` جدول را در `target/bench/<label>.md` می‌نویسد و `scripts/bench.sh compare before after` دو جدول را کنار هم با درصد تغییر چاپ می‌کند. `KARIZ_BENCH_ONLY=kcp,quic` فقط ردیف‌هایی را نگه می‌دارد که نامشان یکی از بخش‌ها را دارد (`KARIZ_BENCH_ONLY="=kcp balanced local"` یک ردیف دقیق)، و `KARIZ_BENCH_SECS=5` هر اندازه‌گیری را کوتاه می‌کند (پیش‌فرض ۱۰ ثانیه؛ کل ماتریس با ۱۰ ثانیه حدود ۴۰ دقیقه طول می‌کشد). مسیرها شبیه‌ساز فضای کاربر در `tests/link` هستند، پس این اعداد دو بیلد را روی یک ماشین مقایسه می‌کنند و مسیر واقعی را پیش‌بینی نمی‌کنند.

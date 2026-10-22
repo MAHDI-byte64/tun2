@@ -49,9 +49,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 use tracing::debug;
 
+use crate::batch::RecvBatch;
 use crate::config::{KcpConfig, KcpTiming, Tuning, TunnelConfig};
 use crate::crypto::handshake::Key;
 use crate::crypto::Psk;
+use adaptive::{Adaptive, Step};
 use fec::{FecDecoder, FecEncoder, Shard};
 use protect::{Nonces, Protection};
 
@@ -144,6 +146,8 @@ struct ConnSettings {
     timing: KcpTiming,
     send_window: u16,
     recv_window: u16,
+    /// The send window follows the path (`[tunnel.kcp] adaptive`), up to `recv_window`.
+    adaptive: bool,
     mtu: usize,
     /// A ping goes out every third of it; a peer silent for twice as long is dead.
     keepalive: Duration,
@@ -168,8 +172,9 @@ impl ConnSettings {
     fn new(params: &KcpParams, tuning: &Tuning) -> Self {
         Self {
             timing: params.config.timing(),
-            send_window: params.config.send_window,
-            recv_window: params.config.recv_window,
+            send_window: params.config.send_window.unwrap_or(1024),
+            recv_window: params.config.recv_window.unwrap_or(4096),
+            adaptive: params.config.adaptive,
             mtu: params.config.mtu,
             keepalive: tuning.keepalive,
             socket_buffer: tuning.udp.socket_buffer,
@@ -196,7 +201,9 @@ struct Sender {
     /// The next data segment number never sent: lower ones are resent.
     next_new_sn: u32,
     plain: Vec<u8>,
-    sealed: Vec<u8>,
+    /// Sealed packets waiting for one send call, and spare buffers for the next ones.
+    pending: Vec<Vec<u8>>,
+    spare: Vec<Vec<u8>>,
 }
 
 impl Sender {
@@ -220,18 +227,33 @@ impl Sender {
             stats,
             next_new_sn: 0,
             plain: Vec::with_capacity(1500),
-            sealed: Vec::with_capacity(1500),
+            pending: Vec::with_capacity(crate::batch::MAX_SEND),
+            spare: Vec::with_capacity(crate::batch::MAX_SEND),
         })
     }
 
-    /// Seals and sends `plain`.
+    /// Seals `plain` and queues it for the next [`Self::flush_pending`] (KCP hands over a
+    /// packet per segment; they go out together).
     fn send_plain(&mut self) {
+        let mut sealed = self.spare.pop().unwrap_or_else(|| Vec::with_capacity(1500));
         self.protection
-            .seal(&mut self.nonces, &self.plain, &mut self.sealed);
-        let _ = match self.peer {
-            Some(peer) => self.socket.try_send_to(&self.sealed, peer),
-            None => self.socket.try_send(&self.sealed),
-        };
+            .seal(&mut self.nonces, &self.plain, &mut sealed);
+        self.pending.push(sealed);
+        if self.pending.len() >= crate::batch::MAX_SEND {
+            self.flush_pending();
+        }
+    }
+
+    /// Sends the queued packets in one call (`sendmmsg` on Linux). A full socket buffer
+    /// drops what does not fit, as a congested link would; KCP sends it again.
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let packets: Vec<&[u8]> = self.pending.iter().map(Vec::as_slice).collect();
+        let _ = self.socket.try_send_many(&packets, self.peer);
+        drop(packets);
+        self.spare.append(&mut self.pending);
     }
 
     fn send(&mut self, kind: u8, body: &[u8]) {
@@ -243,13 +265,14 @@ impl Sender {
 
     fn control(&mut self, kind: u8, conv: u32) {
         self.send(kind, &conv.to_le_bytes());
+        self.flush_pending();
     }
 
     /// Sends a datagram beside KCP. With `fec` and FEC on, it goes into the open group
     /// (true: the driver has a group to close on time).
     fn datagram(&mut self, datagram: &[u8], fec: bool, now: Instant) -> bool {
         self.stats.datagrams_sent.fetch_add(1, Ordering::Relaxed);
-        match self.fec.take() {
+        let opened = match self.fec.take() {
             Some(mut encoder) if fec => {
                 let mut content = Vec::with_capacity(DATAGRAM_HEADER + datagram.len());
                 content.extend_from_slice(&(!self.conv).to_le_bytes());
@@ -267,7 +290,9 @@ impl Sender {
                 self.send_plain();
                 false
             }
-        }
+        };
+        self.flush_pending();
+        opened
     }
 
     /// A packet of KCP segments, as is or as an FEC data shard (then the group's parity
@@ -298,6 +323,7 @@ impl Sender {
         if let Some(mut fec) = self.fec.take() {
             fec.close_if_due(now, &mut |shard| self.send_shard(shard));
             self.fec = Some(fec);
+            self.flush_pending();
         }
     }
 
@@ -362,6 +388,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Packet counts of a connection.
 #[derive(Default, Debug)]
 struct ConnStats {
+    /// The send window in use (adapted or configured).
+    window: AtomicU64,
     /// Packets of KCP segments sent (as FEC data shards or not).
     kcp_packets: AtomicU64,
     parity_packets: AtomicU64,
@@ -703,9 +731,15 @@ enum Inbound {
     Dialer {
         socket: Arc<CarrierSocket>,
         protection: Arc<Protection>,
-        buf: Vec<u8>,
+        batch: RecvBatch,
+        /// Opened packets of the last receive not yet handed over.
+        opened: VecDeque<Bytes>,
     },
 }
+
+/// Room for one sealed packet of the largest MTU with FEC overhead (`KCP_MTU` is at most
+/// 1443); anything longer is not one of ours.
+const PACKET_BUFFER: usize = 2048;
 
 impl Inbound {
     /// The next packet's plaintext for conversation `conv`.
@@ -718,18 +752,24 @@ impl Inbound {
             Self::Dialer {
                 socket,
                 protection,
-                buf,
+                batch,
+                opened,
             } => loop {
-                let n = match socket.recv(buf).await {
-                    Ok(n) => n,
+                if let Some(plain) = opened.pop_front() {
+                    return Ok(plain);
+                }
+                match socket.recv_batch(batch).await {
+                    Ok(()) => {}
                     Err(e) if is_icmp_error(&e) => continue,
                     Err(e) => return Err(e),
-                };
-                let Some(plain) = protection.open(&mut buf[..n]) else {
-                    continue;
-                };
-                if conv_of(plain) == Some(conv) {
-                    return Ok(Bytes::copy_from_slice(plain));
+                }
+                for (sealed, _) in batch.packets() {
+                    let Some(plain) = protection.open(sealed) else {
+                        continue;
+                    };
+                    if conv_of(plain) == Some(conv) {
+                        opened.push_back(Bytes::copy_from_slice(plain));
+                    }
                 }
             },
         }
@@ -838,6 +878,10 @@ struct Driver {
     fin_sent: bool,
     /// Segments KCP may hold (queued and in flight) before writers wait.
     max_queued: usize,
+    /// The send window that follows the path, when on.
+    adaptive: Option<Adaptive>,
+    /// Resent and sent packets at the last adaptive step.
+    counted: (u64, u64),
     /// Listener side: tell the demultiplexer when the conversation is over.
     on_exit: Option<(mpsc::UnboundedSender<ConnKey>, ConnKey)>,
 }
@@ -881,6 +925,9 @@ impl Driver {
             }),
         };
         let now = Instant::now();
+        link.stats
+            .window
+            .store(settings.send_window.into(), Ordering::Relaxed);
         let driver = Self {
             kcp,
             conv,
@@ -895,6 +942,15 @@ impl Driver {
             last_ping: now,
             fin_sent: false,
             max_queued: settings.send_window as usize * 2,
+            adaptive: settings.adaptive.then(|| {
+                Adaptive::new(
+                    settings.send_window,
+                    settings.recv_window,
+                    settings.timing.interval_ms,
+                    now,
+                )
+            }),
+            counted: (0, 0),
             on_exit,
         };
         Ok((stream, driver))
@@ -911,6 +967,7 @@ impl Driver {
         debug!(
             conv = self.conv,
             error,
+            window = stats.window.load(Ordering::Relaxed),
             packets = stats.kcp_packets.load(Ordering::Relaxed),
             parity = stats.parity_packets.load(Ordering::Relaxed),
             resent = stats.resent.load(Ordering::Relaxed),
@@ -946,10 +1003,13 @@ impl Driver {
             self.kcp.send(&[MSG_OPEN]).map_err(kcp_error)?;
             self.kcp.flush().map_err(kcp_error)?;
         }
+        self.flush_out();
         loop {
             let now = Instant::now();
             self.kcp.update(self.ms(now)).map_err(kcp_error)?;
+            self.adapt(now);
             self.pump_send()?;
+            self.flush_out();
             self.pump_recv(false)?;
             if now - self.last_heard >= silent_limit {
                 return Err(io::Error::new(
@@ -998,6 +1058,59 @@ impl Driver {
         lock(&self.sender).control(kind, self.conv);
     }
 
+    /// Sends what KCP queued (acks, data, resends) since the last call, in one go.
+    fn flush_out(&mut self) {
+        lock(&self.sender).flush_pending();
+    }
+
+    /// Lets the adaptive send window take its step, if it is time.
+    fn adapt(&mut self, now: Instant) {
+        let Some(adaptive) = &mut self.adaptive else {
+            return;
+        };
+        let stats = &self.link.stats;
+        let resent = stats.resent.load(Ordering::Relaxed);
+        let sent = stats.kcp_packets.load(Ordering::Relaxed);
+        let step = adaptive.decide(
+            now,
+            self.kcp.wait_snd(),
+            self.kcp.rmt_wnd(),
+            resent.saturating_sub(self.counted.0),
+            sent.saturating_sub(self.counted.1),
+        );
+        if step != Step::None {
+            self.counted = (resent, sent);
+        }
+        if let Step::Window(window) = step {
+            // The receive window stays: a 0 leaves it alone.
+            self.kcp.set_wndsize(window, 0);
+            self.max_queued = window as usize * 2;
+            stats.window.store(window.into(), Ordering::Relaxed);
+        }
+    }
+
+    /// Round trips from the acks in a packet of KCP segments: an ack echoes the time
+    /// stamp this side put on the segment it acknowledges.
+    fn sample_rtt(&mut self, packet: &[u8]) {
+        let now = Instant::now();
+        let now_ms = self.ms(now);
+        let Some(adaptive) = &mut self.adaptive else {
+            return;
+        };
+        for segment in segments(packet) {
+            if segment[4] != KCP_CMD_ACK {
+                continue;
+            }
+            let ts = u32::from_le_bytes(segment[8..12].try_into().expect("4 bytes"));
+            let rtt = now_ms.wrapping_sub(ts);
+            // A stamp from the future or a minute old is not a round trip (an ack for a
+            // segment FEC rebuilt carries a future one on purpose).
+            if rtt < 60_000 {
+                adaptive.sample(f64::from(rtt), now);
+            }
+        }
+    }
+
     /// Returns true when the peer closed the conversation cleanly.
     fn on_packet(&mut self, plain: &[u8]) -> io::Result<bool> {
         self.last_heard = Instant::now();
@@ -1010,6 +1123,7 @@ impl Driver {
                     .stats
                     .gaps_filled
                     .fetch_add(filled, Ordering::Relaxed);
+                self.sample_rtt(&plain[1..]);
                 let _ = self.kcp.input(&plain[1..]);
             }
             PACKET_DATAGRAM => self.deliver_datagram(&plain[5..]),
@@ -1023,6 +1137,7 @@ impl Driver {
                             .stats
                             .gaps_filled
                             .fetch_add(filled, Ordering::Relaxed);
+                        self.sample_rtt(content);
                         let _ = self.kcp.input(content);
                     }
                     let (group, index) = fec_header(plain);
@@ -1142,6 +1257,7 @@ impl Driver {
         if sent {
             // Send now rather than at the next interval.
             self.kcp.flush().map_err(kcp_error)?;
+            self.flush_out();
         }
         Ok(())
     }
@@ -1226,7 +1342,8 @@ impl KcpDialer {
         let inbound = Inbound::Dialer {
             socket: socket.clone(),
             protection: self.settings.protection.clone(),
-            buf: vec![0u8; 65_536],
+            batch: RecvBatch::new(PACKET_BUFFER, 4, crate::batch::MAX_RECV),
+            opened: VecDeque::new(),
         };
         let (stream, driver) = Driver::start(conv, socket, None, inbound, &self.settings, None)?;
         tokio::spawn(driver.run(true));
@@ -1295,11 +1412,11 @@ async fn demultiplex(
     let Ok(mut replies) = Sender::new(socket.clone(), None, 0, &settings, stats) else {
         return;
     };
-    let mut buf = vec![0u8; 65_536];
+    let mut batch = RecvBatch::new(PACKET_BUFFER, 8, crate::batch::MAX_RECV);
     loop {
-        let (n, peer) = tokio::select! {
-            received = socket.recv_from(&mut buf) => match received {
-                Ok(r) => r,
+        tokio::select! {
+            received = socket.recv_batch(&mut batch) => match received {
+                Ok(()) => {}
                 Err(e) if is_icmp_error(&e) => continue,
                 Err(e) => {
                     debug!(error = %e, "kcp listener socket failed");
@@ -1311,53 +1428,56 @@ async fn demultiplex(
                 continue;
             }
         };
-        let Some(plain) = settings.protection.open(&mut buf[..n]) else {
-            // Not made with the token: no answer, as from a closed port.
-            continue;
-        };
-        let Some(conv) = conv_of(plain) else {
-            continue;
-        };
-        let key = (peer, conv);
-        if let Some(tx) = conns.get(&key) {
-            match tx.try_send(Bytes::copy_from_slice(plain)) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    conns.remove(&key);
+        for (sealed, peer) in batch.packets() {
+            let Some(plain) = settings.protection.open(sealed) else {
+                // Not made with the token: no answer, as from a closed port.
+                continue;
+            };
+            let Some(conv) = conv_of(plain) else {
+                continue;
+            };
+            let key = (peer, conv);
+            if let Some(tx) = conns.get(&key) {
+                match tx.try_send(Bytes::copy_from_slice(plain)) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        conns.remove(&key);
+                    }
                 }
             }
-        }
-        if !opens_conversation(plain) {
-            if from_earlier_conversation(plain) {
-                replies.peer = Some(peer);
-                replies.control(PACKET_CLOSE, conv);
+            if !opens_conversation(plain) {
+                if from_earlier_conversation(plain) {
+                    replies.peer = Some(peer);
+                    replies.control(PACKET_CLOSE, conv);
+                }
+                continue;
             }
-            continue;
+            if conns.len() >= MAX_CONVERSATIONS {
+                continue;
+            }
+            let Ok(permit) = accepted.try_reserve() else {
+                continue;
+            };
+            let (tx, rx) = mpsc::channel(CONN_QUEUE);
+            let started = Driver::start(
+                conv,
+                socket.clone(),
+                Some(peer),
+                Inbound::Listener(rx),
+                &settings,
+                Some((ended_tx.clone(), key)),
+            );
+            let Ok((stream, driver)) = started else {
+                continue;
+            };
+            let _ = tx.try_send(Bytes::copy_from_slice(plain));
+            conns.insert(key, tx);
+            tokio::spawn(driver.run(false));
+            permit.send((stream, peer));
         }
-        if conns.len() >= MAX_CONVERSATIONS {
-            continue;
-        }
-        let Ok(permit) = accepted.try_reserve() else {
-            continue;
-        };
-        let (tx, rx) = mpsc::channel(CONN_QUEUE);
-        let started = Driver::start(
-            conv,
-            socket.clone(),
-            Some(peer),
-            Inbound::Listener(rx),
-            &settings,
-            Some((ended_tx.clone(), key)),
-        );
-        let Ok((stream, driver)) = started else {
-            continue;
-        };
-        let _ = tx.try_send(Bytes::copy_from_slice(plain));
-        conns.insert(key, tx);
-        tokio::spawn(driver.run(false));
-        permit.send((stream, peer));
     }
 }
 
+mod adaptive;
 #[cfg(test)]
 mod tests;

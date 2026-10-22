@@ -89,6 +89,7 @@ bottleneck with a 50 ms queue. Its TCP side models the sender's TCP, so loss slo
 ## Running the benchmarks
 
 ```bash
+scripts/bench.sh run before                                                # the matrix
 cargo test --release --test tunnel throughput -- --ignored --nocapture     # localhost
 cargo test --release --test tunnel udp_ -- --ignored --nocapture           # UDP rates
 cargo test --release --test tunnel lossy_link -- --ignored --nocapture     # lossy path
@@ -98,3 +99,16 @@ scripts/rss.sh tcpmux 100                                                  # mem
 
 `KARIZ_BENCH_ONLY=kcp` limits `lossy_link` and `game_traffic` to rows whose name
 contains `kcp`. `KARIZ_BENCH_LOSS=1` runs one loss rate.
+
+**The matrix** (`bench_matrix`, run by `scripts/bench.sh`) is the one to compare two builds
+with: four transports (`tcpmux`, `wss`, `kcp`, `quic`) × the three profiles × five paths
+(localhost; 40 ms RTT; 40 ms with 1 % loss; 100 ms with 2 ms jitter and 0.3 % loss; 40 ms at
+50 Mbit/s with a 50 ms queue), each measured with a one-stream download, an eight-stream
+download and a UDP flow of 1200-byte packets at 4000 a second (echoed, so the table has its
+round trips and delivery). `scripts/bench.sh run <label>` writes `target/bench/<label>.md`;
+`scripts/bench.sh compare before after` prints the two side by side with the change.
+`KARIZ_BENCH_ONLY=kcp,quic` keeps the rows whose name contains one of the parts
+(`KARIZ_BENCH_ONLY="=kcp balanced local"` one exact row), `KARIZ_BENCH_SECS=5` shortens each
+measurement (default 10 s; the whole matrix takes about 40 minutes at 10 s). The paths are
+the userspace emulator in `tests/link`, so the numbers compare builds on one machine; they do
+not predict a real path.

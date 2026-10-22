@@ -1,15 +1,17 @@
 //! Entry side: accepts user connections on the `[[forward]]` ports and carries them
 //! through the tunnel to the exit side.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tracing::{debug, info, warn};
@@ -17,12 +19,13 @@ use tracing::{debug, info, warn};
 use crate::auto::{self, Dial};
 use crate::channel::{self, Channel, Link};
 use crate::config::{Config, Forward, Mode, TransportKind, Tuning};
+use crate::control::{ReloadFailure, ReloadReport};
 use crate::crypto::{Crypto, ReplayFilter};
 use crate::fallback;
-use crate::limit::PerIp;
+use crate::limit::Limits;
 use crate::mux::{MuxSession, SessionConfig, Side};
 use crate::proto::{self, Open, STATUS_DIAL_FAILED, STATUS_OK};
-use crate::proxy_header::ProxyHeader;
+use crate::proxy_header::{ProxyHeader, ProxyVersion};
 use crate::relay::{relay, relay_stream, Counters};
 #[cfg(feature = "quic")]
 use crate::session::quic::{accept_sessions, QuicSession};
@@ -56,8 +59,9 @@ struct Entry {
     /// rotates through its candidates; without fallback it is set once and never changes.
     source: std::sync::RwLock<Arc<Source>>,
     stats: Arc<Stats>,
-    /// `tuning.max_conns_per_ip`, shared by all forward rules.
-    per_ip: Option<Arc<PerIp>>,
+    /// `tuning.max_conns_per_ip` and `udp_max_flows`, shared by all forward rules and
+    /// changed by a reload.
+    limits: Arc<Limits>,
     last_full_warning: std::sync::Mutex<Option<Instant>>,
 }
 
@@ -88,13 +92,13 @@ pub async fn run(config: Config) -> Result<()> {
         tasks.spawn(crate::stats::persist(stats.clone(), path));
     }
 
-    let per_ip = tuning.max_conns_per_ip.map(PerIp::new);
+    let limits = Limits::new(tuning.max_conns_per_ip, tuning.udp.max_flows);
     let entry = Arc::new(Entry {
         crypto: crypto.clone(),
         tuning: tuning.clone(),
         source: std::sync::RwLock::new(Arc::new(Source::Pending)),
         stats: stats.clone(),
-        per_ip,
+        limits,
         last_full_warning: std::sync::Mutex::default(),
     });
 
@@ -159,69 +163,49 @@ pub async fn run(config: Config) -> Result<()> {
         });
     }
 
-    // `kariz status` reads the counters and `kariz speedtest` reaches the live sessions
-    // through this (Unix only).
+    // The forward rules, in their own manager: a reload adds, removes and retargets them
+    // while the daemon runs. The udp transport forwards on the unreliable path only (no
+    // retransmit); it cannot share a fallback chain, so the active transport is always
+    // udp there.
+    let (probe_tx, probe_rx) = watch::channel(probe_targets(&config.forward));
+    let forwards = Arc::new(Forwards {
+        entry: entry.clone(),
+        datagram_only: config.tunnel.transport == TransportKind::Udp,
+        running: Mutex::new(RunningSet {
+            text: config.text.clone(),
+            rules: HashMap::new(),
+        }),
+        probe_targets: probe_tx,
+    });
+    forwards.start_all(&config.forward).await?;
+
+    // `kariz status` reads the counters, `kariz speedtest` reaches the live sessions and
+    // `kariz reload` the forward rules through this (Unix only).
     #[cfg(unix)]
     if let Some(socket) = config.control_socket() {
-        let entry = entry.clone();
-        let open = move |open: Bytes| {
+        let open = {
             let entry = entry.clone();
-            async move { entry.open_channel(&open).await }
-        };
-        tasks.spawn(crate::control::serve(socket, Some(open), stats.clone()));
-    }
-
-    for (forward, counters) in config.forward.iter().zip(&stats.forwards) {
-        if forward.protocol.has_tcp() {
-            let listener = TcpListener::bind(&forward.listen)
-                .await
-                .with_context(|| format!("failed to listen on forward port {}", forward.listen))?;
-            let (entry, forward, counters) = (entry.clone(), forward.clone(), counters.clone());
-            tasks.spawn(accept_users(entry, listener, forward, counters));
-        }
-        if forward.protocol.has_udp() {
-            let socket = udp::bind(&forward.listen, &entry.tuning.udp)
-                .await
-                .with_context(|| format!("failed to bind UDP forward port {}", forward.listen))?;
-            let open = encode_open(Open::udp(forward.target.clone(), forward.duplication()));
-            let opener = {
+            move |open: Bytes| {
                 let entry = entry.clone();
-                move || {
-                    let (entry, open) = (entry.clone(), open.clone());
-                    async move { entry.open_channel(&open).await }
-                }
-            };
-            let (udp_tuning, target) = (entry.tuning.udp.clone(), forward.target.clone());
-            let (listen, duplicate) = (forward.listen.clone(), forward.duplication());
-            let (counters, per_ip) = (counters.clone(), entry.per_ip.clone());
-            // The udp transport forwards on the unreliable path only (no retransmit); it
-            // cannot share a fallback chain, so the active transport is always udp here.
-            let datagram_only = config.tunnel.transport == TransportKind::Udp;
-            tasks.spawn(async move {
-                udp::serve(
-                    socket,
-                    udp_tuning,
-                    target,
-                    duplicate,
-                    datagram_only,
-                    counters,
-                    per_ip,
-                    opener,
-                )
-                .await
-                .with_context(|| format!("UDP forward port {listen} failed"))
-            });
-        }
-        info!(
-            listen = %forward.listen,
-            target = %forward.target,
-            protocol = forward.protocol.name(),
-            proxy_protocol = forward.proxy_protocol.map_or("off", |v| v.name()),
-            "forward ready"
-        );
+                async move { entry.open_channel(&open).await }
+            }
+        };
+        let reload = {
+            let (forwards, path) = (forwards.clone(), config.path.clone());
+            move || {
+                let (forwards, path) = (forwards.clone(), path.clone());
+                async move { forwards.reload(path.as_deref()).await }
+            }
+        };
+        tasks.spawn(crate::control::serve(
+            socket,
+            Some(open),
+            Some(reload),
+            stats.clone(),
+        ));
     }
 
-    tasks.spawn(health(entry.clone(), probe_targets(&config.forward)));
+    tasks.spawn(health(entry.clone(), probe_rx));
 
     // Accept loops only return on fatal errors.
     match tasks.join_next().await {
@@ -503,23 +487,307 @@ async fn accept_reverse(
     }
 }
 
+/// The forward rules as they run, and what a reload changes under them: rules are added,
+/// removed and retargeted by their listen address and protocol; the ones that stay keep
+/// their listeners and their users' connections.
+struct Forwards {
+    entry: Arc<Entry>,
+    datagram_only: bool,
+    /// Held across a whole reload, so two never interleave.
+    running: Mutex<RunningSet>,
+    /// What the health probe connects to.
+    probe_targets: watch::Sender<Vec<String>>,
+}
+
+struct RunningSet {
+    /// The config text the running rules came from (a reload compares the rest of the
+    /// file against it); `None` for a config that did not come from a file.
+    text: Option<String>,
+    rules: HashMap<RuleKey, Running>,
+}
+
+/// A rule's listen address and protocol name: what tells rules apart across a reload.
+type RuleKey = (String, &'static str);
+
+fn rule_key(forward: &Forward) -> RuleKey {
+    (forward.listen.clone(), forward.protocol.name())
+}
+
+/// One rule as it runs: its accept and serve tasks, the cells its new connections and
+/// flows read, and the signal that ends every connection of it.
+struct Running {
+    forward: Forward,
+    tcp: Option<Arc<TcpRule>>,
+    udp: Option<Arc<udp::Rule>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    stop: watch::Sender<bool>,
+}
+
+impl Running {
+    /// The rule's new values (same listen and protocol): connections and flows opened from
+    /// now on use them.
+    fn update(&mut self, forward: &Forward) {
+        if let Some(tcp) = &self.tcp {
+            tcp.set(forward);
+        }
+        if let Some(udp) = &self.udp {
+            udp.set(
+                &forward.target,
+                encode_open(Open::udp(forward.target.clone(), forward.duplication())),
+                forward.duplication(),
+            );
+        }
+        self.forward = forward.clone();
+    }
+}
+
+/// What a TCP rule's new connections read: the target, the plain open request for it, and
+/// the PROXY header setting, which a reload may change.
+struct TcpRule {
+    inner: std::sync::RwLock<(String, Bytes, Option<ProxyVersion>)>,
+}
+
+impl TcpRule {
+    fn new(forward: &Forward) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::RwLock::new(Self::view(forward)),
+        })
+    }
+
+    fn view(forward: &Forward) -> (String, Bytes, Option<ProxyVersion>) {
+        (
+            forward.target.clone(),
+            encode_open(Open::tcp(forward.target.clone())),
+            forward.proxy_protocol,
+        )
+    }
+
+    fn set(&self, forward: &Forward) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = Self::view(forward);
+    }
+
+    fn get(&self) -> (String, Bytes, Option<ProxyVersion>) {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Forwards {
+    /// Starts every rule; a port that cannot be bound is fatal, as the daemon's start
+    /// always was.
+    async fn start_all(&self, forwards: &[Forward]) -> Result<()> {
+        let stats = self.entry.stats.forwards();
+        let mut set = self.running.lock().await;
+        for (forward, stats) in forwards.iter().zip(stats) {
+            let running = self.start_rule(forward, stats).await?;
+            set.rules.insert(rule_key(forward), running);
+        }
+        Ok(())
+    }
+
+    /// Binds a rule's ports and starts its accept and serve tasks.
+    async fn start_rule(&self, forward: &Forward, stats: Arc<ForwardStats>) -> Result<Running> {
+        let entry = &self.entry;
+        let listener =
+            if forward.protocol.has_tcp() {
+                Some(TcpListener::bind(&forward.listen).await.with_context(|| {
+                    format!("failed to listen on forward port {}", forward.listen)
+                })?)
+            } else {
+                None
+            };
+        let socket = if forward.protocol.has_udp() {
+            Some(
+                udp::bind(&forward.listen, &entry.tuning.udp)
+                    .await
+                    .with_context(|| {
+                        format!("failed to bind UDP forward port {}", forward.listen)
+                    })?,
+            )
+        } else {
+            None
+        };
+        let (stop, stopped) = watch::channel(false);
+        let mut tasks = Vec::new();
+        let tcp = listener.map(|listener| {
+            let rule = TcpRule::new(forward);
+            let accepting = accept_users(
+                entry.clone(),
+                listener,
+                forward.listen.clone(),
+                rule.clone(),
+                stats.clone(),
+                stopped.clone(),
+            );
+            tasks.push(tokio::spawn(logged(
+                forward.listen.clone(),
+                "TCP",
+                accepting,
+            )));
+            rule
+        });
+        let udp = socket.map(|socket| {
+            let rule = udp::Rule::new(
+                &forward.target,
+                encode_open(Open::udp(forward.target.clone(), forward.duplication())),
+                forward.duplication(),
+            );
+            let opener = {
+                let entry = entry.clone();
+                move |open: Bytes| {
+                    let entry = entry.clone();
+                    async move { entry.open_channel(&open).await }
+                }
+            };
+            let serving = udp::serve(
+                socket,
+                entry.tuning.udp.clone(),
+                rule.clone(),
+                self.datagram_only,
+                stats.clone(),
+                entry.limits.clone(),
+                opener,
+                stopped.clone(),
+            );
+            tasks.push(tokio::spawn(logged(forward.listen.clone(), "UDP", serving)));
+            rule
+        });
+        info!(
+            listen = %forward.listen,
+            target = %forward.target,
+            protocol = forward.protocol.name(),
+            proxy_protocol = forward.proxy_protocol.map_or("off", |v| v.name()),
+            "forward ready"
+        );
+        Ok(Running {
+            forward: forward.clone(),
+            tcp,
+            udp,
+            tasks,
+            stop,
+        })
+    }
+
+    /// Reads the config file again and applies its rules (`kariz reload`, SIGHUP).
+    async fn reload(&self, path: Option<&Path>) -> io::Result<ReloadReport> {
+        let Some(path) = path else {
+            return Err(io::Error::other(
+                "not loaded from a file (this daemon was started with a config from elsewhere)",
+            ));
+        };
+        let new = Config::load(path)
+            .map_err(|e| io::Error::other(format!("the config file is not valid: {e:#}")))?;
+        self.apply(&new).await
+    }
+
+    /// Makes `new`'s rules the running ones. Refused, with nothing changed, when anything
+    /// but the rules (and the two reloadable `[tuning]` limits) differs from the running
+    /// config: that needs a restart. A rule that stays keeps its connections; one whose
+    /// target, duplication or PROXY header changed keeps its port and applies the change
+    /// to new connections; removed rules end with their connections; added rules are
+    /// bound (one whose port cannot be bound is reported, the rest stands).
+    async fn apply(&self, new: &Config) -> io::Result<ReloadReport> {
+        let mut set = self.running.lock().await;
+        if let (Some(old), Some(text)) = (&set.text, &new.text) {
+            if let Err(section) = Config::same_but_forwards(old, text) {
+                return Err(io::Error::other(format!(
+                    "restart needed: {section} changed (a reload applies only the forward \
+                     rules, tuning.max_conns_per_ip and tuning.udp_max_flows)"
+                )));
+            }
+        }
+        let tuning = new.tuning();
+        let mut report = ReloadReport::default();
+        let wanted: HashSet<RuleKey> = new.forward.iter().map(rule_key).collect();
+        let gone: Vec<RuleKey> = set
+            .rules
+            .keys()
+            .filter(|k| !wanted.contains(*k))
+            .cloned()
+            .collect();
+        for key in gone {
+            if let Some(running) = set.rules.remove(&key) {
+                stop_rule(running).await;
+                report.removed.push(key.0);
+            }
+        }
+        // The counters, in the new order; a rule that is gone goes into the carry.
+        let stats = self.entry.stats.replace_forwards(&new.forward);
+        self.entry
+            .limits
+            .set(tuning.max_conns_per_ip, tuning.udp.max_flows);
+        for (forward, stats) in new.forward.iter().zip(stats) {
+            let key = rule_key(forward);
+            if let Some(running) = set.rules.get_mut(&key) {
+                if running.forward != *forward {
+                    running.update(forward);
+                    report.changed.push(forward.listen.clone());
+                }
+                continue;
+            }
+            match self.start_rule(forward, stats).await {
+                Ok(running) => {
+                    set.rules.insert(key, running);
+                    report.added.push(forward.listen.clone());
+                }
+                Err(e) => report.failed.push(ReloadFailure {
+                    listen: forward.listen.clone(),
+                    error: format!("{e:#}"),
+                }),
+            }
+        }
+        let _ = self.probe_targets.send(probe_targets(&new.forward));
+        set.text.clone_from(&new.text);
+        info!(%report, "forward rules reloaded");
+        Ok(report)
+    }
+}
+
+/// Ends a removed rule: its accept and serve tasks, then every connection and flow of it
+/// (each holds a receiver of the stop signal; once they are all gone the port is free for
+/// a rule that takes it in the same reload).
+async fn stop_rule(running: Running) {
+    let _ = running.stop.send(true);
+    for task in running.tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    let _ = timeout(Duration::from_secs(2), running.stop.closed()).await;
+}
+
+/// Runs a rule's task, logging how it ended; the daemon goes on without it.
+async fn logged<E: std::fmt::Display>(
+    listen: String,
+    kind: &'static str,
+    task: impl std::future::Future<Output = std::result::Result<(), E>>,
+) {
+    if let Err(e) = task.await {
+        warn!(%listen, kind, error = %e, "forward rule ended");
+    }
+}
+
 async fn accept_users(
     entry: Arc<Entry>,
     listener: TcpListener,
-    forward: Forward,
+    listen: String,
+    rule: Arc<TcpRule>,
     counters: Arc<ForwardStats>,
+    mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
-    let open = encode_open(Open::tcp(forward.target.clone()));
     loop {
-        let (user, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            // The rule was removed by a reload.
+            _ = stop.changed() => return Ok(()),
+        };
+        let (user, peer) = match accepted {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, listen = %forward.listen, "user accept failed");
+                warn!(error = %e, %listen, "user accept failed");
                 sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
-        let slot = match &entry.per_ip {
+        let slot = match entry.limits.per_ip() {
             Some(limit) => match limit.acquire(peer.ip()) {
                 Some(slot) => Some(slot),
                 None => {
@@ -529,8 +797,9 @@ async fn accept_users(
             },
             None => None,
         };
-        let open = match forward.proxy_protocol {
-            None => open.clone(),
+        let (target, plain, proxy_protocol) = rule.get();
+        let open = match proxy_protocol {
+            None => plain,
             // The header names this user and the address they reached, so the request is
             // theirs alone.
             Some(version) => match user.local_addr() {
@@ -540,7 +809,7 @@ async fn accept_users(
                         source: peer,
                         destination,
                     };
-                    encode_open(Open::tcp_proxied(forward.target.clone(), proxy))
+                    encode_open(Open::tcp_proxied(target.clone(), proxy))
                 }
                 Err(e) => {
                     debug!(%peer, error = %e, "user connection has no local address");
@@ -549,10 +818,16 @@ async fn accept_users(
             },
         };
         let entry = entry.clone();
-        let (target, counters) = (forward.target.clone(), counters.clone());
+        let counters = counters.clone();
+        let mut stop = stop.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = handle_user(&entry, user, &open, &counters).await {
+            let result = tokio::select! {
+                r = handle_user(&entry, user, &open, &counters) => r,
+                // The rule was removed: the connection ends, as it would on a restart.
+                _ = stop.changed() => Ok(()),
+            };
+            if let Err(e) = result {
                 debug!(%peer, %target, error = %e, "connection ended with error");
             }
         });
@@ -573,6 +848,7 @@ async fn handle_user(
 ) -> io::Result<()> {
     let _open = stats.tcp_connection();
     user.set_nodelay(entry.tuning.nodelay)?;
+    crate::transport::tcp::tune_socket_options(&socket2::SockRef::from(&user), &entry.tuning);
     let size = entry.tuning.buffer_size;
     let channel = entry
         .open_channel(open)
@@ -795,9 +1071,14 @@ fn probe_targets(forwards: &[Forward]) -> Vec<String> {
 /// Probes the way through the tunnel every [`HEALTH_EVERY`], one target at a time, and
 /// keeps what it found in the stats (`status`). A tunnel can be up and still let no one
 /// through (every session full, the target down); this is what tells.
-async fn health(entry: Arc<Entry>, targets: Vec<String>) -> Result<()> {
+async fn health(entry: Arc<Entry>, targets: watch::Receiver<Vec<String>>) -> Result<()> {
     sleep(HEALTH_FIRST).await;
-    for target in targets.iter().cycle() {
+    let mut round = 0usize;
+    loop {
+        // The targets follow the forward rules (a reload changes them).
+        let current = targets.borrow().clone();
+        let target = current[round % current.len().max(1)].clone();
+        round = round.wrapping_add(1);
         let open = encode_open(Open::probe(target.clone()));
         let started = Instant::now();
         let result = entry.probe(&open, HEALTH_WAIT).await;
@@ -818,7 +1099,7 @@ async fn health(entry: Arc<Entry>, targets: Vec<String>) -> Result<()> {
         entry
             .stats
             .probe
-            .record(target, outcome, answered.then_some(took), error);
+            .record(&target, outcome, answered.then_some(took), error);
         sleep(if outcome == ProbeOutcome::Unsupported {
             HEALTH_UNSUPPORTED_EVERY
         } else {
@@ -826,7 +1107,6 @@ async fn health(entry: Arc<Entry>, targets: Vec<String>) -> Result<()> {
         })
         .await;
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -834,6 +1114,7 @@ mod tests {
     use super::*;
     use crate::mux::tests::config as session_config;
     use crate::session::is_full;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TOKEN: &str = "0123456789abcdef0123";
 
@@ -853,6 +1134,10 @@ mod tests {
     /// An entry whose pool has one session of at most `max_streams`; `serve` runs the
     /// other end of it.
     fn entry_with(max_streams: usize, serve: impl FnOnce(MuxSession)) -> Entry {
+        entry_from(config("entry"), max_streams, serve)
+    }
+
+    fn entry_from(config: Config, max_streams: usize, serve: impl FnOnce(MuxSession)) -> Entry {
         let (a, b) = tokio::io::duplex(256 * 1024);
         let client = SessionConfig {
             max_streams,
@@ -865,13 +1150,13 @@ mod tests {
             client,
         ))));
         serve(MuxSession::new(b, Side::Server, session_config()));
-        let config = config("entry");
+        let tuning = config.tuning();
         Entry {
             crypto: Crypto::new(TOKEN, config.tunnel.encryption),
-            tuning: config.tuning(),
+            limits: Limits::new(tuning.max_conns_per_ip, tuning.udp.max_flows),
+            tuning,
             source: std::sync::RwLock::new(Arc::new(Source::Mux(pool))),
             stats: Stats::new(&config),
-            per_ip: None,
             last_full_warning: std::sync::Mutex::default(),
         }
     }
@@ -881,6 +1166,161 @@ mod tests {
         entry_with(max_streams, |server| {
             crate::exit::serve_for_test(&config("exit"), Arc::new(Session::Kmux(server)));
         })
+    }
+
+    /// An entry config, as if loaded from a file, with the given forward rules and limits.
+    fn entry_config(rules: &[(u16, u16)], max_conns_per_ip: u32, udp_max_flows: u32) -> Config {
+        let forwards: String = rules
+            .iter()
+            .map(|(listen, target)| {
+                format!(
+                    "[[forward]]\nlisten = \"127.0.0.1:{listen}\"\ntarget = \"127.0.0.1:{target}\"\n"
+                )
+            })
+            .collect();
+        let text = format!(
+            "role = \"entry\"\nmode = \"direct\"\n[tunnel]\ntransport = \"tcpmux\"\n\
+             token = \"{TOKEN}\"\nremote = \"127.0.0.1:9\"\n\
+             [tuning]\nmax_conns_per_ip = {max_conns_per_ip}\nudp_max_flows = {udp_max_flows}\n\
+             {forwards}"
+        );
+        let mut config = Config::parse(&text).unwrap();
+        config.text = Some(text);
+        config
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Connects to a forward port and echoes `what` through it (the exit dials the echo
+    /// target), keeping the connection.
+    async fn echo_through(port: u16, what: &[u8]) -> io::Result<TcpStream> {
+        let mut user = TcpStream::connect(("127.0.0.1", port)).await?;
+        user.write_all(what).await?;
+        let mut back = vec![0; what.len()];
+        timeout(WAIT, user.read_exact(&mut back)).await??;
+        assert_eq!(back, what);
+        Ok(user)
+    }
+
+    #[tokio::test]
+    async fn a_reload_adds_removes_and_retargets_rules_and_keeps_the_rest_running() {
+        // The echo target the exit side dials for every rule.
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let (a, b, c) = (free_port(), free_port(), free_port());
+        let config = entry_config(&[(a, target), (b, target)], 5, 100);
+        let entry = Arc::new(entry_from(config.clone(), 16, |server| {
+            crate::exit::serve_for_test(
+                &super::tests::config("exit"),
+                Arc::new(Session::Kmux(server)),
+            );
+        }));
+        let (probe_tx, probe_rx) = watch::channel(Vec::new());
+        let forwards = Forwards {
+            entry: entry.clone(),
+            datagram_only: false,
+            running: Mutex::new(RunningSet {
+                text: config.text.clone(),
+                rules: HashMap::new(),
+            }),
+            probe_targets: probe_tx,
+        };
+        forwards.start_all(&config.forward).await.unwrap();
+        let mut kept = echo_through(a, b"through a").await.unwrap();
+        echo_through(b, b"through b").await.unwrap();
+        assert_eq!(entry.limits.max_flows(), 100);
+
+        // b is retargeted at a closed port, c added, the limits changed; a stays.
+        let next = entry_config(&[(a, target), (b, 9), (c, target)], 7, 200);
+        let report = forwards.apply(&next).await.unwrap();
+        assert_eq!(report.added, vec![format!("127.0.0.1:{c}")]);
+        assert_eq!(report.changed, vec![format!("127.0.0.1:{b}")]);
+        assert!(
+            report.removed.is_empty() && report.failed.is_empty(),
+            "{report}"
+        );
+        assert_eq!(entry.limits.max_flows(), 200);
+        assert_eq!(
+            probe_rx.borrow().clone(),
+            probe_targets(&next.forward),
+            "the health probe follows the rules"
+        );
+        // The connection through a is still there, and c works.
+        kept.write_all(b"still a").await.unwrap();
+        let mut back = [0; 7];
+        timeout(WAIT, kept.read_exact(&mut back))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&back, b"still a");
+        echo_through(c, b"through c").await.unwrap();
+        // b's new connections go to the closed port: the exit cannot dial it.
+        let mut refused = TcpStream::connect(("127.0.0.1", b)).await.unwrap();
+        refused.write_all(b"x").await.unwrap();
+        let mut end = [0; 1];
+        let n = timeout(WAIT, refused.read(&mut end))
+            .await
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the retargeted rule's connection ends");
+        let names: Vec<String> = entry
+            .stats
+            .forwards()
+            .iter()
+            .map(|f| f.listen().to_owned())
+            .collect();
+        assert_eq!(names, [a, b, c].map(|p| format!("127.0.0.1:{p}")));
+
+        // Anything but the rules: refused, nothing changed.
+        let mut other = entry_config(&[(a, target), (b, 9), (c, target)], 7, 200);
+        other.text = Some(
+            other
+                .text
+                .unwrap()
+                .replace("127.0.0.1:9\"", "127.0.0.1:10\""),
+        );
+        let err = forwards.apply(&other).await.unwrap_err();
+        assert!(
+            err.to_string().starts_with("restart needed: tunnel"),
+            "{err}"
+        );
+        assert_eq!(entry.stats.forwards().len(), 3);
+
+        // a removed: its connection ends, its port is free, its bytes stay in the totals.
+        let before = entry.stats.snapshot();
+        let last = entry_config(&[(b, 9), (c, target)], 7, 200);
+        let report = forwards.apply(&last).await.unwrap();
+        assert_eq!(report.removed, vec![format!("127.0.0.1:{a}")]);
+        let n = timeout(WAIT, kept.read(&mut back))
+            .await
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the removed rule's connection ends");
+        TcpListener::bind(("127.0.0.1", a))
+            .await
+            .expect("the removed rule's port is free");
+        let after = entry.stats.snapshot();
+        let (before, after) = (before.totals, after.totals);
+        assert!(before.bytes_up > 0, "{before:?}");
+        assert!(
+            after.bytes_up >= before.bytes_up && after.bytes_down >= before.bytes_down,
+            "{before:?} {after:?}"
+        );
+        assert_eq!(entry.stats.forwards().len(), 2);
     }
 
     fn probe_of(target: &str) -> Bytes {
@@ -947,7 +1387,7 @@ mod tests {
             tuning: config.tuning(),
             source: std::sync::RwLock::new(Arc::new(Source::Mux(Arc::new(SessionPool::default())))),
             stats: Stats::new(&config),
-            per_ip: None,
+            limits: Limits::new(None, 4096),
             last_full_warning: std::sync::Mutex::default(),
         };
         let err = entry

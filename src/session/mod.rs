@@ -212,4 +212,12 @@ impl SessionStream {
             Self::Quic(s) => s.recv_datagram().await,
         }
     }
+
+    /// A datagram already received, if any (to gather several into one send).
+    pub fn try_recv_datagram(&self) -> Option<Bytes> {
+        match self {
+            Self::Kmux(s) => s.try_recv_datagram(),
+            Self::Quic(s) => s.try_recv_datagram(),
+        }
+    }
 }

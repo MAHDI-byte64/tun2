@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
@@ -15,7 +16,8 @@ use tracing::warn;
 const WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct PerIp {
-    max: u32,
+    /// Changed by a reload; the counts stay.
+    max: AtomicU32,
     state: Mutex<State>,
 }
 
@@ -28,9 +30,14 @@ struct State {
 impl PerIp {
     pub fn new(max: u32) -> Arc<Self> {
         Arc::new(Self {
-            max,
+            max: AtomicU32::new(max),
             state: Mutex::default(),
         })
+    }
+
+    /// A new maximum (a reload); what is open stays counted.
+    pub fn set_max(&self, max: u32) {
+        self.max.store(max, Ordering::Relaxed);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -41,9 +48,10 @@ impl PerIp {
     /// and then) when the address already has `max` open.
     pub fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<Slot> {
         let ip = ip.to_canonical();
+        let max = self.max.load(Ordering::Relaxed);
         let mut st = self.lock();
         let open = st.open.entry(ip).or_default();
-        if *open >= self.max {
+        if *open >= max {
             let now = Instant::now();
             if st
                 .last_warning
@@ -52,7 +60,7 @@ impl PerIp {
                 st.last_warning = Some(now);
                 warn!(
                     client = %ip,
-                    max = self.max,
+                    max,
                     "a client reached tuning.max_conns_per_ip; its new connections are closed"
                 );
             }
@@ -68,6 +76,47 @@ impl PerIp {
     #[cfg(test)]
     fn open(&self, ip: IpAddr) -> u32 {
         self.lock().open.get(&ip).copied().unwrap_or(0)
+    }
+}
+
+/// The entry's limits that every forward rule shares, and a reload may change:
+/// `tuning.max_conns_per_ip` and `tuning.udp_max_flows`.
+pub struct Limits {
+    per_ip: RwLock<Option<Arc<PerIp>>>,
+    max_flows: AtomicUsize,
+}
+
+impl Limits {
+    pub fn new(max_conns_per_ip: Option<u32>, max_flows: usize) -> Arc<Self> {
+        Arc::new(Self {
+            per_ip: RwLock::new(max_conns_per_ip.map(PerIp::new)),
+            max_flows: AtomicUsize::new(max_flows),
+        })
+    }
+
+    /// The per-address limit, if there is one.
+    pub fn per_ip(&self) -> Option<Arc<PerIp>> {
+        self.per_ip
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// UDP flows (client addresses) a rule may have open.
+    pub fn max_flows(&self) -> usize {
+        self.max_flows.load(Ordering::Relaxed)
+    }
+
+    /// New values (a reload). A per-address limit that only changes its number keeps its
+    /// counts.
+    pub fn set(&self, max_conns_per_ip: Option<u32>, max_flows: usize) {
+        self.max_flows.store(max_flows, Ordering::Relaxed);
+        let mut per_ip = self.per_ip.write().unwrap_or_else(|e| e.into_inner());
+        match (max_conns_per_ip, &*per_ip) {
+            (Some(max), Some(limit)) => limit.set_max(max),
+            (Some(max), None) => *per_ip = Some(PerIp::new(max)),
+            (None, _) => *per_ip = None,
+        }
     }
 }
 
