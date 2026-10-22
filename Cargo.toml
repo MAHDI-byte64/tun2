@@ -1,6 +1,6 @@
 [package]
 name = "kariz"
-version = "2.9.2"
+version = "2.9.3"
 edition = "2021"
 rust-version = "1.80"
 description = "High-performance, resource-efficient tunnel core for server-to-server links, built to resist DPI."

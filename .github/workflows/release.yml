@@ -11,6 +11,14 @@ name: Release
 # release (as a draft) first so the matrix uploads have somewhere to go, and the `publish`
 # job downloads the archives back, signs them, attaches the signatures, sets the notes and
 # publishes it.
+#
+# Every job runs on the ubuntu-24.04 image, not ubuntu-latest: when ubuntu-latest moved to the
+# 26.04 image (21 October 2026) its C toolchain and packages came from the amd64v3 (x86-64-v3)
+# variant, so the C parts of the x86_64 binaries (ring, mimalloc, SQLite) were compiled with
+# AVX2 instructions and 2.9.2 / 2.10.x crashed at start (SIGILL) on CPUs without AVX2. The
+# native build also pins the C and Rust compilers to baseline x86-64, and the x86_64 binaries
+# are run under an emulated pre-AVX2 CPU before they are uploaded, so such a build fails here
+# instead of on a server.
 on:
   push:
     tags: ["v*"]
@@ -25,7 +33,7 @@ jobs:
   # Make sure a release exists for the tag before the matrix uploads to it. If one was made
   # from the web UI already (which is what created the tag), this is a no-op.
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Tag matches the version in Cargo.toml
@@ -46,7 +54,7 @@ jobs:
 
   build:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: true
       matrix:
@@ -77,6 +85,31 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - if: ${{ !matrix.cross }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p kariz -p kariz-panel
+        env:
+          # Baseline x86-64 for the Rust code and for every C file the cc crate compiles
+          # (ring, mimalloc, SQLite): no AVX2/BMI/FMA on unguarded paths, whatever the image's
+          # compiler defaults to. The crypto code still picks AES-NI/AVX2 at run time through
+          # its own CPU detection, so modern servers lose nothing.
+          RUSTFLAGS: -C target-cpu=x86-64
+          CFLAGS: -march=x86-64 -mtune=generic
+          CXXFLAGS: -march=x86-64 -mtune=generic
+      # The binaries must run on any 64-bit Intel/AMD server, including ones without AVX2
+      # (Ivy Bridge Xeons and older). Run them under QEMU with such CPUs: an illegal
+      # instruction fails the build here. `kariz-panel init` opens the database and makes a
+      # certificate, so SQLite and the crypto code are exercised, not just the start-up path.
+      - if: ${{ !matrix.cross }}
+        name: Smoke test under CPUs without AVX2
+        run: |
+          sudo apt-get install -y qemu-user
+          bin="target/${{ matrix.target }}/release"
+          tmp=$(mktemp -d)
+          for cpu in Nehalem IvyBridge; do
+            echo "== $cpu"
+            qemu-x86_64 -cpu "$cpu" "$bin/kariz" --version
+            qemu-x86_64 -cpu "$cpu" "$bin/kariz-panel" --version
+            qemu-x86_64 -cpu "$cpu" "$bin/kariz-panel" init -c "$tmp/$cpu/panel.toml" --data-dir "$tmp/$cpu/data" --port 8443 >/dev/null
+          done
+          rm -rf "$tmp"
       - if: ${{ matrix.cross }}
         uses: taiki-e/install-action@v2
         with:
@@ -102,7 +135,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Download the archives from the release

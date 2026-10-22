@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.9.3 - 2026-10-22
+
+### Fixed
+
+- **The x86_64 binaries of 2.9.2 (and of the withdrawn 2.10.0–2.10.2) crashed at start on CPUs
+  without AVX2**, older Xeons for example: every tunnel on such a server was restarted by
+  systemd over and over (`status=4/ILL`, *Illegal instruction*), and the panel died as soon as
+  it opened its database. The release job ran on GitHub's `ubuntu-latest` image, which moved
+  to Ubuntu 26.04 on 21 October; that image installs its C toolchain and packages from the
+  `amd64v3` (x86-64-v3) variant, so the C parts of the binaries (the crypto library, the
+  allocator, SQLite) were compiled with AVX2 instructions. The build now runs on the Ubuntu
+  24.04 image with the C and Rust compilers pinned to baseline `x86-64`, and every x86_64
+  build is run under an emulated pre-AVX2 CPU before it is published, so a build like this can
+  no longer be released. Nothing else changed since 2.9.2.
+
 ## 2.9.2 - 2026-10-22
 
 ### Added

@@ -8,11 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# ubuntu-24.04, not ubuntu-latest: the same image the release is built on (see release.yml:
+# the 26.04 image's amd64v3 toolchain broke the x86_64 binaries on CPUs without AVX2).
 jobs:
   # Formatting and lints, which fail in seconds: kept apart from the tests, so a mistake
   # shows before the tests have even built.
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +38,7 @@ jobs:
 
   # The core's tests and the panel's run side by side: each takes a few minutes.
   test-core:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,7 +46,7 @@ jobs:
       - run: cargo test
 
   test-panel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +66,7 @@ jobs:
   # library tests run under QEMU, so a target-specific break (32-bit atomics, alignment)
   # shows before a release.
   cross:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +102,7 @@ jobs:
   # terminal, the panel and an agent, signed releases, updating the panel from the panel. The
   # tunnels the agent would make are written by hand here (same files, same units).
   manager:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -253,7 +255,7 @@ jobs:
   # GRE code (`kariz-panel net`) links them: the private addresses answer, two links between
   # the same pair work at once, a filtered GRE path fails the test, `net down` removes it.
   gre:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -267,7 +269,7 @@ jobs:
   # under sudo. The RAII-firewall unit tests and the e2e scaffolds in tunnel_rawlink / l3
   # (which the faketcp, icmp and l3 units fill in) force a failure rather than skip here.
   rawlink:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -286,7 +288,7 @@ jobs:
   # through it, a tunnel that cannot connect being undone, the look in both languages and
   # themes, and axe (WCAG 2.1 A and AA) on every page and dialog.
   browser:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -313,7 +315,7 @@ jobs:
   # Known vulnerabilities in the dependencies (RustSec's advisory database). It runs on the
   # lock file, so it also catches an advisory published after the last change.
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -324,7 +326,7 @@ jobs:
   # nginx in front of the tunnel as a stand-in for a CDN: WebSocket proxying, TLS
   # termination and an idle timeout (tests/tunnel.rs, module `nginx`).
   cdn:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

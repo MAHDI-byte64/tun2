@@ -12,6 +12,12 @@ RUST_LOG=kariz=debug kariz run -c ...       # more detail
 
 اگر پنل وب دارید، صفحهٔ **لاگ** لاگ هر دو سمت یک تانل را به ترتیب زمان کنار هم نشان می‌دهد ([پنل](panel.md)).
 
+## اصلاً بالا نمی‌آید
+
+| پیام لاگ | علت | راه‌حل |
+|---|---|---|
+| `kariz@NAME.service: Main process exited, code=killed, status=4/ILL`، یا *Illegal instruction* وقتی دستی اجرا می‌کنید؛ تانل هر چند ثانیه ری‌استارت می‌شود | باینری به CPU جدیدتری از سرور نیاز دارد: بیلدهای x86_64 نسخه‌های 2.9.2 و 2.10.0 تا 2.10.2 دستورهای AVX2 دارند و این CPU ندارد (`grep -c avx2 /proc/cpuinfo` عدد `0` می‌دهد) | به 2.9.3 یا بالاتر به‌روز کنید (`kariz-manager update`)؛ تا آن موقع `kariz-manager update --version v2.9.1` |
+
 ## دو سمت وصل نمی‌شوند
 
 | پیام لاگ | علت | راه‌حل |

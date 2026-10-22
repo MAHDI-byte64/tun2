@@ -11,6 +11,12 @@ journalctl -u kariz -p warning              # warnings and errors only
 RUST_LOG=kariz=debug kariz run -c ...       # more detail
 ```
 
+## It does not start at all
+
+| Log message | Cause | Fix |
+|---|---|---|
+| `kariz@NAME.service: Main process exited, code=killed, status=4/ILL`, or *Illegal instruction* when run by hand; the tunnel restarts every few seconds | the binary needs a newer CPU than the server has: the x86_64 builds of 2.9.2 and 2.10.0–2.10.2 contain AVX2 instructions, and this CPU has none (`grep -c avx2 /proc/cpuinfo` prints `0`) | update to 2.9.3 or later (`kariz-manager update`); until then `kariz-manager update --version v2.9.1` |
+
 ## The sides do not connect
 
 | Log message | Cause | Fix |
