@@ -82,6 +82,11 @@ pub async fn run(config: Config) -> Result<()> {
     let sessions = SessionConfig::new(&mux);
     let stats = Stats::new(&config);
     let mut tasks = JoinSet::new();
+    // The byte counters go on from where the last run left them (docs/status.md).
+    if let Some(path) = config.traffic_file() {
+        stats.restore(&path);
+        tasks.spawn(crate::stats::persist(stats.clone(), path));
+    }
 
     let per_ip = tuning.max_conns_per_ip.map(PerIp::new);
     let entry = Arc::new(Entry {

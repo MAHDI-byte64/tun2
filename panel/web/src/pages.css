@@ -1431,3 +1431,16 @@ label.sp-opt { display: inline-flex; align-items: center; gap: var(--sp-2); min-
 @media (prefers-reduced-motion: reduce) {
   .bench-skel, .bench-bar i, .bench-spin, .bench-best { animation: none; }
 }
+
+/* ---- Traffic limits: the usage bar and the limit form ---- */
+.qt-bar { display: grid; gap: 3px; min-width: 110px; margin-top: 4px; }
+.qt-bar .qt-text { font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
+.qt-bar.near .t-bar i { background: var(--warn); }
+.qt-bar.over .t-bar i { background: var(--danger); }
+.qt-bar.over .qt-text { color: var(--danger); }
+.stat-card .qt-bar { margin-top: var(--sp-2); }
+.qt-form { display: flex; flex-wrap: wrap; gap: var(--sp-4); align-items: flex-start; margin-top: var(--sp-3); }
+.qt-form .field { margin: 0; }
+.qt-state dd { min-width: 0; flex: 1 1 auto; text-align: end; }
+.qt-state dd .qt-bar { margin-top: 0; }
+.qt-block .banner.small { margin-bottom: var(--sp-3); }

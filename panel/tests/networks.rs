@@ -602,14 +602,14 @@ async fn a_reverse_server_is_reached_across_a_gre_link() {
     let again = hub
         .create_reverse_rejoin(
             &made.id,
-            kariz_panel::reverse::Reverse::new(&made.server_addr, 29501, None).unwrap(),
+            kariz_panel::reverse::Reverse::new(&made.server_addr, 29501, None, false).unwrap(),
         )
         .unwrap();
     assert_eq!(kariz_panel::join::decode(&again).unwrap().g, Some(theirs));
     let public = hub
         .create_reverse_rejoin(
             &made.id,
-            kariz_panel::reverse::Reverse::new("192.0.2.2", 29501, None).unwrap(),
+            kariz_panel::reverse::Reverse::new("192.0.2.2", 29501, None, false).unwrap(),
         )
         .unwrap();
     assert_eq!(kariz_panel::join::decode(&public).unwrap().g, None);
@@ -618,7 +618,7 @@ async fn a_reverse_server_is_reached_across_a_gre_link() {
     let plain = hub
         .create_reverse_join(
             Some("plain"),
-            kariz_panel::reverse::Reverse::new("192.0.2.3", 29001, None).unwrap(),
+            kariz_panel::reverse::Reverse::new("192.0.2.3", 29001, None, false).unwrap(),
         )
         .await
         .unwrap();

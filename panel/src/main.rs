@@ -483,11 +483,15 @@ fn serve(config: Config, config_path: &std::path::Path) -> Result<()> {
             kariz_bin: std::env::current_exe()?.with_file_name("kariz"),
         });
         tokio::spawn(hub.clone().run_local());
+        // The panel's outbound proxy (if one is set) is put into effect before anything
+        // dials out, so release downloads go through it from the start.
+        kariz_panel::proxy::Settings::load(&db).apply();
         // The servers the panel connects to (reverse) are dialed whether or not it takes
         // agents itself.
         hub.start_reverse_links();
         tokio::spawn(kariz_panel::telegram::run(hub.clone()));
         tokio::spawn(kariz_panel::schedule::run(hub.clone()));
+        tokio::spawn(kariz_panel::quota::run(hub.clone()));
         let mut state = AppState::new(db);
         state.hub = hub.clone();
         if let Some(listen) = &config.agent_listen {

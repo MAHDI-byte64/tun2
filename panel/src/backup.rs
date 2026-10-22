@@ -42,6 +42,9 @@ struct ReverseRow {
     host: String,
     port: u16,
     transport: Option<String>,
+    /// Through the panel's proxy (not in backups from before it: then not).
+    #[serde(default)]
+    via_proxy: bool,
 }
 
 /// A server with an agents port of its own: the port its agent dials.
@@ -49,6 +52,23 @@ struct ReverseRow {
 struct PortRow {
     server: String,
     port: u16,
+}
+
+/// A tunnel's traffic limit and usage (`crate::quota`), the whole row.
+#[derive(Debug, Serialize, Deserialize)]
+struct QuotaRow {
+    name: String,
+    limit_bytes: i64,
+    used: i64,
+    last_seen: i64,
+    side: String,
+    counter_id: String,
+    reset_day: i64,
+    last_reset: i64,
+    warned: i64,
+    stopped: i64,
+    start_due: i64,
+    since: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +87,9 @@ struct Payload {
     /// Where the panel's own server stood among them; none: before them all.
     #[serde(default)]
     local_position: Option<i64>,
+    /// The tunnels' traffic limits and usage. Not in backups from before them: then none.
+    #[serde(default)]
+    quotas: Vec<QuotaRow>,
 }
 
 fn derive(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
@@ -119,14 +142,16 @@ pub fn export(db: &Db, passphrase: &str) -> Result<Vec<u8>> {
     };
     let reverse = {
         let conn = db.conn();
-        let mut stmt = conn
-            .prepare("SELECT server, host, port, transport FROM reverse_links ORDER BY server")?;
+        let mut stmt = conn.prepare(
+            "SELECT server, host, port, transport, via_proxy FROM reverse_links ORDER BY server",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(ReverseRow {
                 server: r.get(0)?,
                 host: r.get(1)?,
                 port: r.get(2)?,
                 transport: r.get(3)?,
+                via_proxy: r.get::<_, i64>(4)? != 0,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -142,6 +167,30 @@ pub fn export(db: &Db, passphrase: &str) -> Result<Vec<u8>> {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    let quotas = {
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since \
+             FROM quotas ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(QuotaRow {
+                name: r.get(0)?,
+                limit_bytes: r.get(1)?,
+                used: r.get(2)?,
+                last_seen: r.get(3)?,
+                side: r.get(4)?,
+                counter_id: r.get(5)?,
+                reset_day: r.get(6)?,
+                last_reset: r.get(7)?,
+                warned: r.get(8)?,
+                stopped: r.get(9)?,
+                start_due: r.get(10)?,
+                since: r.get(11)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
     let payload = Payload {
         format: 1,
         created: now(),
@@ -151,6 +200,7 @@ pub fn export(db: &Db, passphrase: &str) -> Result<Vec<u8>> {
         reverse,
         ports,
         local_position: db.meta("local_position")?.and_then(|p| p.parse().ok()),
+        quotas,
     };
     seal(serde_json::to_vec(&payload)?, passphrase)
 }
@@ -231,8 +281,8 @@ pub fn import(db: &Db, passphrase: &str, file: &[u8], replace: bool) -> Result<u
     tx.execute("DELETE FROM reverse_links", [])?;
     for r in &payload.reverse {
         tx.execute(
-            "INSERT INTO reverse_links (server, host, port, transport) VALUES (?1, ?2, ?3, ?4)",
-            params![r.server, r.host, r.port, r.transport],
+            "INSERT INTO reverse_links (server, host, port, transport, via_proxy) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![r.server, r.host, r.port, r.transport, r.via_proxy as i64],
         )?;
     }
     tx.execute("DELETE FROM agent_ports", [])?;
@@ -240,6 +290,27 @@ pub fn import(db: &Db, passphrase: &str, file: &[u8], replace: bool) -> Result<u
         tx.execute(
             "INSERT INTO agent_ports (server, port) VALUES (?1, ?2)",
             params![p.server, p.port],
+        )?;
+    }
+    tx.execute("DELETE FROM quotas", [])?;
+    for q in &payload.quotas {
+        tx.execute(
+            "INSERT INTO quotas (name, limit_bytes, used, last_seen, side, counter_id, reset_day, last_reset, warned, stopped, start_due, since) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                q.name,
+                q.limit_bytes,
+                q.used,
+                q.last_seen,
+                q.side,
+                q.counter_id,
+                q.reset_day,
+                q.last_reset,
+                q.warned,
+                q.stopped,
+                q.start_due,
+                q.since
+            ],
         )?;
     }
     if let Some(token) = &payload.link_token {

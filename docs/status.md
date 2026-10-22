@@ -62,6 +62,7 @@ tunnel), and any number of clients may ask at once.
   "transport": "tcpmux",
   "profile": "balanced",
   "uptime_secs": 93600,
+  "counter_id": "9f1c0b7a3e5d2246",
   "peer": {
     "connected": true,
     "sessions": 2,
@@ -105,6 +106,7 @@ Readers must ignore fields they do not know: later versions add fields and raise
 | `kariz` | the daemon's version |
 | `role`, `mode`, `transport`, `profile` | as in its config |
 | `uptime_secs` | since the daemon started |
+| `counter_id` | marks one life of the byte counters: it changes when they start again from zero (no traffic file, or one that could not be used). Absent without a traffic file, and from daemons before 2.9.2 |
 
 ### `peer`: the other side
 
@@ -129,7 +131,7 @@ On the entry side, one entry per `[[forward]]` rule, in config order, and their 
 |---|---|
 | `tcp_open`, `tcp_total` | user connections open now, and since start |
 | `udp_flows`, `udp_total` | UDP flows (one per client address) open now, and since start |
-| `bytes_up`, `bytes_down` | since start, counted as data flows (not when a connection ends) |
+| `bytes_up`, `bytes_down` | counted as data flows (not when a connection ends). Kept across restarts in the traffic file (`[control] traffic_file`, next to the config by default), so they count from when the tunnel was first started, not from the last restart; a rule edited away keeps its bytes in `totals` |
 | `open_failures` | user connections and flows that could not be carried: no session to the exit side in time, every session full, or the exit could not reach the target |
 | `refused_per_ip` | user connections and flows closed at once because their address had `tuning.max_conns_per_ip` open |
 

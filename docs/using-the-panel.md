@@ -90,6 +90,9 @@ Open the tunnel, then:
 - **Auto restart:** restarts the tunnel by itself, every so many minutes, hours or days or every
   day at a time. The same on a server's card restarts all its running tunnels
   ([details](panel.md#restart-on-a-timer)).
+- **Traffic limit:** a volume after which the panel stops the tunnel, with a reset by hand or
+  every month on a day you pick; the usage shows on the tunnel's page and in the list
+  ([details](panel.md#traffic-limit)).
 - **Delete:** removes it from both servers.
 
 ## 6. Private networks
@@ -107,6 +110,22 @@ In **Settings**: the password, one-time links, and every signed-in device with a
 A notice appears in the top bar when a newer release is out. **Settings, Updates** shows the
 release notes and two buttons: update the panel, and update the servers (one at a time, each
 checked, and put back if it does not come up). The panel never updates by itself.
+
+## 9. Proxy
+
+When the panel's own server cannot reach some of the other servers directly, **Settings, Proxy**
+takes a SOCKS5 proxy (its address, and a username/password if it needs them). Which servers go
+through it is chosen per server: for a server the panel connects to (*Add server*, **The panel
+connects to it**, or a server's *Edit*), tick **Through the panel proxy**. Only those servers
+are dialed through the proxy; because SOCKS5 carries only TCP, such a link uses the TCP
+transports (`tcpmux`, `wss`) and not the UDP ones (`kcp`, `quic`). When an agent dials the
+panel instead, nothing on the panel side is proxied. A second switch, **Panel internet**, sends
+the panel's own update downloads through the proxy.
+
+Changing the proxy takes effect at once (the servers that go through it are connected again
+through the new one); while the proxy is off, those servers are not connected and their cards
+say so. The password is kept in the panel and never shown again. (The Telegram bot has its own
+separate proxy under *Settings, Telegram*.)
 
 ## Handy things
 

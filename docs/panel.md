@@ -164,6 +164,18 @@ panel that takes no agents. *Reconnect* and *Edit* have the same choice (*Who ma
 connection*), so a server can be switched either way; the address and port can be changed there.
 A backup keeps where the panel dials each such server.
 
+**Through the panel proxy.** When the panel's server cannot reach the new server directly but a
+SOCKS5 proxy can, set the proxy once in *Settings, Proxy* and tick **Through the panel proxy**
+for that server (in *Add server* and in *Edit*). The panel then dials it through the proxy, over
+the TCP link transports only (`tcpmux`, `wss`; SOCKS5 carries no UDP). The proxy's settings are
+read on every dial, so a change applies to the next one, and the servers that go through it are
+connected again through the new proxy at once. While the proxy is off, such a server is not
+dialed: its card says *reached through the panel proxy, which is off*, and *Edit* lets you clear
+the switch. The switch is kept in the backup (the proxy's own settings are not). API:
+`via_proxy` in `POST /api/servers/join-reverse` and in the `reverse` object of
+`POST /api/servers/reconnect` (`proxy_udp` when the transport is `kcp` or `quic`, `proxy_off`
+while no proxy is enabled), and `GET`/`POST /api/proxy` for the proxy itself.
+
 **Across a private link.** When only GRE (or only UDP) gets through between the two servers,
 tick **Across a private link (GRE or VXLAN)**, pick GRE or VXLAN, and type the new server's
 public IPv4 address instead of an address to dial. As with
@@ -217,6 +229,35 @@ servers. Good to know:
 - *Restart now* tries it at once; the card shows when the next restart is and how the last one
   went. Each restart is in *Events* and the audit log. The timers need the panel to be running,
   and are not part of the backup.
+
+## Traffic limit
+
+A tunnel can be given a volume on its page (*Traffic limit*), or in the last step of the wizard:
+when the bytes it carries reach it, the panel stops the tunnel on both sides and keeps it
+stopped (its *Start* is refused, and a tunnel an edit or a reboot brought back is stopped again)
+until the usage is reset or the limit raised. Good to know:
+
+- **What is counted:** upload plus download, as the entry side's daemon counts them (`status`'s
+  `bytes_up` + `bytes_down`), read every few seconds; the exit side's when the entry is away. An
+  `l3` (GRE) tunnel counts nothing and cannot have a limit.
+- **It survives restarts.** The usage is kept in the panel's database. Since 2.9.2 the daemons
+  keep their own counters across restarts too (the traffic file next to the config,
+  `[control] traffic_file`; see [Status](status.md)), so a restart of the tunnel, of its agent or
+  of the panel loses nothing. A daemon killed outright (a crash, a power cut) comes back from a
+  file at most 5 s old; the panel notices and lets those few bytes go. A server on an older
+  version is metered from the panel's readings alone: what moves while the panel is away, or
+  between a restart of its daemon and the next reading, is missed; the tunnel's page says so.
+- **Reset:** by hand (*Reset the usage*, or raise the limit above the usage, or remove the
+  limit), or **monthly** on a day you pick (1 to 28, at 00:00 UTC). Either way a tunnel the limit
+  stopped is started again by the panel; if one of its servers is away or the tunnel is busy at
+  that moment, the panel keeps trying until every side runs again.
+- **Notices:** at 80% of the limit and when the tunnel is stopped, an entry in *Events* and a
+  Telegram message (when the bot is set up); the stop is in the audit log too. The usage shows
+  in the tunnels list, on the tunnel's overview and on its *Traffic limit* tab.
+- API: `GET /api/quotas`, `POST /api/quotas` (`{name, limit_bytes, reset_day}`),
+  `POST /api/quotas/delete`, `POST /api/quotas/reset`, and `quota: {limit_bytes, reset_day}` in
+  `POST /api/tunnels`. A `start` or `restart` of a tunnel over its limit answers `409
+  quota_exceeded`.
 
 ## Make a tunnel
 
@@ -360,9 +401,11 @@ The menu has the same (items 3 to 10). Without the manager: `kariz-panel init`, 
 
 *Settings*, *Download a backup* gives one file, locked with a passphrase you choose (10
 characters or more; Argon2id and ChaCha20-Poly1305). It holds the servers this panel knows,
-with the keys they prove themselves with, and the token they dial with. It does **not** hold
-tunnels (they live on the servers, in their own files, and the panel reads them from there),
-sessions or login links. Keep the passphrase: without it the file cannot be opened.
+with the keys they prove themselves with, and the token they dial with; where the panel dials
+the servers it connects to (and whether through its proxy); and the tunnels' traffic limits
+with their usage. It does **not** hold tunnels (they live on the servers, in their own files,
+and the panel reads them from there), the proxy's own settings, sessions or login links. Keep
+the passphrase: without it the file cannot be opened.
 
 To move to a new server: install the panel there, sign in, *Restore a backup*, then
 `systemctl restart kariz-panel` so the agents can connect with the restored token. They dial

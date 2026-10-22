@@ -697,6 +697,8 @@ pub fn remove_files(dir: &Path, name: &str) -> Result<()> {
         path.clone(),
         path.with_extension("toml.bak"),
         path.with_extension("sock"),
+        path.with_extension("traffic"),
+        path.with_extension("traffic.tmp"),
         path.with_extension("crt"),
         path.with_extension("key"),
     ] {

@@ -46,6 +46,8 @@ export interface TunnelStatus {
     full?: number;
   };
   totals: { bytes_up: number; bytes_down: number; tcp_open: number; udp_flows: number };
+  /** Marks one life of the byte counters (2.9.2): absent from older daemons, whose counters reset at every restart. */
+  counter_id?: string | null;
   forwards?: { listen: string; open_failures: number; refused_per_ip?: number }[];
   probe?: ProbeStatus | null;
 }
@@ -236,6 +238,8 @@ export interface ReverseTarget {
   port: number;
   /** The one link transport; none: all of them in turn. */
   transport?: string | null;
+  /** Dialed through the panel's SOCKS5 proxy (Settings → Proxy). */
+  via_proxy?: boolean;
 }
 
 /** A GRE link the panel is to make to a server: its public IPv4 address, and the network that gives the addresses (none: the first, or a new one). */
@@ -263,7 +267,7 @@ export interface GreJoin {
 export interface LinkError {
   at: number;
   /** `link_ended`: the link dropped or went quiet. `wrong_key`: an agent came with this server's id and a key that does not match. */
-  kind: "link_ended" | "wrong_key";
+  kind: "link_ended" | "wrong_key" | "proxy_off";
   detail: string;
 }
 
@@ -281,6 +285,30 @@ export interface ScheduleRow {
   /** `ok`, `ok:N`, `skipped_offline`, `skipped_stopped`, `skipped_none`, `busy`, `missed`, or `failed:` and why. */
   last_result: string;
   next_run: number | null;
+}
+
+/** A tunnel's traffic limit and the usage the panel adds up (`/api/quotas`). */
+export interface QuotaRow {
+  name: string;
+  limit_bytes: number;
+  used: number;
+  /** 0: reset by hand; 1..28: every month on that day (00:00 UTC). */
+  reset_day: number;
+  last_reset: number;
+  warned: boolean;
+  /** When the limit stopped the tunnel (0: it did not). */
+  stopped: number;
+  /** The panel still has to start it again (a server was away, or the tunnel busy). */
+  start_due: boolean;
+  since: number;
+  next_reset: number | null;
+  pct: number;
+}
+
+export interface QuotaBody {
+  name: string;
+  limit_bytes: number;
+  reset_day: number;
 }
 
 export interface ScheduleBody {
@@ -354,6 +382,8 @@ export interface MuxSpec {
 }
 
 export interface PairRequest {
+  /** A traffic limit for the new tunnel (the wizard): bytes, and the day of the month the usage resets on (0: by hand). */
+  quota?: { limit_bytes: number; reset_day: number };
   name: string;
   entry: string;
   exit: string;
@@ -633,6 +663,19 @@ export type TelegramChange = Partial<
   Pick<TelegramView, "enabled" | "lang" | "servers" | "tunnels" | "server_grace" | "tunnel_grace" | "digest_hours" | "api_base" | "proxy" | "connect_via">
 > & { token?: string; remove_token?: boolean };
 
+export interface ProxyView {
+  enabled: boolean;
+  addr: string;
+  username: string;
+  has_password: boolean;
+  panel_internet: boolean;
+}
+
+export type ProxyChange = Partial<Pick<ProxyView, "enabled" | "addr" | "username" | "panel_internet">> & {
+  password?: string;
+  remove_password?: boolean;
+};
+
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -687,11 +730,11 @@ export const api = {
   removeServer: (id: string) => call<object>("POST", "servers/remove", { id }),
   /** With `gre`, a GRE link to the server is made first and the link to the panel goes across it (the answer then says what was made). */
   /** `port`: the agents port its agent dials (the panel's own clears a port of its own; left out: unchanged). */
-  reconnectServer: (id: string, host: string, transport: LinkTransport, reverse?: { host: string; port: number }, gre?: NewGreLink, port?: number) =>
+  reconnectServer: (id: string, host: string, transport: LinkTransport, reverse?: { host: string; port: number; via_proxy?: boolean }, gre?: NewGreLink, port?: number) =>
     call<{ code: string; valid_for: number } & Partial<GreJoin>>("POST", "servers/reconnect", { id, host, transport, reverse, gre, port }),
   /** With `gre`, the panel makes a GRE link to the new server and dials it across that link (`host` is not used). */
-  joinReverse: (name: string | undefined, host: string, port: number, transport: LinkTransport, gre?: NewGreLink) =>
-    call<{ code: string; valid_for: number; id: string; name: string } & Partial<GreJoin>>("POST", "servers/join-reverse", { name, host, port, transport, gre }),
+  joinReverse: (name: string | undefined, host: string, port: number, transport: LinkTransport, gre?: NewGreLink, via_proxy?: boolean) =>
+    call<{ code: string; valid_for: number; id: string; name: string } & Partial<GreJoin>>("POST", "servers/join-reverse", { name, host, port, transport, gre, via_proxy }),
   renameServer: (id: string, name: string) => call<object>("POST", "servers/rename", { id, name }),
   /** Every server's id once (the panel's own, `local`, too), in the order every list shows them. */
   orderServers: (ids: string[]) => call<object>("POST", "servers/order", { ids }),
@@ -699,6 +742,10 @@ export const api = {
   setSchedule: (body: ScheduleBody) => call<object>("POST", "schedules", body),
   deleteSchedule: (kind: string, subject: string) => call<object>("POST", "schedules/delete", { kind, subject }),
   runSchedule: (kind: string, subject: string) => call<object>("POST", "schedules/run", { kind, subject }),
+  quotas: () => call<{ quotas: QuotaRow[] }>("GET", "quotas"),
+  setQuota: (body: QuotaBody) => call<object>("POST", "quotas", body),
+  deleteQuota: (name: string) => call<object>("POST", "quotas/delete", { name }),
+  resetQuota: (name: string) => call<object>("POST", "quotas/reset", { name }),
   sessions: () => call<{ sessions: SessionRow[] }>("GET", "sessions"),
   revoke: (id: number) => call<object>("POST", "sessions/revoke", { id }),
   changePassword: (current: string | undefined, next: string) =>
@@ -748,6 +795,8 @@ export const api = {
   telegramPair: () => call<TelegramView>("POST", "telegram/pair", {}),
   telegramRemoveChat: (id: number) => call<TelegramView>("POST", "telegram/chats/remove", { id }),
   telegramTest: () => call<{ ok: boolean; bot?: string; error?: string }>("POST", "telegram/test", {}),
+  proxy: () => call<ProxyView>("GET", "proxy"),
+  proxySet: (body: ProxyChange) => call<ProxyView>("POST", "proxy", body),
   applyUpdate: (confirm_major: boolean) => call<{ op: string }>("POST", "update/apply", { confirm_major }),
   updateServers: (restart_tunnels: boolean) => call<{ op: string }>("POST", "update/servers", { restart_tunnels }),
   newLink: () => call<{ token: string; valid_for: number }>("POST", "links"),

@@ -6,6 +6,12 @@
 //! handshake, the panel opens the streams and the agent answers, and the agent still proves
 //! who it is with its key (or, the first time, its join secret).
 //!
+//! A server can be reached through the panel's SOCKS5 proxy (Settings → Proxy): its
+//! `via_proxy` switch sends the panel's dials to it through the proxy, kept to the TCP
+//! transports (`tcpmux`, `wss`), since a SOCKS5 proxy carries no UDP. The proxy's settings
+//! are read on every dial, so a change applies to the next one; while the proxy is off, such
+//! a server is not dialed at all and its card says why (`proxy_off`).
+//!
 //! One dialing loop per server keeps its link up. It starts with the panel and when a server
 //! is added or switched to reverse, and stops when the server is removed or switched back:
 //! every start takes a new generation number, and a loop whose number is no longer the
@@ -33,12 +39,15 @@ pub struct Reverse {
     pub port: u16,
     /// The one link transport to use; none: all of them in turn.
     pub transport: Option<String>,
+    /// Dialed through the panel's SOCKS5 proxy (Settings → Proxy).
+    pub via_proxy: bool,
 }
 
 impl Reverse {
     /// Checks what was typed: a host name or address, a port below 65535 (the next one is
-    /// used too), and a link transport the panel knows (`auto` or none: all of them).
-    pub fn new(host: &str, port: u16, transport: Option<&str>) -> Result<Self> {
+    /// used too), and a link transport the panel knows (`auto` or none: all of them). Through
+    /// the proxy, the transport has to be one a SOCKS5 proxy carries (`proxy_udp` otherwise).
+    pub fn new(host: &str, port: u16, transport: Option<&str>, via_proxy: bool) -> Result<Self> {
         let host = host
             .trim()
             .trim_start_matches('[')
@@ -55,10 +64,14 @@ impl Reverse {
         {
             bail!("bad_input");
         }
+        if via_proxy && transport.is_some_and(|t| !proxy_carries(t)) {
+            bail!("proxy_udp");
+        }
         Ok(Self {
             host,
             port,
             transport: transport.map(str::to_owned),
+            via_proxy,
         })
     }
 
@@ -75,6 +88,11 @@ impl Reverse {
     pub fn listen(&self) -> String {
         format!("0.0.0.0:{}", self.port)
     }
+}
+
+/// Whether a SOCKS5 proxy carries a link transport: the TCP ones.
+fn proxy_carries(transport: &str) -> bool {
+    matches!(transport, "tcpmux" | "wss")
 }
 
 /// A server added for the panel to connect to: the code its agent joins with.
@@ -97,13 +115,14 @@ impl Hub {
         self.db
             .conn()
             .query_row(
-                "SELECT host, port, transport FROM reverse_links WHERE server = ?1",
+                "SELECT host, port, transport, via_proxy FROM reverse_links WHERE server = ?1",
                 [server],
                 |r| {
                     Ok(Reverse {
                         host: r.get(0)?,
                         port: r.get(1)?,
                         transport: r.get(2)?,
+                        via_proxy: r.get::<_, i64>(3)? != 0,
                     })
                 },
             )
@@ -115,7 +134,8 @@ impl Hub {
     /// Every server the panel connects to, with where.
     pub fn reverse_all(&self) -> Result<Vec<(String, Reverse)>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare("SELECT server, host, port, transport FROM reverse_links")?;
+        let mut stmt =
+            conn.prepare("SELECT server, host, port, transport, via_proxy FROM reverse_links")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get(0)?,
@@ -123,6 +143,7 @@ impl Hub {
                     host: r.get(1)?,
                     port: r.get(2)?,
                     transport: r.get(3)?,
+                    via_proxy: r.get::<_, i64>(4)? != 0,
                 },
             ))
         })?;
@@ -135,9 +156,9 @@ impl Hub {
         match target {
             Some(t) => {
                 self.db.conn().execute(
-                    "INSERT INTO reverse_links (server, host, port, transport) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT (server) DO UPDATE SET host = excluded.host, port = excluded.port, transport = excluded.transport",
-                    params![server, t.host, t.port, t.transport],
+                    "INSERT INTO reverse_links (server, host, port, transport, via_proxy) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (server) DO UPDATE SET host = excluded.host, port = excluded.port, transport = excluded.transport, via_proxy = excluded.via_proxy",
+                    params![server, t.host, t.port, t.transport, t.via_proxy as i64],
                 )?;
                 self.start_reverse(server);
             }
@@ -161,6 +182,19 @@ impl Hub {
     /// Stops the dialing loop of a server that is being removed.
     pub(crate) fn forget_reverse(&self, server: &str) {
         self.next_generation(server);
+    }
+
+    /// The proxy changed: every server dialed through it is dialed again, with the new one
+    /// (or not at all, while it is off). The link it has now is closed, so its loop ends
+    /// and the new one takes over; a server dialed direct is not touched.
+    pub fn restart_proxied_links(self: &Arc<Self>) {
+        for (server, target) in self.reverse_all().unwrap_or_default() {
+            if !target.via_proxy {
+                continue;
+            }
+            self.start_reverse(&server);
+            self.close_session(&server);
+        }
     }
 
     fn next_generation(&self, server: &str) -> u64 {
@@ -201,15 +235,36 @@ impl Hub {
             let Some(target) = self.reverse_of(&server) else {
                 return;
             };
+            // Through the proxy: the proxy as it is set now, and only the transports a
+            // SOCKS5 proxy carries. While the proxy is off, the server is not dialed.
+            let proxy = if target.via_proxy {
+                match crate::proxy::Settings::load(&self.db).socks5() {
+                    Some(p) => Some(p),
+                    None => {
+                        warn!(server = %server, "this server is reached through the panel proxy, but no proxy is enabled (Settings → Proxy)");
+                        self.note_error(
+                            &server,
+                            "proxy_off",
+                            "this server is set to connect through the panel proxy, but no proxy is enabled in Settings → Proxy".to_owned(),
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let kinds: Vec<_> = kariz::link::LINK_TRANSPORTS
                 .into_iter()
                 .filter(|k| !matches!(target.transport.as_deref(), Some(t) if t != k.name()))
+                .filter(|k| proxy.is_none() || proxy_carries(k.name()))
                 .collect();
             let Some(&kind) = kinds.get(at % kinds.len().max(1)) else {
                 warn!(server = %server, "no link transport to dial this server with");
                 return;
             };
-            match self.reverse_once(&server, &target, kind).await {
+            match self.reverse_once(&server, &target, kind, proxy).await {
                 Ok(true) => {
                     misses = 0;
                     backoff = Duration::from_secs(1);
@@ -257,6 +312,7 @@ impl Hub {
         server: &str,
         target: &Reverse,
         kind: kariz::config::TransportKind,
+        proxy: Option<kariz::transport::proxy::Socks5>,
     ) -> Result<bool> {
         let addr = kariz::link::address_for(&target.addr(), kind)?;
         let peer = tokio::net::lookup_host(addr.as_str())
@@ -264,12 +320,17 @@ impl Hub {
             .ok()
             .and_then(|mut a| a.next())
             .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |a| a.ip().to_canonical());
-        let dialer = kariz::link::Dialer::via(&addr, &self.link_token()?, kind)?;
+        let through_proxy = proxy.is_some();
+        let dialer = kariz::link::Dialer::via_proxy(&addr, &self.link_token()?, kind, proxy)?;
         let session = dialer
             .connect(Side::Client)
             .await
             .map_err(|e| anyhow!("{e}"))?;
-        info!(server = %server, address = %addr, transport = kind.name(), "connected to a server's agent (reverse)");
+        if through_proxy {
+            info!(server = %server, address = %addr, transport = kind.name(), "connected to a server's agent (reverse, through the proxy)");
+        } else {
+            info!(server = %server, address = %addr, transport = kind.name(), "connected to a server's agent (reverse)");
+        }
         let started = Instant::now();
         let result = self
             .run_session(Arc::new(session), kind.name(), peer, Some(server))
@@ -361,15 +422,26 @@ mod tests {
 
     #[test]
     fn a_target_is_checked_and_written_as_an_address() {
-        let t = Reverse::new(" Fra.Example.com ", 29001, Some("auto")).unwrap();
+        let t = Reverse::new(" Fra.Example.com ", 29001, Some("auto"), false).unwrap();
         assert_eq!(
             (t.addr().as_str(), t.transport.as_deref()),
             ("fra.example.com:29001", None)
         );
         assert_eq!(t.listen(), "0.0.0.0:29001");
-        let v6 = Reverse::new("[2001:db8::7]", 443, Some("quic")).unwrap();
+        let v6 = Reverse::new("[2001:db8::7]", 443, Some("quic"), false).unwrap();
         assert_eq!(v6.addr(), "[2001:db8::7]:443");
         assert_eq!(v6.transport.as_deref(), Some("quic"));
+        // Through the proxy only the TCP transports go; auto picks among them.
+        let via = Reverse::new("203.0.113.5", 29001, Some("auto"), true).unwrap();
+        assert!(via.via_proxy && via.transport.is_none());
+        assert!(Reverse::new("203.0.113.5", 29001, Some("wss"), true).is_ok());
+        for udp in ["kcp", "quic"] {
+            let why = format!(
+                "{:#}",
+                Reverse::new("203.0.113.5", 29001, Some(udp), true).unwrap_err()
+            );
+            assert_eq!(why, "proxy_udp");
+        }
         for (host, port, x) in [
             ("", 29001, None),
             ("a b", 29001, None),
@@ -378,7 +450,10 @@ mod tests {
             ("203.0.113.5", 65535, None),
             ("203.0.113.5", 29001, Some("pigeon")),
         ] {
-            assert!(Reverse::new(host, port, x).is_err(), "{host} {port} {x:?}");
+            assert!(
+                Reverse::new(host, port, x, false).is_err(),
+                "{host} {port} {x:?}"
+            );
         }
     }
 }

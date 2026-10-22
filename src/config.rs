@@ -351,6 +351,10 @@ pub struct ControlConfig {
     /// Where the socket goes. Default: the config file's path with `.sock` instead of
     /// `.toml` (`/etc/kariz/main.toml` -> `/etc/kariz/main.sock`). Owner only.
     pub socket: Option<PathBuf>,
+    /// Where the byte counters are kept across restarts (`status`'s `bytes_up` /
+    /// `bytes_down`, see [`crate::stats::persist`]). Default: the config file's path with
+    /// `.traffic` (`/etc/kariz/main.toml` -> `/etc/kariz/main.traffic`).
+    pub traffic_file: Option<PathBuf>,
 }
 
 /// `[tunnel.kcp]`.
@@ -1499,6 +1503,15 @@ impl Config {
             .socket
             .clone()
             .or_else(|| self.path.as_ref().map(|p| p.with_extension("sock")))
+    }
+
+    /// Where the byte counters are kept across restarts: `[control] traffic_file`, else next
+    /// to the config file it was loaded from; `None` for a config that came from elsewhere.
+    pub fn traffic_file(&self) -> Option<PathBuf> {
+        self.control
+            .traffic_file
+            .clone()
+            .or_else(|| self.path.as_ref().map(|p| p.with_extension("traffic")))
     }
 
     pub fn parse(text: &str) -> Result<Self> {

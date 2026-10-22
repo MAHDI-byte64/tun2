@@ -104,6 +104,18 @@ pub enum Notice {
         streams: u64,
         max: u64,
     },
+    /// A tunnel has used 80% of its traffic limit (`crate::quota`).
+    QuotaNear {
+        name: String,
+        used: u64,
+        limit: u64,
+    },
+    /// A tunnel was stopped: its traffic limit is reached.
+    QuotaStopped {
+        name: String,
+        used: u64,
+        limit: u64,
+    },
 }
 
 /// A subject that is down, since when, and whether the user was told.
@@ -539,6 +551,7 @@ mod tests {
             transport: "tcpmux".into(),
             profile: "balanced".into(),
             uptime_secs: 10,
+            counter_id: None,
             peer: PeerStatus {
                 transport: None,
                 connected,

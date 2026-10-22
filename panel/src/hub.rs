@@ -291,6 +291,9 @@ pub struct Hub {
     pub telegram: crate::telegram::State,
     /// Agents ports of a server's own (`crate::agent_ports`).
     pub(crate) ports: crate::agent_ports::Ports,
+    /// Things to tell the user that did not come from watching the servers (a tunnel's
+    /// traffic limit); the Telegram alerts take them.
+    notices: Mutex<Vec<crate::alerts::Notice>>,
 }
 
 pub const LOCAL: &str = "local";
@@ -375,6 +378,7 @@ impl Hub {
             checked: Mutex::new(crate::updater::Checked::default()),
             telegram: crate::telegram::State::default(),
             ports: crate::agent_ports::Ports::default(),
+            notices: Mutex::new(Vec::new()),
             kariz_dir,
             live: Mutex::new(HashMap::new()),
             reverse_gen: Mutex::new(HashMap::new()),
@@ -1005,7 +1009,9 @@ impl Hub {
                     code
                 }
                 GreWay::Reverse { port } => {
-                    let target = crate::reverse::Reverse::new(&theirs.address, port, transport)?;
+                    // A private link to the panel's own server is never dialed through the proxy.
+                    let target =
+                        crate::reverse::Reverse::new(&theirs.address, port, transport, false)?;
                     let code = self.rejoin_code(
                         id,
                         "",
@@ -1220,6 +1226,60 @@ impl Hub {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The panel's database (the tests set things in it directly).
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// What a server reported, as if it had been polled: for the tests of what reads the
+    /// snapshot (the traffic limits).
+    #[cfg(test)]
+    pub(crate) fn set_live_tunnels(
+        &self,
+        id: &str,
+        online: bool,
+        tunnels: Vec<crate::wire::TunnelInfo>,
+    ) {
+        // The snapshot lists the servers the database knows.
+        let _ = self.db.conn().execute(
+            "INSERT OR IGNORE INTO servers (id, name, key, created) VALUES (?1, ?1, '', 0)",
+            [id],
+        );
+        let mut live = self.live();
+        let entry = live.entry(id.to_owned()).or_default();
+        entry.online = online;
+        entry.tunnels = tunnels
+            .into_iter()
+            .map(|info| TunnelView {
+                info,
+                rate_mbps: None,
+            })
+            .collect();
+    }
+
+    /// Queues something to tell the user (the Telegram alerts send it).
+    pub fn push_notice(&self, notice: crate::alerts::Notice) {
+        self.notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(notice);
+    }
+
+    /// What was queued since the last time, in order.
+    pub fn take_notices(&self) -> Vec<crate::alerts::Notice> {
+        std::mem::take(&mut *self.notices.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Closes a server's current link, if it has one, so its loop (or its agent) connects
+    /// again: for a server the panel dials, with whatever changed in the meantime.
+    pub(crate) fn close_session(&self, id: &str) {
+        // Left in place: `run_session` marks the server offline when its link ends, and only
+        // while that link is still the current one.
+        if let Some(session) = self.live().get(id).and_then(|l| l.session.clone()) {
+            session.close();
+        }
     }
 
     /// Remembers why a server's link failed, for the Servers page.

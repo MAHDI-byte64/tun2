@@ -3,6 +3,8 @@ import { createPortal } from "react-dom";
 import { ApiError, api, isPrivatePath } from "./api";
 import type { CheckReply, ForwardSpec, PairRequest, ServerInfo } from "./api";
 import { useApp } from "./store";
+import { QuotaFields, emptyQuotaForm, quotaOf } from "./Quota";
+import type { QuotaForm } from "./Quota";
 import { Icon, Seg, useFocusTrap } from "./ui";
 import { Checklist, opError, useOp } from "./ops";
 import { useNetworks } from "./Networks";
@@ -115,6 +117,10 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const [spoofS, setSpoofS] = useState(emptySpoof());
   const [muxOn, setMuxOn] = useState(true);
   const [profile, setProfile] = useState<string>("balanced");
+  // An optional traffic limit, written once the tunnel is up.
+  const [qtOn, setQtOn] = useState(false);
+  const [qt, setQt] = useState<QuotaForm>(emptyQuotaForm());
+  const qtWanted = qtOn ? quotaOf(qt) : null;
   const [listenPort, setListenPort] = useState(String(FIRST_TUNNEL_PORT));
   // Until a port is typed, the wizard picks a free one.
   const [portTouched, setPortTouched] = useState(false);
@@ -252,6 +258,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     helper: helperOf(helperS, transport),
     ...l3Of(l3S, transport),
     forwards: parsed.forwards,
+    quota: qtWanted ?? undefined,
   });
 
   const problem = (s: number): string => {
@@ -739,6 +746,16 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                     })}
                   </div>
                 )}
+                {!opId && (
+                  <div className="field wz-quota">
+                    <label className="check">
+                      <input type="checkbox" id="wz-quota" checked={qtOn} onChange={(e) => setQtOn(e.target.checked)} /> {t("wz.quota")}
+                    </label>
+                    <span className="help">{t("wz.quotaHelp")}</span>
+                    {qtOn && <QuotaFields id="wz-quota" form={qt} onChange={setQt} />}
+                    {qtOn && !qtWanted && qt.amount.trim() !== "" && <span className="err small">{t("qt.badInput")}</span>}
+                  </div>
+                )}
                 {checking && <p className="muted small">…</p>}
                 {!opId && conflicts.map((c) => (
                   <p className="err small" key={c}>
@@ -788,7 +805,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
           </button>
         )}
         {!opId && step === 4 && (
-          <button className="btn btn-primary" type="button" disabled={checking || conflicts.length > 0} onClick={() => void build()}>
+          <button className="btn btn-primary" type="button" disabled={checking || conflicts.length > 0 || (qtOn && !qtWanted)} onClick={() => void build()}>
             <span className="shine" />
             {t("wz.make")}
           </button>

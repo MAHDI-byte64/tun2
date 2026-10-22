@@ -86,6 +86,11 @@ pub async fn run(config: Config) -> Result<()> {
         .speedtest
         .then(|| Arc::new(Semaphore::new(SPEEDTEST_STREAMS)));
     let mut tasks = JoinSet::new();
+    // The byte counters go on from where the last run left them (docs/status.md).
+    if let Some(path) = config.traffic_file() {
+        stats.restore(&path);
+        tasks.spawn(crate::stats::persist(stats.clone(), path));
+    }
 
     // `kariz status` reads the counters through this (Unix only). It uses the shared stats,
     // so it outlives any transport the fallback chain rotates through.

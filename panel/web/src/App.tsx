@@ -263,6 +263,7 @@ export function App() {
           {route.page === "logs" && <LogsPage servers={servers} />}
           {route.page === "settings" && (
             <SettingsPage
+              servers={servers}
               hasPassword={info?.has_password ?? false}
               onPasswordSet={() => setInfo((i) => (i ? { ...i, has_password: true } : i))}
               updates={<UpdatesSection status={update.status} reload={update.reload} />}

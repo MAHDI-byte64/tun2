@@ -157,7 +157,7 @@ export function LogsPage({ servers }: { servers: ServerInfo[] }) {
           ) : (
             <ul className="timeline">
               {events.map((e) => (
-                <li key={e.id} className={e.kind.endsWith("down") ? "bad" : e.kind === "change" ? "info" : ""}>
+                <li key={e.id} className={e.kind.endsWith("down") || e.kind === "quota_stop" ? "bad" : e.kind === "change" ? "info" : ""}>
                   <span>{eventText(e)}</span>
                   <time>{ago(Math.max(0, Date.now() / 1000 - e.at))}</time>
                 </li>

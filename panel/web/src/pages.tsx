@@ -10,6 +10,7 @@ import type { MapData, MapHit } from "./scene-map";
 import { useApp } from "./store";
 import { BackupDialog, RestoreDialog } from "./Extras";
 import { TelegramSection } from "./Telegram";
+import { ProxySection } from "./Proxy";
 import { AutoRestartDialog } from "./AutoRestart";
 import { ServerFixDialog } from "./ServerFix";
 import { useNetworks } from "./Networks";
@@ -488,6 +489,20 @@ function AddServer({ servers, agentsOn, onClose }: { servers: ServerInfo[]; agen
   // Reverse across a GRE link the panel makes: the new server's public IPv4 and network are the ones above.
   const [revGre, setRevGre] = useState(false);
   const [revKind, setRevKind] = useState<LinkKind>("gre");
+  // Reverse through the panel's SOCKS5 proxy (Settings → Proxy), which has to be on for that.
+  const [viaProxy, setViaProxy] = useState(false);
+  const [proxyOn, setProxyOn] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    api
+      .proxy()
+      .then((p) => alive && setProxyOn(p.enabled))
+      .catch(() => alive && setProxyOn(false));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const throughProxy = way === "reverse" && !revGre && viaProxy;
   // Over a private link the panel makes (GRE or VXLAN), and its kind.
   const overLink = way === "gre" || way === "vxlan";
   const linkKind: LinkKind = way === "vxlan" ? "vxlan" : "gre";
@@ -535,7 +550,7 @@ function AddServer({ servers, agentsOn, onClose }: { servers: ServerInfo[]; agen
         setCode(made.code);
         setLeft(made.valid_for);
       } else if (way === "reverse") {
-        const made = await api.joinReverse(name.trim() || undefined, rhost.trim(), +rport, transport);
+        const made = await api.joinReverse(name.trim() || undefined, rhost.trim(), +rport, transport, undefined, throughProxy);
         setRev({ addr: hostPort(rhost.trim().replace(/^\[|\]$/g, ""), rport.trim()), port: +rport });
         setCode(made.code);
         setLeft(made.valid_for);
@@ -548,6 +563,7 @@ function AddServer({ servers, agentsOn, onClose }: { servers: ServerInfo[]; agen
       if (overLink) setError(e instanceof ApiError ? (agentPortError(t, e.code, names) ?? greJoinError(t, e.code, names)) : String(e));
       else if (way === "reverse" && revGre && !portOk) setError(t("add.rev.err.input"));
       else if (way === "reverse" && revGre) setError(e instanceof ApiError ? greJoinError(t, e.code, names) : String(e));
+      else if (way === "reverse" && e instanceof ApiError && (e.code === "proxy_udp" || e.code === "proxy_off")) setError(t(`add.rev.err.${e.code}`));
       else if (way === "reverse") setError(e instanceof ApiError && e.code !== "bad_input" ? greJoinError(t, e.code, names) : t("add.rev.err.input"));
       else if (e instanceof ApiError && agentPortError(t, e.code, names)) setError(agentPortError(t, e.code, names) ?? "");
       else setError(e instanceof ApiError && e.code === "agents_off" ? t("add.off") : t("add.bad"));
@@ -577,12 +593,14 @@ function AddServer({ servers, agentsOn, onClose }: { servers: ServerInfo[]; agen
     overLink ? ipOk && panelPublic !== null && agentPortOk(ownPort) : way === "reverse" ? (revGre ? ipOk && panelPublic !== null && portOk : reverseOk(rhost, rport)) : !!host.trim() && agentPortOk(ownPort);
   // The panel needs no agents port of its own when it is the one that connects.
   const blocked = !agentsOn && way !== "reverse";
+  // A SOCKS5 proxy carries no UDP: through it, only the TCP transports are offered.
+  const transports = (["auto", "tcpmux", "kcp", "wss", "quic"] as LinkTransport[]).filter((x) => !throughProxy || (x !== "kcp" && x !== "quic"));
   const transportField = (help: string) => (
     <div className="field">
       <span className="label">{t("add.transport")}</span>
       <Seg
         value={transport}
-        options={(["auto", "tcpmux", "kcp", "wss", "quic"] as LinkTransport[]).map((x) => [x, t(`add.x.${x}`)] as [LinkTransport, string])}
+        options={transports.map((x) => [x, t(`add.x.${x}`)] as [LinkTransport, string])}
         onChange={setTransport}
       />
       <span className="help">{help}</span>
@@ -731,6 +749,25 @@ function AddServer({ servers, agentsOn, onClose }: { servers: ServerInfo[]; agen
                   <span className="help">{t("add.rev.portHelp")}</span>
                 </div>
               </div>
+              {!revGre && (
+                <div className="field">
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      id="add-proxy"
+                      checked={viaProxy}
+                      disabled={proxyOn === false}
+                      onChange={(e) => {
+                        setViaProxy(e.target.checked);
+                        if (e.target.checked && (transport === "kcp" || transport === "quic")) setTransport("auto");
+                        setError("");
+                      }}
+                    />{" "}
+                    {t("add.rev.proxy")}
+                  </label>
+                  <span className="help">{proxyOn === false ? t("add.rev.proxy.off") : t("add.rev.proxy.d")}</span>
+                </div>
+              )}
               {!revGre && (
                 <span className="err" role="alert">
                   {error}
@@ -943,7 +980,9 @@ export function ServersPage({ servers, loaded, agentsOn, onChanged }: { servers:
                           : t(s.gre ? "srv.alertWaitGre" : "srv.alertWait")
                         : s.last_error?.kind === "wrong_key"
                           ? t("srv.alertKey")
-                          : t("srv.alertOff")}
+                          : s.last_error?.kind === "proxy_off"
+                            ? t("srv.alertProxyOff")
+                            : t("srv.alertOff")}
                     </p>
                     <button className="btn btn-primary btn-sm" type="button" onClick={() => setFixing(s.id)}>
                       <Icon name="restart" size={16} />
@@ -990,6 +1029,11 @@ export function ServersPage({ servers, loaded, agentsOn, onChanged }: { servers:
                     <span className="badge" title={t("srv.viaRev", { addr: hostPort(s.reverse.host, s.reverse.port) })}>
                       {t("srv.revChip", { addr: `\u2066${hostPort(s.reverse.host, s.reverse.port)}\u2069` })}
                     </span>
+                    {s.reverse.via_proxy && (
+                      <span className="badge" title={t("srv.viaProxy")}>
+                        {t("srv.proxyChip")}
+                      </span>
+                    )}
                   </div>
                 )}
                 {s.gre && (
@@ -1267,7 +1311,7 @@ function Sessions() {
   );
 }
 
-export function SettingsPage({ hasPassword, onPasswordSet, updates }: { hasPassword: boolean; onPasswordSet: () => void; updates?: React.ReactNode }) {
+export function SettingsPage({ servers, hasPassword, onPasswordSet, updates }: { servers: ServerInfo[]; hasPassword: boolean; onPasswordSet: () => void; updates?: React.ReactNode }) {
   const { t, lang, setLang, theme, setTheme, digits, setDigits, low, setLow, toast } = useApp();
   const [dialog, setDialog] = useState(false);
   const [backup, setBackup] = useState<"save" | "restore" | null>(null);
@@ -1285,6 +1329,7 @@ export function SettingsPage({ hasPassword, onPasswordSet, updates }: { hasPassw
     ["sec", t("set.sec"), "shield"],
     ["upd", t("set.updates"), "update"],
     ["tg", t("set.telegram"), "bell"],
+    ["px", t("set.proxy"), "shield"],
     ["bak", t("set.backup"), "download"],
     ["look", t("set.look"), "palette"],
   ];
@@ -1340,6 +1385,9 @@ export function SettingsPage({ hasPassword, onPasswordSet, updates }: { hasPassw
         </div>
         <div id="set-tg" className="set-section">
           <TelegramSection />
+        </div>
+        <div id="set-px" className="set-section">
+          <ProxySection servers={servers} />
         </div>
         <Card title={t("set.backup")} id="set-bak" className="set-section">
           {row(

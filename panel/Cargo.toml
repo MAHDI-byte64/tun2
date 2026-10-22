@@ -1,6 +1,6 @@
 [package]
 name = "kariz-panel"
-version = "2.9.1"
+version = "2.9.2"
 edition = "2021"
 rust-version = "1.80"
 description = "The Kariz web panel: sign-in, servers, tunnels, live monitoring."
@@ -46,9 +46,13 @@ tar = "0.4"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# The day of the month a tunnel's traffic limit resets on (already a dependency of the core).
+time = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+# The core's SOCKS5 test server, for the proxied-link tests.
+kariz = { path = "..", default-features = false, features = ["test-util"] }
 
 [features]
 default = []

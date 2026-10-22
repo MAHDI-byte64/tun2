@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiError, api, isPrivatePath } from "./api";
-import type { ServerInfo } from "./api";
+import type { QuotaRow, ServerInfo } from "./api";
 import { pairTunnels, rateParts } from "./derive";
 import type { Tunnel, TunnelState } from "./derive";
 import { useApp } from "./store";
@@ -15,6 +15,7 @@ import type { BenchChoice } from "./Benchmark";
 import { useNetworks } from "./Networks";
 import { linkWithAddress } from "./GreChoice";
 import { AutoRestartBlock } from "./AutoRestart";
+import { QuotaBar, QuotaBlock, quotaStopped } from "./Quota";
 import { Wizard } from "./Wizard";
 import { TunnelEdit } from "./TunnelEdit";
 import { transportLabel } from "./transport";
@@ -57,7 +58,13 @@ function RunDialog({
     try {
       setId((await start()).op);
     } catch (e) {
-      setError(e instanceof ApiError && e.code === "busy" ? t("wz.busy") : t("tun.failed", { why: e instanceof ApiError ? e.code : String(e) }));
+      setError(
+        e instanceof ApiError && e.code === "busy"
+          ? t("wz.busy")
+          : e instanceof ApiError && e.code === "quota_exceeded"
+            ? t("tun.quotaExceeded")
+            : t("tun.failed", { why: e instanceof ApiError ? e.code : String(e) }),
+      );
     }
   };
   const ready = !confirm || typed.trim() === confirm;
@@ -106,7 +113,7 @@ function RunDialog({
   );
 }
 
-function StateBadge({ state }: { state: TunnelState }) {
+function StateBadge({ state, label }: { state: TunnelState; label?: string }) {
   const { t } = useApp();
   // A state that just changed (broke, came back, was stopped) rings once, so the eye finds it.
   const was = useRef(state);
@@ -121,7 +128,7 @@ function StateBadge({ state }: { state: TunnelState }) {
   return (
     <span className={`pill ${state} ${rang ? "is-new" : ""}`}>
       <i className={`dot ${state}`} aria-hidden="true" />
-      {t(stateKey[state])}
+      {label ?? t(stateKey[state])}
     </span>
   );
 }
@@ -256,25 +263,46 @@ type Action = "start" | "stop" | "restart" | "delete" | "rotate";
 function TunnelPage({
   tunnel,
   servers,
+  quota,
+  onQuota,
   onBack,
   onAct,
   onEdit,
 }: {
   tunnel: Tunnel;
   servers: ServerInfo[];
+  /** Its traffic limit, if it has one. */
+  quota: QuotaRow | null;
+  /** The limit or the usage changed: read them again. */
+  onQuota: () => void;
   onBack: () => void;
   onAct: (a: Action) => void;
   /** With a benchmark's choice, the edit page opens with it filled in. */
   onEdit: (preset?: BenchChoice) => void;
 }) {
-  const { t, num } = useApp();
+  const { t, num, toast } = useApp();
   const [tab, setTab] = useState<TunnelTab>("overview");
+  // Stopped by its traffic limit: it does not start until the usage is reset or the limit raised.
+  const limited = quotaStopped(quota);
+  const resetUsage = async () => {
+    try {
+      await api.resetQuota(tunnel.name);
+      toast(t("qt.resetDone"), "ok");
+    } catch {
+      toast(t("qt.failed"));
+    }
+    onQuota();
+  };
   const { links } = useNetworks();
   const forwards = tunnel.entry?.tunnel.forwards ?? tunnel.exit?.tunnel.forwards ?? [];
   const status = tunnel.entry?.tunnel.status ?? null;
   const up = tunnel.state === "up";
   const r = rateParts(tunnel.rate);
   const moved = bytes(status ? status.totals.bytes_up + status.totals.bytes_down : 0);
+  // An l3 (GRE) tunnel's bytes are not counted; an entry on an older version is counted by the panel alone.
+  const metered = tunnel.transport !== "l3" && !tunnel.transport.startsWith("l3");
+  const entryVersion = tunnel.entry?.server.version ?? "";
+  const oldAgent = !!entryVersion && !status?.counter_id;
   const mode = tunnel.entry?.tunnel.mode ?? tunnel.exit?.tunnel.mode ?? "";
   // What the tunnel runs over now, as the benchmark names it: its core transport (tcp is measured with mux), its
   // direction, and whether it listens on a private network link.
@@ -315,7 +343,7 @@ function TunnelPage({
           <div className="td-title">
             <h2 className="td-name mono">{tunnel.name}</h2>
             <div className="td-tags">
-              <StateBadge state={tunnel.state} />
+              <StateBadge state={tunnel.state} label={limited ? t("st.limit") : undefined} />
               <span className={`tag ${tunnel.via ? "via" : ""}`} dir="ltr" title={tunnel.via ? t("td.autoNow", { via: tunnel.via.replace(/tcpmux/g, "tcp") }) : undefined}>
                 {transportLabel(tunnel.transport, tunnel.via)}
               </span>
@@ -330,7 +358,13 @@ function TunnelPage({
               <Icon name="restart" size={18} />
               {t("tun.restart")}
             </button>
-            <button className="btn btn-ghost btn-sm" type="button" onClick={() => onAct(tunnel.state === "off" ? "start" : "stop")}>
+            <button
+              className="btn btn-ghost btn-sm"
+              type="button"
+              disabled={tunnel.state === "off" && limited}
+              title={tunnel.state === "off" && limited ? t("tun.quotaExceeded") : undefined}
+              onClick={() => onAct(tunnel.state === "off" ? "start" : "stop")}
+            >
               <Icon name={tunnel.state === "off" ? "play" : "pause"} size={18} />
               {t(tunnel.state === "off" ? "tun.start" : "tun.stop")}
             </button>
@@ -404,7 +438,7 @@ function TunnelPage({
           )}
         </div>
       )}
-      {tunnel.state === "off" && (
+      {tunnel.state === "off" && !limited && (
         <div className="diagnosis calm">
           <div className="diag-icon">
             <Icon name="pause" size={18} />
@@ -418,6 +452,28 @@ function TunnelPage({
             <Icon name="play" size={18} />
             {t("tun.start")}
           </button>
+        </div>
+      )}
+      {limited && quota && (
+        <div className="diagnosis calm" role="status">
+          <div className="diag-icon">
+            <Icon name="pause" size={18} />
+          </div>
+          <div>
+            <h3>{t("td.quotaTitle")}</h3>
+            <p>{t("td.quotaText", { used: `${num(bytes(quota.used).value, bytes(quota.used).decimals)} ${bytes(quota.used).unit}`, limit: `${num(bytes(quota.limit_bytes).value, bytes(quota.limit_bytes).decimals)} ${bytes(quota.limit_bytes).unit}` })}</p>
+          </div>
+          <div className="row-actions">
+            <button className="btn btn-ghost btn-sm" type="button" onClick={() => setTab("quota")}>
+              <Icon name="edit" size={18} />
+              {t("td.tab.quota")}
+            </button>
+            <button className="btn btn-primary btn-sm" type="button" onClick={() => void resetUsage()}>
+              <span className="shine" />
+              <Icon name="restart" size={18} />
+              {t("qt.resetUsage")}
+            </button>
+          </div>
         </div>
       )}
       {!tunnel.paired && (
@@ -436,6 +492,7 @@ function TunnelPage({
           ["overview", t("td.tab.overview")],
           ["tools", t("td.tab.tools")],
           ["schedule", t("td.tab.schedule")],
+          ["quota", t("td.tab.quota")],
         ]}
       />
 
@@ -454,7 +511,13 @@ function TunnelPage({
             <Stat label={t("tun.sessions")} icon="tunnels" value={status?.peer.sessions != null ? num(status.peer.sessions) : "—"} />
           </div>
           <div className="card stat-card">
-            <Stat label={t("td.moved")} icon="download" value={status ? num(moved.value, moved.decimals) : "—"} unit={status ? moved.unit : undefined} />
+            {quota ? (
+              <Stat label={t("qt.used")} icon="download" tone={quota.used >= quota.limit_bytes ? "danger" : quota.pct >= 80 ? "warn" : undefined} value={num(bytes(quota.used).value, bytes(quota.used).decimals)} unit={bytes(quota.used).unit}>
+                <QuotaBar q={quota} />
+              </Stat>
+            ) : (
+              <Stat label={t("td.moved")} icon="download" value={status ? num(moved.value, moved.decimals) : "—"} unit={status ? moved.unit : undefined} />
+            )}
           </div>
         </div>
   
@@ -539,11 +602,17 @@ function TunnelPage({
           <AutoRestartBlock tunnel={tunnel.name} />
         </Card>
       </div>
+
+      <div className="tab-panel" role="tabpanel" id="td-panel-quota" aria-labelledby="td-tab-quota" hidden={tab !== "quota"}>
+        <Card title={t("qt.title")} sub={t("qt.subTunnel")}>
+          <QuotaBlock tunnel={tunnel.name} metered={metered} oldAgent={oldAgent} onChanged={onQuota} />
+        </Card>
+      </div>
     </div>
   );
 }
 
-type TunnelTab = "overview" | "tools" | "schedule";
+type TunnelTab = "overview" | "tools" | "schedule" | "quota";
 
 type Filter = "all" | TunnelState;
 
@@ -563,6 +632,25 @@ export function TunnelsPage({
   const { t, num } = useApp();
   const tunnels = pairTunnels(servers);
   const online = servers.filter((s) => s.online);
+  // The traffic limits, by tunnel, read again every few seconds (the usage moves).
+  const [quotas, setQuotas] = useState<Map<string, QuotaRow>>(new Map());
+  const readQuotas = useRef(() => {});
+  useEffect(() => {
+    let alive = true;
+    const read = () => {
+      api
+        .quotas()
+        .then((r) => alive && setQuotas(new Map(r.quotas.map((q) => [q.name, q]))))
+        .catch(() => {});
+    };
+    readQuotas.current = read;
+    read();
+    const id = setInterval(read, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
   const [wizard, setWizard] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   // A benchmark's choice the edit page opens with.
@@ -670,6 +758,11 @@ export function TunnelsPage({
         <TunnelPage
           key={openTunnel.name}
           tunnel={openTunnel}
+          quota={quotas.get(openTunnel.name) ?? null}
+          onQuota={() => {
+            readQuotas.current();
+            onChanged();
+          }}
           onBack={() => setOpen(null)}
           servers={servers}
           onAct={(a) => setAct({ name: openTunnel.name, action: a })}
@@ -749,6 +842,8 @@ export function TunnelsPage({
                 {rows.map((x) => {
                   const r = rateParts(x.rate);
                   const mode = x.entry?.tunnel.mode ?? x.exit?.tunnel.mode ?? "";
+                  const q = quotas.get(x.name);
+                  const limited = quotaStopped(q);
                   return (
                     <tr key={x.name} className={`clickable st-${x.state}`} onClick={() => setOpen(x.name)}>
                       <td>
@@ -790,7 +885,7 @@ export function TunnelsPage({
                       </td>
                       <td className="c-transport num hide-sm">{num((x.entry ?? x.exit)?.tunnel.forwards.length ?? 0)}</td>
                       <td>
-                        <StateBadge state={x.state} />
+                        <StateBadge state={x.state} label={limited ? t("st.limit") : undefined} />
                       </td>
                       <td className="rate num">
                         {x.state === "up" ? (
@@ -805,6 +900,7 @@ export function TunnelsPage({
                         ) : (
                           "—"
                         )}
+                        {q && <QuotaBar q={q} />}
                       </td>
                       <td>
                         <button
@@ -813,6 +909,8 @@ export function TunnelsPage({
                           role="switch"
                           aria-checked={x.state !== "off"}
                           aria-label={t("tl.toggle", { name: x.name })}
+                          disabled={limited}
+                          title={limited ? t("tun.quotaExceeded") : undefined}
                           onClick={(e) => {
                             e.stopPropagation();
                             setAct({ name: x.name, action: x.state === "off" ? "start" : "stop" });

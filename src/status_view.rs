@@ -279,6 +279,7 @@ mod tests {
             transport: "tcpmux".into(),
             profile: "balanced".into(),
             uptime_secs: 93_600,
+            counter_id: None,
             peer: PeerStatus {
                 transport: None,
                 connected: true,

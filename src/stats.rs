@@ -5,6 +5,7 @@
 //! runs in the background. Reading them ([`Stats::snapshot`]) never touches the tunnel.
 
 use std::fmt::Display;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -35,6 +36,16 @@ impl Traffic {
 
     pub fn add_down(&self, n: usize) {
         self.down.fetch_add(n as u64, Relaxed);
+    }
+
+    /// Starts the counters from what was kept across a restart.
+    fn set(&self, up: u64, down: u64) {
+        self.up.store(up, Relaxed);
+        self.down.store(down, Relaxed);
+    }
+
+    fn get(&self) -> (u64, u64) {
+        (self.up.load(Relaxed), self.down.load(Relaxed))
     }
 }
 
@@ -410,6 +421,12 @@ pub struct Stats {
     pub targets: Targets,
     /// Entry side.
     pub probe: Probe,
+    /// Bytes from the traffic file that belong to no `[[forward]]` rule of this run (rules
+    /// that were edited away), so the totals never go down across a restart. Entry side.
+    carry: Traffic,
+    /// The id of the counters restored from the traffic file (`status`'s `counter_id`),
+    /// empty without a file.
+    counter_id: Mutex<String>,
 }
 
 impl Stats {
@@ -451,7 +468,109 @@ impl Stats {
                 .collect(),
             targets: Targets::default(),
             probe: Probe::default(),
+            carry: Traffic::default(),
+            counter_id: Mutex::new(String::new()),
         })
+    }
+
+    /// Starts the byte counters from the traffic file at `path`, written by [`persist`] in
+    /// an earlier run: on the entry side each `[[forward]]` rule gets its own bytes back and
+    /// the bytes of rules that are gone go into the carry, so the totals go on from where
+    /// they were; the exit side gets its target totals back. A file that is missing, cannot
+    /// be read or does not add up starts the counters at zero, under a new counter id.
+    pub fn restore(&self, path: &Path) {
+        let file = match std::fs::read(path) {
+            Ok(text) => match serde_json::from_slice::<TrafficFile>(&text) {
+                Ok(f) if f.adds_up() => Some(f),
+                Ok(_) => {
+                    tracing::warn!(path = %path.display(), "the traffic file does not add up; counting from zero");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "the traffic file cannot be read; counting from zero");
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "the traffic file cannot be read; counting from zero");
+                None
+            }
+        };
+        let Some(file) = file else {
+            *lock(&self.counter_id) = new_counter_id();
+            return;
+        };
+        if self.role == "exit" {
+            self.targets.traffic.set(file.bytes_up, file.bytes_down);
+        } else {
+            let (mut up, mut down) = (0u64, 0u64);
+            let mut taken = vec![false; file.forwards.len()];
+            for f in &self.forwards {
+                let found = file.forwards.iter().enumerate().find(|(i, saved)| {
+                    !taken[*i]
+                        && saved.listen == f.listen
+                        && saved.target == f.target
+                        && saved.protocol == f.protocol
+                });
+                if let Some((i, saved)) = found {
+                    taken[i] = true;
+                    f.traffic.set(saved.bytes_up, saved.bytes_down);
+                    up += saved.bytes_up;
+                    down += saved.bytes_down;
+                }
+            }
+            self.carry.set(
+                file.bytes_up.saturating_sub(up),
+                file.bytes_down.saturating_sub(down),
+            );
+        }
+        *lock(&self.counter_id) = if file.counter_id.is_empty() {
+            new_counter_id()
+        } else {
+            file.counter_id
+        };
+        tracing::debug!(path = %path.display(), bytes_up = file.bytes_up, bytes_down = file.bytes_down, "byte counters restored");
+    }
+
+    /// This side's byte totals now: the forwards and the carry on the entry side, the
+    /// targets on the exit side.
+    fn bytes(&self) -> (u64, u64) {
+        if self.role == "exit" {
+            return self.targets.traffic.get();
+        }
+        let (mut up, mut down) = self.carry.get();
+        for f in &self.forwards {
+            let (u, d) = f.traffic.get();
+            up += u;
+            down += d;
+        }
+        (up, down)
+    }
+
+    /// What goes into the traffic file.
+    fn traffic_file(&self) -> TrafficFile {
+        let (bytes_up, bytes_down) = self.bytes();
+        TrafficFile {
+            version: TRAFFIC_FILE_VERSION,
+            counter_id: lock(&self.counter_id).clone(),
+            bytes_up,
+            bytes_down,
+            forwards: self
+                .forwards
+                .iter()
+                .map(|f| {
+                    let (bytes_up, bytes_down) = f.traffic.get();
+                    ForwardTraffic {
+                        listen: f.listen.clone(),
+                        target: f.target.clone(),
+                        protocol: f.protocol.to_string(),
+                        bytes_up,
+                        bytes_down,
+                    }
+                })
+                .collect(),
+        }
     }
 
     /// The `status` document.
@@ -473,7 +592,14 @@ impl Stats {
                 refused_per_ip: f.refused_per_ip.load(Relaxed),
             })
             .collect();
-        let mut totals = Totals::default();
+        // The carry (bytes of forwards that are gone) is part of the entry's sum; the exit
+        // side's totals are its targets' and replace the sum below.
+        let (carry_up, carry_down) = self.carry.get();
+        let mut totals = Totals {
+            bytes_up: carry_up,
+            bytes_down: carry_down,
+            ..Totals::default()
+        };
         for f in &forwards {
             totals.bytes_up += f.bytes_up;
             totals.bytes_down += f.bytes_down;
@@ -507,11 +633,129 @@ impl Stats {
                 .to_string(),
             profile: self.profile.to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
+            counter_id: Some(lock(&self.counter_id).clone()).filter(|id| !id.is_empty()),
             peer: self.peer.snapshot(self.mux),
             totals,
             forwards,
             exit,
             probe: self.probe.snapshot(),
+        }
+    }
+}
+
+/// Version of the traffic file; a file of another version is not read.
+const TRAFFIC_FILE_VERSION: u32 = 1;
+/// How often the traffic file is written while the counters move.
+const SAVE_EVERY: Duration = Duration::from_secs(5);
+
+/// The traffic file: this side's byte totals, kept across restarts (`[control]
+/// traffic_file`, next to the config by default). JSON, so a person can read it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct TrafficFile {
+    version: u32,
+    /// Changes when the counters start again from zero (no file, or one that could not be
+    /// used), so a reader that keeps its own running total can tell a counter that went
+    /// back a little (a restore after a hard kill) from one that started over.
+    #[serde(default)]
+    counter_id: String,
+    bytes_up: u64,
+    bytes_down: u64,
+    /// Entry side: each `[[forward]]` rule's own bytes.
+    #[serde(default)]
+    forwards: Vec<ForwardTraffic>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ForwardTraffic {
+    listen: String,
+    target: String,
+    protocol: String,
+    bytes_up: u64,
+    bytes_down: u64,
+}
+
+impl TrafficFile {
+    /// The version is known and the forwards do not add up to more than the totals.
+    fn adds_up(&self) -> bool {
+        let (mut up, mut down) = (0u64, 0u64);
+        for f in &self.forwards {
+            up = up.saturating_add(f.bytes_up);
+            down = down.saturating_add(f.bytes_down);
+        }
+        self.version == TRAFFIC_FILE_VERSION && up <= self.bytes_up && down <= self.bytes_down
+    }
+}
+
+/// 16 hex characters that mark one life of the counters.
+fn new_counter_id() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Not random, but still a new value: the clock.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        bytes = t.to_be_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Writes the traffic file in one piece: the new content goes to a temporary file next to
+/// it, which then takes its place, so a reader (or a restart) never sees half a file.
+fn write_traffic_file(path: &Path, file: &TrafficFile) -> std::io::Result<()> {
+    let text = serde_json::to_vec_pretty(file)?;
+    let tmp = path.with_extension("traffic.tmp");
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp)?;
+        std::io::Write::write_all(&mut f, &text)?;
+        f.sync_data()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Writes the counters once more when the task that keeps the traffic file is dropped: at
+/// shutdown, when the runtime drops its tasks.
+struct FlushOnDrop {
+    stats: Arc<Stats>,
+    path: PathBuf,
+}
+
+impl Drop for FlushOnDrop {
+    fn drop(&mut self) {
+        let _ = write_traffic_file(&self.path, &self.stats.traffic_file());
+    }
+}
+
+/// Keeps the traffic file at `path` up to date: every few seconds while the byte counters
+/// move, and once more at shutdown. It never returns (a tunnel's tasks end the tunnel when
+/// they do): a write that fails is logged, not more than once a minute, and tried again.
+pub async fn persist(stats: Arc<Stats>, path: PathBuf) -> anyhow::Result<()> {
+    let _flush = FlushOnDrop {
+        stats: stats.clone(),
+        path: path.clone(),
+    };
+    let mut written = None;
+    let mut last_warning: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(SAVE_EVERY).await;
+        let now = stats.bytes();
+        if written == Some(now) {
+            continue;
+        }
+        match write_traffic_file(&path, &stats.traffic_file()) {
+            Ok(()) => written = Some(now),
+            Err(e) => {
+                if last_warning.map_or(true, |t| t.elapsed() >= Duration::from_secs(60)) {
+                    tracing::warn!(path = %path.display(), error = %e, "the traffic file could not be written; the byte counters will not survive a restart");
+                    last_warning = Some(Instant::now());
+                }
+            }
         }
     }
 }
@@ -526,6 +770,10 @@ pub struct Status {
     pub transport: String,
     pub profile: String,
     pub uptime_secs: u64,
+    /// Marks one life of the byte counters (the traffic file's id): it changes when they
+    /// start again from zero. Absent without a traffic file, and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_id: Option<String>,
     pub peer: PeerStatus,
     pub totals: Totals,
     #[serde(default)]
@@ -738,5 +986,183 @@ mod tests {
         assert!(text.contains("\"status_version\":1"), "{text}");
         assert!(!text.contains("\"exit\""), "{text}");
         assert_eq!(serde_json::from_str::<Status>(&text).unwrap(), s);
+    }
+
+    const ENTRY_ONE: &str = r#"
+        role = "entry"
+        mode = "reverse"
+        [tunnel]
+        transport = "tcpmux"
+        listen = "0.0.0.0:3080"
+        token = "0123456789abcdef0123"
+        [[forward]]
+        listen = "0.0.0.0:443"
+        target = "127.0.0.1:443"
+    "#;
+
+    const EXIT: &str = r#"
+        role = "exit"
+        mode = "reverse"
+        [tunnel]
+        transport = "tcpmux"
+        remote = "127.0.0.1:3080"
+        token = "0123456789abcdef0123"
+    "#;
+
+    fn traffic_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kariz-traffic-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("main.traffic")
+    }
+
+    fn totals(stats: &Stats) -> (u64, u64) {
+        let s = stats.snapshot();
+        (s.totals.bytes_up, s.totals.bytes_down)
+    }
+
+    #[test]
+    fn the_byte_counters_come_back_from_the_traffic_file_on_the_entry_side() {
+        let path = traffic_path("entry");
+        let _ = std::fs::remove_file(&path);
+        let first = Stats::new(&Config::parse(ENTRY).unwrap());
+        // No file yet: the counters start at zero under a new id.
+        first.restore(&path);
+        let id = first.snapshot().counter_id.unwrap();
+        assert_eq!(id.len(), 16);
+        first.forwards[0].traffic.add_up(100);
+        first.forwards[0].traffic.add_down(1000);
+        first.forwards[1].traffic.add_up(5);
+        write_traffic_file(&path, &first.traffic_file()).unwrap();
+
+        // A new run: the same totals, per forward, under the same id.
+        let again = Stats::new(&Config::parse(ENTRY).unwrap());
+        again.restore(&path);
+        let s = again.snapshot();
+        assert_eq!(s.counter_id.as_deref(), Some(id.as_str()));
+        assert_eq!((s.totals.bytes_up, s.totals.bytes_down), (105, 1000));
+        assert_eq!(
+            (s.forwards[0].bytes_up, s.forwards[0].bytes_down),
+            (100, 1000)
+        );
+        assert_eq!(s.forwards[1].bytes_up, 5);
+        again.forwards[1].traffic.add_down(7);
+        assert_eq!(totals(&again), (105, 1007));
+    }
+
+    #[test]
+    fn a_forward_that_was_edited_away_keeps_its_bytes_in_the_total() {
+        let path = traffic_path("carry");
+        let first = Stats::new(&Config::parse(ENTRY).unwrap());
+        first.restore(&path);
+        first.forwards[0].traffic.add_up(100);
+        first.forwards[0].traffic.add_down(1000);
+        first.forwards[1].traffic.add_up(50);
+        first.forwards[1].traffic.add_down(500);
+        write_traffic_file(&path, &first.traffic_file()).unwrap();
+
+        // The tunnel is edited: only the first forward is left. The total stays, and goes on.
+        let edited = Stats::new(&Config::parse(ENTRY_ONE).unwrap());
+        edited.restore(&path);
+        let s = edited.snapshot();
+        assert_eq!((s.totals.bytes_up, s.totals.bytes_down), (150, 1500));
+        assert_eq!(
+            (s.forwards[0].bytes_up, s.forwards[0].bytes_down),
+            (100, 1000)
+        );
+        edited.forwards[0].traffic.add_up(1);
+        assert_eq!(totals(&edited), (151, 1500));
+        // Written again, the carry is still in the totals, and a third run sees it.
+        write_traffic_file(&path, &edited.traffic_file()).unwrap();
+        let third = Stats::new(&Config::parse(ENTRY_ONE).unwrap());
+        third.restore(&path);
+        assert_eq!(totals(&third), (151, 1500));
+    }
+
+    #[test]
+    fn the_exit_side_gets_its_totals_back_without_doubling_them() {
+        let path = traffic_path("exit");
+        let first = Stats::new(&Config::parse(EXIT).unwrap());
+        first.restore(&path);
+        first.targets.traffic.add_up(7);
+        first.targets.traffic.add_down(9);
+        write_traffic_file(&path, &first.traffic_file()).unwrap();
+        for _ in 0..2 {
+            let again = Stats::new(&Config::parse(EXIT).unwrap());
+            again.restore(&path);
+            assert_eq!(totals(&again), (7, 9));
+            write_traffic_file(&path, &again.traffic_file()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_traffic_file_that_cannot_be_used_starts_the_counters_at_zero_under_a_new_id() {
+        let path = traffic_path("bad");
+        // The forwards add up to more than the totals: not trusted.
+        let file = TrafficFile {
+            version: TRAFFIC_FILE_VERSION,
+            counter_id: "0123456789abcdef".into(),
+            bytes_up: 10,
+            bytes_down: 10,
+            forwards: vec![ForwardTraffic {
+                listen: "0.0.0.0:443".into(),
+                target: "127.0.0.1:443".into(),
+                protocol: "tcp".into(),
+                bytes_up: 100,
+                bytes_down: 0,
+            }],
+        };
+        write_traffic_file(&path, &file).unwrap();
+        let stats = Stats::new(&Config::parse(ENTRY_ONE).unwrap());
+        stats.restore(&path);
+        let s = stats.snapshot();
+        assert_eq!((s.totals.bytes_up, s.totals.bytes_down), (0, 0));
+        let id = s.counter_id.unwrap();
+        assert!(!id.is_empty() && id != "0123456789abcdef");
+
+        // Garbage: the same.
+        std::fs::write(&path, b"{not json").unwrap();
+        let stats = Stats::new(&Config::parse(ENTRY_ONE).unwrap());
+        stats.restore(&path);
+        assert_eq!(totals(&stats), (0, 0));
+        assert!(stats.snapshot().counter_id.is_some());
+
+        // Another version: not read.
+        let other = TrafficFile {
+            version: TRAFFIC_FILE_VERSION + 1,
+            bytes_up: 5,
+            bytes_down: 5,
+            ..TrafficFile::default()
+        };
+        write_traffic_file(&path, &other).unwrap();
+        let stats = Stats::new(&Config::parse(ENTRY_ONE).unwrap());
+        stats.restore(&path);
+        assert_eq!(totals(&stats), (0, 0));
+    }
+
+    #[test]
+    fn a_file_without_an_id_gets_one_and_the_file_is_written_whole() {
+        let path = traffic_path("noid");
+        let file = TrafficFile {
+            version: TRAFFIC_FILE_VERSION,
+            bytes_up: 3,
+            bytes_down: 4,
+            ..TrafficFile::default()
+        };
+        write_traffic_file(&path, &file).unwrap();
+        assert!(!path.with_extension("traffic.tmp").exists());
+        let stats = Stats::new(&Config::parse(EXIT).unwrap());
+        stats.restore(&path);
+        let s = stats.snapshot();
+        assert_eq!((s.totals.bytes_up, s.totals.bytes_down), (3, 4));
+        assert_eq!(s.counter_id.map_or(0, |id| id.len()), 16);
+        // The status of a side without a traffic file names no counter id.
+        let plain = Stats::new(&Config::parse(EXIT).unwrap());
+        assert_eq!(plain.snapshot().counter_id, None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

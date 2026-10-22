@@ -116,6 +116,10 @@ pub struct PairRequest {
     /// `l3`: the TUN/TAP MTU.
     #[serde(default)]
     pub l3_mtu: Option<u16>,
+    /// A traffic limit for the new tunnel (the wizard), written once it is up. Not used by
+    /// an edit: the limit lives on the tunnel's page.
+    #[serde(default)]
+    pub quota: Option<crate::quota::QuotaSpec>,
 }
 
 impl PairRequest {
@@ -695,6 +699,12 @@ impl Ops {
             .any(|o| o.kind == kind && o.state == "running")
     }
 
+    /// How many operations of a kind there have been (for the tests).
+    #[cfg(test)]
+    pub(crate) fn count(&self, kind: &str) -> usize {
+        self.lock().iter().filter(|o| o.kind == kind).count()
+    }
+
     pub fn get(&self, id: &str) -> Option<Op> {
         self.lock().iter().find(|o| o.id == id).cloned()
     }
@@ -783,6 +793,13 @@ async fn wait_connected(hub: &Hub, req: &PairRequest, limit: Duration) -> Result
 }
 
 pub async fn ctl(hub: &Hub, server: &str, name: &str, action: &str) -> Result<(), String> {
+    // Stop disables the service too, so a stopped tunnel stays stopped at boot, as the page
+    // says; Start enables it again. Every agent knows both (`manage::ctl_args`).
+    let action = match action {
+        "stop" => "disable",
+        "start" => "enable",
+        other => other,
+    };
     let r: Ack = hub
         .ask_as(
             server,
@@ -845,6 +862,9 @@ fn describe(check: &CheckReply) -> String {
 /// Starts making a tunnel. The operation's id comes back at once.
 pub fn create(hub: &Arc<Hub>, req: PairRequest) -> Result<String> {
     req.validate()?;
+    if let Some(q) = &req.quota {
+        crate::quota::check(q.limit_bytes, q.reset_day)?;
+    }
     req.require_new_enough(hub)?;
     let id = hub.ops.begin("create", &req.name)?;
     let hub = hub.clone();
@@ -1005,6 +1025,13 @@ async fn run_create(
     match wait_connected(hub, req, hub.connect_wait).await {
         Ok(()) => {
             ops.end(op, true, None);
+            // The limit the wizard asked for, from the first byte.
+            if let Some(q) = &req.quota {
+                if let Err(e) = crate::quota::write(&hub.db, &req.name, q.limit_bytes, q.reset_day)
+                {
+                    tracing::warn!(tunnel = %req.name, error = %format!("{e:#}"), "the new tunnel's traffic limit could not be set");
+                }
+            }
             Ok(())
         }
         Err(e) => {
@@ -1140,7 +1167,7 @@ async fn run_edit(
     for server in [first, second] {
         let role = if server == req.entry { "entry" } else { "exit" };
         ops.run(op, &format!("start_{role}"));
-        match ctl(hub, server, &req.name, "restart").await {
+        match run_again(hub, server, &req.name).await {
             Ok(()) => ops.end(op, true, None),
             Err(e) => {
                 let undone = restore(hub, &before, &changed, token.is_some()).await;
@@ -1168,10 +1195,18 @@ async fn restore(hub: &Hub, before: &[(String, Spec)], changed: &[&str], rotated
     for (server, spec) in before {
         if changed.contains(&server.as_str()) {
             all &= put(hub, server, spec.clone()).await.is_ok();
-            all &= ctl(hub, server, &spec.name, "restart").await.is_ok();
+            all &= run_again(hub, server, &spec.name).await.is_ok();
         }
     }
     all
+}
+
+/// Runs a tunnel with the settings just written: enabled (a tunnel that was stopped, and so
+/// disabled, comes back at boot again like a started one) and restarted (a running one takes
+/// the new settings).
+async fn run_again(hub: &Hub, server: &str, name: &str) -> Result<(), String> {
+    ctl(hub, server, name, "enable").await?;
+    ctl(hub, server, name, "restart").await
 }
 
 /// Starts, stops or restarts both sides, in the order that never leaves a dialer without
@@ -1191,6 +1226,19 @@ pub fn control(hub: &Arc<Hub>, name: &str, action: &str) -> Result<String> {
         hub.ops.finish(&op, error, None);
     });
     Ok(id)
+}
+
+/// Waits for an operation to end, up to two minutes: `Ok` when it worked, else why.
+pub async fn wait(hub: &Hub, op: &str) -> Result<(), String> {
+    for _ in 0..240 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        match hub.ops.get(op) {
+            Some(o) if o.state == "running" => {}
+            Some(o) => return o.error.map_or(Ok(()), Err),
+            None => return Ok(()),
+        }
+    }
+    Err("timeout".into())
 }
 
 /// The tunnel's servers, the accepting side first.
@@ -1306,12 +1354,13 @@ async fn run_delete(hub: &Hub, op: &str, name: &str) -> Result<(), String> {
             }
         }
     }
-    // A tunnel that is gone needs no automatic restart.
+    // A tunnel that is gone needs no automatic restart, and no traffic limit.
     if failed.is_none() {
         let _ = hub.db.conn().execute(
             "DELETE FROM schedules WHERE kind = 'tunnel' AND subject = ?1",
             [name],
         );
+        crate::quota::forget(&hub.db, name);
     }
     failed.map_or(Ok(()), Err)
 }

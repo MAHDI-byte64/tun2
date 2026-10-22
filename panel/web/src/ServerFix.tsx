@@ -36,6 +36,9 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
   // Reverse across a GRE link to the panel's server: one it has (by link id), or a new one the panel makes.
   const [greOn, setGreOn] = useState(!!(server.reverse && server.gre));
   const [greLink, setGreLink] = useState(server.reverse && server.gre ? server.gre.link : "");
+  // Reverse through the panel's SOCKS5 proxy (Settings → Proxy), as it is set now.
+  const [viaProxy, setViaProxy] = useState(!!server.reverse?.via_proxy);
+  const [proxyOn, setProxyOn] = useState<boolean | null>(null);
   const [ip, setIp] = useState(server.addr ?? server.ip4 ?? "");
   const { networks } = useNetworks();
   const [netId, setNetId] = useState("");
@@ -61,6 +64,10 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
         if (mine && server.gre && !picked.current) setHost(mine.addr);
       })
       .catch(() => {});
+    api
+      .proxy()
+      .then((p) => alive && setProxyOn(p.enabled))
+      .catch(() => alive && setProxyOn(false));
     return () => {
       alive = false;
     };
@@ -86,6 +93,9 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
   const mine = (own?.gre ?? []).filter((g) => g.server === server.id);
   const viaLink = greOn ? (mine.find((g) => g.link === greLink) ?? (greLink === "new" ? undefined : mine[0])) : undefined;
   const newLink = way === "reverse" && greOn && !viaLink;
+  const throughProxy = way === "reverse" && !greOn && viaProxy;
+  // A SOCKS5 proxy carries no UDP: through it, only the TCP transports are offered.
+  const transports = TRANSPORTS.filter((x) => !throughProxy || (x !== "kcp" && x !== "quic"));
 
   const make = async () => {
     setError("");
@@ -99,12 +109,13 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
       }
       const made =
         way === "reverse"
-          ? await api.reconnectServer(server.id, "", transport, { host: viaLink ? viaLink.peer_addr : rhost.trim().replace(/^\[|\]$/g, ""), port: +rport })
+          ? await api.reconnectServer(server.id, "", transport, { host: viaLink ? viaLink.peer_addr : rhost.trim().replace(/^\[|\]$/g, ""), port: +rport, via_proxy: throughProxy })
           : await api.reconnectServer(server.id, host.trim(), transport, undefined, undefined, agentPortOf(ownPort, port) ?? undefined);
       setCode(made.code);
       setLeft(made.valid_for);
     } catch (e) {
       if (newLink) setError(e instanceof ApiError ? greJoinError(t, e.code, new Map(servers.map((s) => [s.id, s.name]))) : String(e));
+      else if (e instanceof ApiError && (e.code === "proxy_udp" || e.code === "proxy_off")) setError(t(`add.rev.err.${e.code}`));
       else if (e instanceof ApiError && agentPortError(t, e.code, new Map(servers.map((s) => [s.id, s.name])))) setError(agentPortError(t, e.code, new Map(servers.map((s) => [s.id, s.name]))) ?? "");
       else setError(e instanceof ApiError && e.code === "agents_off" ? t("add.off") : t(way === "reverse" ? "add.rev.err.input" : "add.bad"));
     }
@@ -176,6 +187,7 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
               {seenAgo ? ` ${t("fix.lastSeen", { ago: digitsOf(seenAgo) })}` : ` ${t("fix.neverSeen")}`}
             </p>
             {err?.kind === "wrong_key" && <p className="err small">{t("fix.err.wrong_key")}</p>}
+            {err?.kind === "proxy_off" && <p className="err small">{t("fix.err.proxy_off")}</p>}
             {err?.kind === "link_ended" && (
               <p className="small">
                 {t("fix.err.link_ended")} {err.detail && <code dir="ltr">{err.detail}</code>}
@@ -283,6 +295,25 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
               onKind={setLinkKind}
             />
           )}
+          {!greOn && (
+            <div className="field">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  id="fix-proxy"
+                  checked={viaProxy}
+                  disabled={proxyOn === false && !viaProxy}
+                  onChange={(e) => {
+                    setViaProxy(e.target.checked);
+                    if (e.target.checked && (transport === "kcp" || transport === "quic")) setTransport("auto");
+                    setError("");
+                  }}
+                />{" "}
+                {t("add.rev.proxy")}
+              </label>
+              <span className="help">{proxyOn === false ? t("add.rev.proxy.off") : t("add.rev.proxy.d")}</span>
+            </div>
+          )}
           <div className="grid-2">
             {!greOn && (
               <div className="field">
@@ -304,7 +335,7 @@ export function ServerFixDialog({ server, servers, agentsOn, onChanged, onClose 
           )}
           <div className="field">
             <span className="label">{t("fix.rev.protocol")}</span>
-            <Seg<LinkTransport> value={transport} options={TRANSPORTS.map((x) => [x, t(`add.x.${x}`)] as [LinkTransport, string])} onChange={setTransport} />
+            <Seg<LinkTransport> value={transport} options={transports.map((x) => [x, t(`add.x.${x}`)] as [LinkTransport, string])} onChange={setTransport} />
             {portOk && (
               <span className="help">
                 {t(greOn ? "fix.rev.gre.ports" : "fix.rev.ports")} <code dir="ltr">{linkPorts(+rport, transport)}</code>

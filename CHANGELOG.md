@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.9.2 - 2026-10-22
+
+### Added
+
+- **Panel proxy, per server.** Settings → Proxy takes a SOCKS5 proxy (address, optional
+  username/password), and each server the panel connects to (reverse) has its own switch,
+  **Through the panel proxy**, in *Add server* and *Edit*. Only those servers are dialed through
+  the proxy, kept to the TCP link transports (`tcpmux`, `wss`), since SOCKS5 carries no UDP; the
+  proxy's settings are read on every dial, so a change applies at once, and while the proxy is
+  off such a server is not dialed and its card says why. A second switch sends the panel's own
+  release downloads through the proxy. The password is kept in the panel and never shown
+  again. New: `GET`/`POST /api/proxy`, `via_proxy` in `POST /api/servers/join-reverse` and in the
+  `reverse` object of `POST /api/servers/reconnect`, and in a server's `reverse` view.
+- **Traffic limit per tunnel.** A tunnel can be given a volume (on its page, *Traffic limit*, or
+  in the last step of the wizard); when the bytes it carries (upload plus download, read from
+  the entry side) reach it, the panel stops the tunnel on both sides and keeps it stopped until
+  the usage is reset or the limit raised. The usage lives in the panel's database and survives
+  restarts of the panel, the agents and the tunnel. It resets by hand, or every month on a day
+  you pick (the tunnel starts again by itself; a server that is away at the time is caught up
+  with when it is back). A warning at 80% and a notice on the stop go to the events list and to
+  Telegram. New: `GET`/`POST /api/quotas`, `/api/quotas/delete`, `/api/quotas/reset`, `quota` in
+  `POST /api/tunnels`, and the events `quota_near`, `quota_stop`, `quota_reset`, `quota_start`.
+- **The tunnel's byte counters survive restarts.** The daemon keeps `bytes_up` / `bytes_down`
+  in a traffic file next to its config (`[control] traffic_file`, `/etc/kariz/NAME.traffic`),
+  written every 5 s while traffic flows and at shutdown, and starts from it again; a rule
+  edited away keeps its bytes in the totals. The `status` document gains `counter_id`, which
+  marks one life of the counters, so the panel's usage stays exact across a tunnel's restart.
+  A server on an older version is metered by the panel from its readings alone (the tunnel's
+  page says so); update it for exact figures.
+
+### Fixed
+
+- **A stopped tunnel now stays stopped at boot**, as the page always said: *Stop* disables the
+  service as well as stopping it, and *Start* enables it again. *Edit* and *New token* enable
+  the service they restart, so a tunnel edited while stopped comes back at boot too.
+
 ## 2.9.1 - 2026-10-20
 
 ### Fixed

@@ -252,6 +252,7 @@ counters (both sides, see [Status](status.md)) and `kariz speedtest` uses its se
 | Key | Default | Notes |
 |---|---|---|
 | `socket` | the config file's path with `.sock` (`/etc/kariz/main.toml` gives `/etc/kariz/main.sock`) | Owner only. If it cannot be made, the tunnel runs without it and logs a warning. |
+| `traffic_file` | the config file's path with `.traffic` (`/etc/kariz/main.traffic`) | Where the byte counters (`status`'s `bytes_up` / `bytes_down`) are kept across restarts: written every 5 s while traffic flows and at shutdown, read back when the tunnel starts. Owner only. A file that cannot be written is logged, and the counters start at zero next time. |
 
 ## `[log]`
 

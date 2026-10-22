@@ -12,6 +12,7 @@ pub mod kcp;
 #[cfg(not(feature = "kcp"))]
 #[path = "kcp_disabled.rs"]
 pub mod kcp;
+pub mod proxy;
 #[cfg(feature = "quic")]
 pub mod quic;
 #[cfg(feature = "quic")]
@@ -361,6 +362,22 @@ impl Dialer {
         Ok(Self::Ws(tcp, Box::new(dialer)))
     }
 
+    /// The same dialer, dialing through a SOCKS5 proxy (the panel's links to the servers it
+    /// reaches that way). Only the stream transports can: a proxy carries TCP, so `kcp` and
+    /// the helper transports are refused. `None` leaves the dialer as it is.
+    pub fn with_proxy(self, proxy: Option<proxy::Socks5>) -> io::Result<Self> {
+        let Some(proxy) = proxy else {
+            return Ok(self);
+        };
+        match self {
+            Self::Tcp(d) => Ok(Self::Tcp(d.with_proxy(Some(proxy)))),
+            Self::Ws(d, ws) => Ok(Self::Ws(d.with_proxy(Some(proxy)), ws)),
+            Self::Kcp(_) => Err(not_through_a_proxy()),
+            #[cfg(all(feature = "helpers", unix))]
+            Self::Helper(_) => Err(not_through_a_proxy()),
+        }
+    }
+
     pub async fn dial(&self) -> io::Result<TunnelStream> {
         self.dial_with(&[]).await
     }
@@ -476,6 +493,13 @@ fn not_a_stream_transport() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         "quic is not a stream transport; use transport::quic",
+    )
+}
+
+fn not_through_a_proxy() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a SOCKS5 proxy carries only the TCP transports (tcp, tcpmux, ws, wss)",
     )
 }
 

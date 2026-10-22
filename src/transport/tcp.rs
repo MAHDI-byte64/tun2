@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::config::Tuning;
+use crate::transport::proxy::Socks5;
 
 pub struct TcpTransportListener {
     inner: TcpListener,
@@ -36,6 +37,10 @@ impl TcpTransportListener {
 pub struct TcpTransportDialer {
     addr: String,
     tuning: Tuning,
+    /// A SOCKS5 proxy to dial through instead of connecting to `addr` directly (the panel's
+    /// links to the servers it reaches that way); `None` everywhere else. Boxed: a dialer is
+    /// carried by value in a few enums, and this is the rare case.
+    proxy: Option<Box<Socks5>>,
 }
 
 impl TcpTransportDialer {
@@ -43,11 +48,21 @@ impl TcpTransportDialer {
         Self {
             addr: addr.to_owned(),
             tuning: tuning.clone(),
+            proxy: None,
         }
     }
 
+    /// The same dialer, through `proxy` (or direct again with `None`).
+    pub fn with_proxy(mut self, proxy: Option<Socks5>) -> Self {
+        self.proxy = proxy.map(Box::new);
+        self
+    }
+
     pub async fn dial(&self) -> io::Result<TcpStream> {
-        let stream = connect(&self.addr, &self.tuning).await?;
+        let stream = match &self.proxy {
+            Some(proxy) => proxy.connect(&self.addr, self.tuning.dial_timeout).await?,
+            None => connect(&self.addr, &self.tuning).await?,
+        };
         tune_tunnel_socket(&stream, &self.tuning)?;
         Ok(stream)
     }

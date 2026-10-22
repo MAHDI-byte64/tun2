@@ -1,6 +1,6 @@
 [package]
 name = "kariz"
-version = "2.9.1"
+version = "2.9.2"
 edition = "2021"
 rust-version = "1.80"
 description = "High-performance, resource-efficient tunnel core for server-to-server links, built to resist DPI."
@@ -83,6 +83,9 @@ helpers = ["dep:nix", "tokio/process"]
 l3 = ["rawlink"]
 # mimalloc as the global allocator of the kariz binary (musl's own is slow).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+# Test helpers other crates' tests use (the panel's): the SOCKS5 server in
+# `transport::proxy::testing`. Never on in a build that ships.
+test-util = []
 
 [dev-dependencies]
 rcgen = "0.14"

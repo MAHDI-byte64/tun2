@@ -48,6 +48,9 @@ pub fn routes() -> Router<AppState> {
         .route("/api/schedules", get(schedules_list).post(schedule_set))
         .route("/api/schedules/delete", post(schedule_delete))
         .route("/api/schedules/run", post(schedule_run))
+        .route("/api/quotas", get(quotas_list).post(quota_set))
+        .route("/api/quotas/delete", post(quota_delete))
+        .route("/api/quotas/reset", post(quota_reset))
         // A tunnel with many ports is a bigger body than the other calls take.
         .route(
             "/api/tunnels/check",
@@ -102,6 +105,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/telegram/pair", post(telegram_pair))
         .route("/api/telegram/chats/remove", post(telegram_remove_chat))
         .route("/api/telegram/test", post(telegram_test))
+        .route("/api/proxy", get(proxy_get).post(proxy_set))
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
@@ -747,6 +751,36 @@ struct JoinReverseBody {
     /// The panel reaches it across a GRE link made for it instead (`host` is then the
     /// server's end of that link).
     gre: Option<GreBody>,
+    /// The panel dials it through its SOCKS5 proxy (Settings → Proxy).
+    #[serde(default)]
+    via_proxy: bool,
+}
+
+/// Where the panel is to dial a server, as typed: checked, with the errors the page knows
+/// (`bad_input`, `proxy_udp`: a UDP transport through the proxy, `proxy_off`: through the
+/// proxy while none is enabled).
+fn reverse_target(
+    state: &AppState,
+    host: &str,
+    port: u16,
+    transport: Option<&str>,
+    via_proxy: bool,
+) -> Result<crate::reverse::Reverse, Response> {
+    let target = crate::reverse::Reverse::new(host, port, transport, via_proxy).map_err(|e| {
+        let why = format!("{e:#}");
+        error(
+            StatusCode::BAD_REQUEST,
+            if why == "proxy_udp" {
+                "proxy_udp"
+            } else {
+                "bad_input"
+            },
+        )
+    })?;
+    if via_proxy && crate::proxy::Settings::load(&state.db).socks5().is_none() {
+        return Err(error(StatusCode::BAD_REQUEST, "proxy_off"));
+    }
+    Ok(target)
 }
 
 /// *Add server* the other way round: the panel connects to the new server. The server is
@@ -805,9 +839,15 @@ async fn join_reverse(
             Err(e) => gre_failed(&e),
         };
     }
-    let Ok(target) = crate::reverse::Reverse::new(&body.host, body.port, body.transport.as_deref())
-    else {
-        return error(StatusCode::BAD_REQUEST, "bad_input");
+    let target = match reverse_target(
+        &state,
+        &body.host,
+        body.port,
+        body.transport.as_deref(),
+        body.via_proxy,
+    ) {
+        Ok(t) => t,
+        Err(r) => return r,
     };
     let at = target.addr();
     match state.hub.create_reverse_join(name, target).await {
@@ -869,6 +909,9 @@ struct ReverseBody {
     #[serde(default)]
     host: String,
     port: u16,
+    /// The panel dials it through its SOCKS5 proxy (Settings → Proxy).
+    #[serde(default)]
+    via_proxy: bool,
 }
 
 /// A join code for a server that is already known: its agent is replaced by one that joins
@@ -921,10 +964,15 @@ async fn reconnect_server(
         };
     }
     if let Some(r) = &body.reverse {
-        let target = match crate::reverse::Reverse::new(&r.host, r.port, body.transport.as_deref())
-        {
+        let target = match reverse_target(
+            &state,
+            &r.host,
+            r.port,
+            body.transport.as_deref(),
+            r.via_proxy,
+        ) {
             Ok(t) => t,
-            Err(_) => return error(StatusCode::BAD_REQUEST, "bad_input"),
+            Err(r) => return r,
         };
         if body.id == crate::hub::LOCAL {
             return error(StatusCode::BAD_REQUEST, "bad_input");
@@ -1111,6 +1159,103 @@ async fn schedule_set(
             "no_such_server" => error(StatusCode::NOT_FOUND, "no_such_server"),
             _ => internal(e),
         },
+    }
+}
+
+// ---- Traffic limits ----
+
+async fn quotas_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&state, &headers, false) {
+        return r;
+    }
+    match crate::quota::list(&state.db) {
+        Ok(quotas) => reply(StatusCode::OK, json!({ "quotas": quotas })),
+        Err(e) => internal(e),
+    }
+}
+
+async fn quota_set(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<crate::quota::NewQuota>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::quota::set(&state.hub, &body) {
+        Ok(()) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!(
+                    "set a traffic limit of {} bytes on tunnel {}",
+                    body.limit_bytes, body.name
+                ),
+            );
+            reply(StatusCode::OK, json!({}))
+        }
+        Err(e) => match format!("{e:#}").as_str() {
+            "bad_name" | "bad_input" => error(StatusCode::BAD_REQUEST, "bad_input"),
+            "no_such_tunnel" => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
+            _ => internal(e),
+        },
+    }
+}
+
+#[derive(Deserialize)]
+struct QuotaKey {
+    name: String,
+}
+
+async fn quota_delete(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<QuotaKey>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::quota::delete(&state.db, &body.name) {
+        Ok(_) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!("removed the traffic limit of tunnel {}", body.name),
+            );
+            reply(StatusCode::OK, json!({}))
+        }
+        Err(e) => internal(e),
+    }
+}
+
+async fn quota_reset(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<QuotaKey>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::quota::reset(&state.hub, &body.name) {
+        Ok(true) => {
+            audit(
+                &state,
+                &format!("session {}", me.id),
+                &ip_of(&peer),
+                &format!("reset the traffic usage of tunnel {}", body.name),
+            );
+            reply(StatusCode::OK, json!({}))
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no_such_tunnel"),
+        Err(e) => internal(e),
     }
 }
 
@@ -1307,6 +1452,12 @@ async fn tunnel_control(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // A tunnel over its traffic limit stays stopped until its usage is reset or its limit raised.
+    if matches!(body.action.as_str(), "start" | "restart")
+        && crate::quota::exhausted(&state.db, &body.name)
+    {
+        return error(StatusCode::CONFLICT, "quota_exceeded");
+    }
     match pair::control(&state.hub, &body.name, &body.action) {
         Ok(op) => {
             audit(
@@ -2356,6 +2507,84 @@ async fn telegram_set(
         },
     );
     reply(StatusCode::OK, state.hub.telegram.view(&s, &state.db))
+}
+
+// ---- Proxy ----
+
+#[derive(Deserialize)]
+struct ProxyBody {
+    enabled: Option<bool>,
+    addr: Option<String>,
+    username: Option<String>,
+    /// A new password. When omitted the stored one is kept (the page never sends it back).
+    password: Option<String>,
+    #[serde(default)]
+    remove_password: bool,
+    panel_internet: Option<bool>,
+}
+
+async fn proxy_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&state, &headers, false) {
+        return r;
+    }
+    reply(
+        StatusCode::OK,
+        crate::proxy::Settings::load(&state.db).view(),
+    )
+}
+
+async fn proxy_set(
+    State(state): State<AppState>,
+    peer: Peer,
+    headers: HeaderMap,
+    Json(body): Json<ProxyBody>,
+) -> Response {
+    let me = match authenticate(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut s = crate::proxy::Settings::load(&state.db);
+    let before = s.socks5();
+    if let Some(v) = body.enabled {
+        s.enabled = v;
+    }
+    if let Some(v) = body.addr {
+        s.addr = v.trim().to_owned();
+    }
+    if let Some(v) = body.username {
+        s.username = v.trim().to_owned();
+    }
+    if body.remove_password {
+        s.password.clear();
+    } else if let Some(v) = body.password {
+        s.password = v;
+    }
+    if let Some(v) = body.panel_internet {
+        s.panel_internet = v;
+    }
+    if let Err(code) = s.check() {
+        return error(StatusCode::BAD_REQUEST, code);
+    }
+    if let Err(e) = s.save(&state.db) {
+        return internal(e);
+    }
+    s.apply();
+    // The servers dialed through the proxy are dialed again with the new one (or stop
+    // being dialed while it is off); a change to the internet switch alone touches none.
+    if s.socks5() != before {
+        state.hub.restart_proxied_links();
+    }
+    audit(
+        &state,
+        &format!("session {}", me.id),
+        &ip_of(&peer),
+        if s.enabled {
+            "changed the panel proxy (on)"
+        } else {
+            "changed the panel proxy (off)"
+        },
+    );
+    reply(StatusCode::OK, s.view())
 }
 
 /// A new code for connecting a chat: the chat sends `/start CODE` to the bot.

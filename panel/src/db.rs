@@ -165,6 +165,23 @@ const MIGRATIONS: &[&str] = &[
          result TEXT NOT NULL,
          PRIMARY KEY (src, dst)
      );",
+    // 18: a server the panel connects to through its SOCKS5 proxy (Settings → Proxy).
+    "ALTER TABLE reverse_links ADD COLUMN via_proxy INTEGER NOT NULL DEFAULT 0;",
+    // 19: a traffic limit per tunnel, and the usage the panel adds up (`crate::quota`).
+    "CREATE TABLE quotas (
+         name TEXT PRIMARY KEY,                 -- the tunnel
+         limit_bytes INTEGER NOT NULL,          -- 0: no limit any more (the row stays while a start is owed)
+         used INTEGER NOT NULL DEFAULT 0,       -- bytes since the last reset
+         last_seen INTEGER NOT NULL DEFAULT -1, -- the last reading of the counted side's total (-1: none)
+         side TEXT NOT NULL DEFAULT '',         -- the role that reading came from
+         counter_id TEXT NOT NULL DEFAULT '',   -- the daemon's counter id at that reading ('': an older daemon)
+         reset_day INTEGER NOT NULL DEFAULT 0,  -- 0: by hand; 1..28: monthly, on that day
+         last_reset INTEGER NOT NULL,
+         warned INTEGER NOT NULL DEFAULT 0,     -- the 80% warning went out this period
+         stopped INTEGER NOT NULL DEFAULT 0,    -- when the limit stopped the tunnel (0: not)
+         start_due INTEGER NOT NULL DEFAULT 0,  -- the panel still has to start it again
+         since INTEGER NOT NULL
+     );",
 ];
 
 /// A shared handle to the database. SQLite calls are short, so one connection behind a

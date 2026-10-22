@@ -34,6 +34,7 @@ use crate::mux::{MuxSession, SessionConfig, Side};
 #[cfg(feature = "quic")]
 use crate::session::quic::QuicSession;
 use crate::session::Session;
+use crate::transport::proxy::Socks5;
 #[cfg(feature = "quic")]
 use crate::transport::quic::{Accepting, QuicDialer, QuicListener, QuicSettings};
 use crate::transport::{Dialer as TransportDialer, Incoming, Listener, Settings};
@@ -447,7 +448,31 @@ impl Dialer {
     /// Like [`Dialer::new`], over `kind` (one of [`LINK_TRANSPORTS`]; for `wss` and `quic`,
     /// `addr` is the panel's [`wss_addr`], see [`address_for`]).
     pub fn via(addr: &str, token: &str, kind: TransportKind) -> io::Result<Self> {
-        Self::shaped(addr, token, Shape::link(kind))
+        Self::via_proxy(addr, token, kind, None)
+    }
+
+    /// Like [`Dialer::via`], dialing through a SOCKS5 proxy when one is given (the panel's
+    /// links to the servers it reaches that way). A proxy carries TCP, so only `tcpmux` and
+    /// `wss` can go through one: `kcp` and `quic` are refused with a proxy.
+    pub fn via_proxy(
+        addr: &str,
+        token: &str,
+        kind: TransportKind,
+        proxy: Option<Socks5>,
+    ) -> io::Result<Self> {
+        let mut dialer = Self::shaped(addr, token, Shape::link(kind))?;
+        if let Some(proxy) = proxy {
+            dialer.dialing =
+                match dialer.dialing {
+                    Dialing::Stream(d) => Dialing::Stream(d.with_proxy(Some(proxy))?),
+                    #[cfg(feature = "quic")]
+                    Dialing::Quic(_) => return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "a SOCKS5 proxy carries only the TCP transports (tcpmux, wss), not quic",
+                    )),
+                };
+        }
+        Ok(dialer)
     }
 
     pub(crate) fn shaped(addr: &str, token: &str, shape: Shape<'_>) -> io::Result<Self> {
@@ -642,6 +667,75 @@ mod tests {
             .await
             .is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link dialed through a SOCKS5 proxy works like a direct one, and really goes through
+    /// the proxy; the UDP transports cannot.
+    #[tokio::test]
+    async fn a_link_goes_through_a_socks5_proxy_over_the_tcp_transports() {
+        use crate::transport::proxy::testing::Socks5Server;
+        let proxy = Socks5Server::start(Some(("panel".into(), "secret".into()))).await;
+        let auth = Some(("panel".to_owned(), "secret".to_owned()));
+
+        let acceptor = Acceptor::bind("127.0.0.1:0", TOKEN).await.unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let dialer = Dialer::via_proxy(
+            &addr,
+            TOKEN,
+            TransportKind::Tcpmux,
+            Some(proxy.proxy(auth.clone())),
+        )
+        .unwrap();
+        round_trips(acceptor, dialer).await;
+        assert_eq!(proxy.relayed(), 1, "the tcpmux link went through the proxy");
+
+        let c = rcgen::generate_simple_self_signed(vec!["panel.example".to_owned()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("kariz-link-proxy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, c.cert.pem()).unwrap();
+        std::fs::write(&key, c.signing_key.serialize_pem()).unwrap();
+        let acceptor = Acceptor::bind_wss("127.0.0.1:0", TOKEN, &cert, &key)
+            .await
+            .unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let dialer = Dialer::via_proxy(
+            &addr,
+            TOKEN,
+            TransportKind::Wss,
+            Some(proxy.proxy(auth.clone())),
+        )
+        .unwrap();
+        round_trips(acceptor, dialer).await;
+        assert_eq!(proxy.relayed(), 2, "the wss link went through the proxy");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The wrong password never gets a link.
+        let acceptor = Acceptor::bind("127.0.0.1:0", TOKEN).await.unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let wrong = Some(("panel".to_owned(), "nope".to_owned()));
+        let dialer = Dialer::via_proxy(
+            &addr,
+            TOKEN,
+            TransportKind::Tcpmux,
+            Some(proxy.proxy(wrong)),
+        )
+        .unwrap();
+        assert!(dialer.connect(Side::Server).await.is_err());
+
+        // A proxy carries TCP only.
+        #[cfg(feature = "kcp")]
+        assert!(Dialer::via_proxy(
+            &addr,
+            TOKEN,
+            TransportKind::Kcp,
+            Some(proxy.proxy(auth.clone()))
+        )
+        .is_err());
+        #[cfg(feature = "quic")]
+        assert!(
+            Dialer::via_proxy(&addr, TOKEN, TransportKind::Quic, Some(proxy.proxy(auth))).is_err()
+        );
     }
 
     #[test]

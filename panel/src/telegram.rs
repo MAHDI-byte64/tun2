@@ -465,7 +465,9 @@ async fn alert_loop(hub: Arc<Hub>) {
                 continue;
             }
         };
-        let notices = alerter.step(&views, at, s.rules());
+        let mut notices = alerter.step(&views, at, s.rules());
+        // What the tunnels' traffic limits have to say (always, like a server going down).
+        notices.extend(hub.take_notices());
         let speaking = s.ready()
             && !s.chats.is_empty()
             && !matches!(muted_until(&hub.db), Some(until) if until > at);
@@ -817,6 +819,34 @@ pub mod text {
                         let _ = write!(out, "🟢 تانل <b>{name}</b> دوباره وصل شد (قطع بود: {d})");
                     } else {
                         let _ = write!(out, "🟢 Tunnel <b>{name}</b> is up again (down for {d})");
+                    }
+                }
+                Notice::QuotaNear { name, used, limit } => {
+                    let (name, used, limit) = (esc(name), bytes(fa, *used), bytes(fa, *limit));
+                    if fa {
+                        let _ = write!(
+                            out,
+                            "⚠️ تانل <b>{name}</b> به ۸۰٪ سقف حجمش رسیده ({used} از {limit})"
+                        );
+                    } else {
+                        let _ = write!(
+                            out,
+                            "⚠️ Tunnel <b>{name}</b> has used 80% of its traffic limit ({used} of {limit})"
+                        );
+                    }
+                }
+                Notice::QuotaStopped { name, used, limit } => {
+                    let (name, used, limit) = (esc(name), bytes(fa, *used), bytes(fa, *limit));
+                    if fa {
+                        let _ = write!(
+                            out,
+                            "🛑 تانل <b>{name}</b> متوقف شد: سقف حجمش پر شده ({used} از {limit}). در پنل مصرف را بازنشانی کنید یا سقف را بالا ببرید."
+                        );
+                    } else {
+                        let _ = write!(
+                            out,
+                            "🛑 Tunnel <b>{name}</b> was stopped: its traffic limit is reached ({used} of {limit}). Reset the usage or raise the limit in the panel."
+                        );
                     }
                 }
                 Notice::Unstable { name } => {

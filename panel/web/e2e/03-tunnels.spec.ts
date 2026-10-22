@@ -157,6 +157,42 @@ test.describe("the tunnel", () => {
     front = newFront;
   });
 
+  test("takes a traffic limit, shows the usage, and lets it go again", async ({ page }) => {
+    await signIn(page);
+    await goTo(page, "tunnels");
+    const row = page.locator(".tunnels tr", { hasText: "demo" });
+    await row.click();
+    await page.locator("#td-tab-quota").click();
+    const panel = page.locator("#td-panel-quota");
+    await expect(panel).toContainText(/No limit/i);
+    // A bad amount is refused by the page itself.
+    await panel.locator("#qt-amount").fill("0");
+    await panel.getByRole("button", { name: /^Save$/ }).click();
+    await expect(panel.getByRole("alert")).toContainText(/at least 1 MB/i);
+    // A limit of one gigabyte, reset on the 5th of every month.
+    await panel.locator("#qt-amount").fill("1");
+    await panel.getByRole("button", { name: "Monthly", exact: true }).click();
+    await panel.locator("#qt-day").fill("5");
+    await panel.getByRole("button", { name: /^Save$/ }).click();
+    await expect(page.locator(".toast, [role=status]").filter({ hasText: /limit saved/i }).first()).toBeVisible();
+    await expect(panel.locator(".qt-bar")).toContainText(/of 1\.0 GB/);
+    await expect(panel).toContainText(/Next reset/i);
+    // The usage is also in the list, and on the page's overview.
+    await page.locator(".td-back").click();
+    await expect(row.locator(".qt-bar")).toContainText(/of 1\.0 GB/, { timeout: 15_000 });
+    await row.click();
+    await expect(page.locator(".stat-card .qt-bar")).toBeVisible();
+    // Reset, then remove: the usage goes, then the limit.
+    await page.locator("#td-tab-quota").click();
+    await panel.getByRole("button", { name: /Reset the usage/i }).click();
+    await expect(page.locator(".toast, [role=status]").filter({ hasText: /usage was reset/i }).first()).toBeVisible();
+    await panel.getByRole("button", { name: /Remove the limit/i }).click();
+    await expect(page.locator(".toast, [role=status]").filter({ hasText: /limit was removed/i }).first()).toBeVisible();
+    await expect(panel).toContainText(/No limit/i);
+    await page.locator(".td-back").click();
+    await expect(row.locator(".qt-bar")).toHaveCount(0, { timeout: 15_000 });
+  });
+
   test("is stopped, started again and deleted, from its page", async ({ page }) => {
     await signIn(page);
     await goTo(page, "tunnels");
