@@ -133,12 +133,14 @@ mod tests {
     use crate::config::Profile;
 
     /// A buffer of our own size (the kernel reports twice what was asked, capped by its
-    /// sysctl) and a congestion control the kernel has.
+    /// sysctl) and a congestion control every kernel has. `reno` is also four bytes long,
+    /// which is all QEMU's user-mode emulation passes for a TCP option (it takes them all
+    /// for an `int`), so the cross jobs can check it too.
     #[tokio::test]
     async fn tunnel_sockets_take_the_buffer_and_congestion_knobs() {
         let tuning = Tuning {
             tcp_buffer: Some(128 * 1024),
-            tcp_congestion: Some("cubic".into()),
+            tcp_congestion: Some("reno".into()),
             ..Tuning::for_profile(Profile::Balanced)
         };
         let listener = TcpTransportListener::bind("127.0.0.1:0", &tuning)
@@ -153,7 +155,7 @@ mod tests {
             assert!(sock.send_buffer_size().unwrap() >= 128 * 1024);
             // The kernel pads the name to 16 bytes.
             let name = sock.tcp_congestion().unwrap();
-            assert_eq!(name.split(|b| *b == 0).next(), Some(&b"cubic"[..]));
+            assert_eq!(name.split(|b| *b == 0).next(), Some(&b"reno"[..]));
         }
     }
 

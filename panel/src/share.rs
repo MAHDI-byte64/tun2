@@ -7,6 +7,10 @@
 //! be asked once in five minutes, and not while the limit or the end keeps the tunnel
 //! stopped. The page refreshes itself every half minute and runs no script.
 
+// The handlers leave early with a ready `Response` as the `Err` of `lookup`, as in
+// `api.rs`; it is built once, on the slow path.
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

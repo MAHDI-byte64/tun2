@@ -2925,7 +2925,8 @@ mod tests {
         assert_eq!(t.tcp_congestion.as_deref(), Some("bbr"));
         for (line, key) in [
             ("udp_socket_buffer = 1024", "tuning.udp_socket_buffer"),
-            ("tcp_buffer = 999999999999", "tuning.tcp_buffer"),
+            // Over the range but within a 32-bit `usize`, so the cross jobs parse it too.
+            ("tcp_buffer = 4000000000", "tuning.tcp_buffer"),
             ("tcp_congestion = \"B B R\"", "tuning.tcp_congestion"),
             ("tcp_congestion = \"\"", "tuning.tcp_congestion"),
         ] {
