@@ -34,11 +34,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/tun2/main/scrip
 ```bash
 kariz-manager install --version v1.0.0        # a specific release
 kariz-manager install --binary ./kariz        # a binary you built yourself
-kariz-manager install --archive kariz-v1.0.0-x86_64-linux.tar.gz   # آفلاین: از یک .tar.gz روی دیسک
-kariz-manager install --offline               # آفلاین: آرشیوِ کپی‌شده را خودکار پیدا می‌کند
 ```
-
-برای سروری که اینترنت ندارد، مراحل نصب آفلاین را در [شروع به کار](getting-started.md#%D8%B3%D8%B1%D9%88%D8%B1-%D8%A7%DB%8C%D9%86%D8%AA%D8%B1%D9%86%D8%AA-%D9%86%D8%AF%D8%A7%D8%B1%D8%AF-%D9%86%D8%B5%D8%A8-%D8%A2%D9%81%D9%84%D8%A7%DB%8C%D9%86) ببینید: چک‌سام و امضا به همان شکل بررسی می‌شوند، پس نصب آفلاین کم‌امن‌تر نیست.
 
 ## راه معمول
 

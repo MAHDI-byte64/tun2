@@ -28,12 +28,6 @@ pub struct PairRequest {
     pub exit: String,
     pub mode: String,
     pub transport: String,
-    /// Asymmetric transport: the user-facing *receive* (download, exit→entry) transport, when
-    /// it differs from `transport` (the send / upload, entry→exit one). `None` is a normal
-    /// symmetric tunnel. Only the stream transports (`tcp`, `ws`, `wss`) are allowed; spoof
-    /// asymmetry travels in `spoof.recv_shape` instead.
-    #[serde(default)]
-    pub recv_transport: Option<String>,
     pub profile: Option<String>,
     /// The address the accepting side listens on, e.g. `0.0.0.0:3080`.
     pub listen: String,
@@ -129,30 +123,11 @@ impl PairRequest {
     /// listening wss side's certificate pin, for the dialing side.
     pub fn specs(&self, token: Option<&str>, pin: Option<&str>) -> (Spec, Spec) {
         let reverse = self.mode == "reverse";
-        // Asymmetric transport: the core's `transport` is link A (dialer→acceptor) and
-        // `recv_transport` is link B (acceptor→dialer). The user picks a send (entry→exit,
-        // upload) and a receive (exit→entry, download) transport; which one is link A depends
-        // on who dials — the entry in direct mode, the exit in reverse. The receive link's
-        // address is the primary port + 1, derived by the core. (spoof carries its own
-        // asymmetry in `spoof.recv_shape`, so it is excluded here.)
-        let asym = self
-            .recv_transport
-            .as_deref()
-            .map(str::trim)
-            .filter(|r| !r.is_empty() && self.transport != "spoof");
-        let (link_a, link_b) = match asym {
-            Some(user_recv) if reverse => (user_recv.to_owned(), self.transport.clone()),
-            Some(user_recv) => (self.transport.clone(), user_recv.to_owned()),
-            None => (self.transport.clone(), String::new()),
-        };
-        let recv_transport = asym.map(|_| link_b.clone());
-        let uses_wss = self.uses_wss();
         let side = |role: &str, accepts: bool| Spec {
             name: self.name.clone(),
             role: role.to_owned(),
             mode: self.mode.clone(),
-            transport: link_a.clone(),
-            recv_transport: recv_transport.clone(),
+            transport: self.transport.clone(),
             profile: self.profile.clone(),
             listen: accepts.then(|| self.listen.clone()),
             remote: (!accepts).then(|| self.dial.clone()),
@@ -170,13 +145,13 @@ impl PairRequest {
                 .then(|| self.proxy_version().map(str::to_owned))
                 .flatten(),
             tls_sni: (!accepts).then(|| self.dial_sni()).flatten(),
-            tls_pin: (!accepts && uses_wss && self.tls_cert.is_none())
+            tls_pin: (!accepts && self.transport == "wss" && self.tls_cert.is_none())
                 .then(|| pin.map(str::to_owned))
                 .flatten(),
-            tls_cert: (accepts && uses_wss)
+            tls_cert: (accepts && self.transport == "wss")
                 .then(|| self.tls_cert.clone())
                 .flatten(),
-            tls_key: (accepts && uses_wss)
+            tls_key: (accepts && self.transport == "wss")
                 .then(|| self.tls_key.clone())
                 .flatten(),
             stealth: (self.transport == "stealth")
@@ -207,14 +182,8 @@ impl PairRequest {
     /// certificate was issued for: any other (a server name typed for a self-signed one, a
     /// WebSocket Host, an address that is not the certificate's) makes the dialing side
     /// refuse the certificate (`BadCertificate`).
-    /// Whether either direction uses `wss` (so the tunnel needs a TLS certificate). For a
-    /// symmetric tunnel this is just `transport == "wss"`.
-    fn uses_wss(&self) -> bool {
-        self.transport == "wss" || self.recv_transport.as_deref().map(str::trim) == Some("wss")
-    }
-
     fn dial_sni(&self) -> Option<String> {
-        if self.uses_wss() && self.tls_cert.is_some() {
+        if self.transport == "wss" && self.tls_cert.is_some() {
             if let Some(host) = self
                 .tls_host
                 .as_deref()
@@ -320,18 +289,8 @@ impl PairRequest {
             return None;
         }
         let base = self.spoof.clone().unwrap_or_default();
-        // Asymmetric spoof: the wizard's `shape` is the upload (entry→exit) shape and
-        // `recv_shape` the download (exit→entry) one. Each side forges toward the other, so the
-        // entry forges upload / receives download, and the exit mirrors it. Symmetric when
-        // `recv_shape` is unset.
-        let (shape, recv_shape) = match &base.recv_shape {
-            Some(download) if is_entry => (base.shape.clone(), Some(download.clone())),
-            Some(download) => (Some(download.clone()), base.shape.clone()),
-            None => (base.shape.clone(), None),
-        };
         let s = crate::wire::SpoofSpec {
-            shape,
-            recv_shape,
+            shape: base.shape,
             pool: if is_entry {
                 base.entry_pool
             } else {
@@ -434,24 +393,6 @@ impl PairRequest {
         self.transport == "spoof"
     }
 
-    /// Asymmetric (split) transport, which arrived with 2.10: a tunnel that rides a different
-    /// transport each way (`recv_transport`), or a spoof tunnel with different send/receive
-    /// shapes (`spoof.recv_shape`). An older agent does not understand it.
-    fn needs_asymmetric(&self) -> bool {
-        let split = self.transport != "spoof"
-            && self
-                .recv_transport
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|r| !r.is_empty());
-        let spoof_shapes = self
-            .spoof
-            .as_ref()
-            .and_then(|s| s.recv_shape.as_deref())
-            .is_some_and(|s| !s.trim().is_empty());
-        split || spoof_shapes
-    }
-
     /// An error (`old_agent:SERVER:VERSION`, or `old_agent_enc:...` for a cipher,
     /// `old_agent_obfs:...` for sealed QUIC, `old_agent_limits:...` for 2.4's limits and
     /// `old_agent_proxy:...` for PROXY headers) naming the first server that is too old.
@@ -463,8 +404,7 @@ impl PairRequest {
             || self.proxy_version().is_some()
             || self.udp_flows().is_some()
             || self.needs_2_7_transport()
-            || self.needs_spoof_transport()
-            || self.needs_asymmetric();
+            || self.needs_spoof_transport();
         if !anything_new {
             return Ok(());
         }
@@ -512,11 +452,6 @@ impl PairRequest {
         }
         // The source-spoofing transport arrived with 2.9: an older agent refuses the config.
         if self.needs_spoof_transport() && !release_at_least(version, SPOOF_SINCE) {
-            bail!("old_agent_transport:{id}:{version}");
-        }
-        // Asymmetric (split) transport arrived with 2.10: an older agent cannot pair the two
-        // links or forge/accept different shapes.
-        if self.needs_asymmetric() && !release_at_least(version, ASYM_SINCE) {
             bail!("old_agent_transport:{id}:{version}");
         }
         // The panel writes the UDP flow limit from 2.6.0-beta.4 (the core had it before; an
@@ -584,12 +519,6 @@ impl PairRequest {
             if kariz::config::SpoofShape::from_name(shape).is_none() {
                 bail!("bad_spoof_shape");
             }
-            // Asymmetric spoof: the receive shape, when set, must be a known shape too.
-            if let Some(rs) = spoof.and_then(|s| s.recv_shape.as_deref()) {
-                if kariz::config::SpoofShape::from_name(rs).is_none() {
-                    bail!("bad_spoof_shape");
-                }
-            }
             let entry_pool = spoof.map(|s| s.entry_pool.as_slice()).unwrap_or_default();
             let exit_pool = spoof.map(|s| s.exit_pool.as_slice()).unwrap_or_default();
             if entry_pool.is_empty() || exit_pool.is_empty() {
@@ -602,24 +531,6 @@ impl PairRequest {
                     .unwrap_or(true)
                 {
                     bail!("bad_spoof_pool");
-                }
-            }
-        }
-        // Asymmetric (split) transport: a different transport each way. Only the stream
-        // transports (tcp, ws, wss) can be split halves, and the two must differ.
-        if self.transport != "spoof" {
-            if let Some(recv) = self
-                .recv_transport
-                .as_deref()
-                .map(str::trim)
-                .filter(|r| !r.is_empty())
-            {
-                let ok = |t: &str| matches!(t, "tcp" | "ws" | "wss");
-                if !ok(&self.transport) || !ok(recv) {
-                    bail!("bad_asymmetric_transport");
-                }
-                if recv == self.transport {
-                    bail!("same_asymmetric_transport");
                 }
             }
         }
@@ -647,8 +558,6 @@ const TRANSPORTS_SINCE: &str = "2.7.0";
 /// The first release whose agent knows the source-spoofing transport (`spoof`) and the IP
 /// spoof tester.
 const SPOOF_SINCE: &str = "2.9.0";
-/// The first release whose agent understands asymmetric (split) transport.
-const ASYM_SINCE: &str = "2.10.0";
 
 /// Whether `version` is `min` or a later release, prereleases in their order
 /// (`2.6.0-beta.3` is before `2.6.0-beta.4`, which is before `2.6.0`). One that cannot be
@@ -1652,66 +1561,6 @@ mod tests {
             bad.validate().unwrap_err().to_string(),
             "spoof_pool_required"
         );
-    }
-
-    #[test]
-    fn asymmetric_maps_each_direction_to_the_right_link_per_mode() {
-        let base = |mode: &str| PairRequest {
-            name: "t".into(),
-            entry: "a".into(),
-            exit: "b".into(),
-            mode: mode.into(),
-            transport: "ws".into(),             // user send (entry → exit)
-            recv_transport: Some("tcp".into()), // user receive (exit → entry)
-            listen: "0.0.0.0:3080".into(),
-            dial: "1.2.3.4:3080".into(),
-            forwards: Vec::new(),
-            ..Default::default()
-        };
-        // Direct: the entry dials, so the send direction is link A (core `transport`).
-        let (entry, exit) = base("direct").specs(Some("tok"), None);
-        assert_eq!(entry.transport, "ws");
-        assert_eq!(entry.recv_transport.as_deref(), Some("tcp"));
-        assert_eq!(exit.transport, "ws");
-        assert_eq!(exit.recv_transport.as_deref(), Some("tcp"));
-        // Reverse: the exit dials, so the receive direction is link A instead.
-        let (entry, _exit) = base("reverse").specs(Some("tok"), None);
-        assert_eq!(entry.transport, "tcp");
-        assert_eq!(entry.recv_transport.as_deref(), Some("ws"));
-        // Both modes validate.
-        assert!(base("direct").validate().is_ok());
-        assert!(base("reverse").validate().is_ok());
-    }
-
-    #[test]
-    fn asymmetric_spoof_mirrors_the_two_shapes_by_role() {
-        let req = PairRequest {
-            name: "t".into(),
-            entry: "a".into(),
-            exit: "b".into(),
-            mode: "direct".into(),
-            transport: "spoof".into(),
-            listen: "0.0.0.0:3080".into(),
-            dial: "1.2.3.4:3080".into(),
-            encryption: Some("auto".into()),
-            spoof: Some(crate::wire::SpoofSpec {
-                shape: Some("udp".into()),      // upload (entry → exit)
-                recv_shape: Some("tcp".into()), // download (exit → entry)
-                entry_pool: vec!["203.0.113.1".into()],
-                exit_pool: vec!["198.51.100.1".into()],
-                ..Default::default()
-            }),
-            forwards: Vec::new(),
-            ..Default::default()
-        };
-        let (entry, exit) = req.specs(Some("tok"), None);
-        let (es, xs) = (entry.spoof.unwrap(), exit.spoof.unwrap());
-        // The entry forges the upload shape and receives the download one; the exit mirrors it.
-        assert_eq!(es.shape.as_deref(), Some("udp"));
-        assert_eq!(es.recv_shape.as_deref(), Some("tcp"));
-        assert_eq!(xs.shape.as_deref(), Some("tcp"));
-        assert_eq!(xs.recv_shape.as_deref(), Some("udp"));
-        assert!(req.validate().is_ok());
     }
 
     #[test]

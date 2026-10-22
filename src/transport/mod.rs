@@ -12,12 +12,10 @@ pub mod kcp;
 #[cfg(not(feature = "kcp"))]
 #[path = "kcp_disabled.rs"]
 pub mod kcp;
-pub mod proxy;
 #[cfg(feature = "quic")]
 pub mod quic;
 #[cfg(feature = "quic")]
 mod quic_obfs;
-pub mod split;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
@@ -107,28 +105,6 @@ impl Settings {
             helper,
         }
     }
-
-    /// The same settings for a different transport, keeping the shared options (ws path, TLS,
-    /// kcp). Used to build the receive link of an asymmetric tunnel from the send link's.
-    pub fn with_kind(&self, kind: TransportKind) -> Self {
-        Self {
-            kind,
-            ..self.clone()
-        }
-    }
-
-    /// The same settings with WebSocket `early_data` turned off. An asymmetric tunnel's ws/wss
-    /// legs cannot use it: the acceptor only ever reads the send link (and the dialer only ever
-    /// reads the receive link), so the HTTP 101 that `early_data` holds back until the first
-    /// write is never flushed and the handshake deadlocks. The correlation id a split link
-    /// sends first is tiny, so losing the one saved round trip does not matter.
-    pub fn without_early_data(&self) -> Self {
-        let mut s = self.clone();
-        if let Some(ws) = s.ws.as_mut() {
-            ws.early_data = false;
-        }
-        s
-    }
 }
 
 pub enum Listener {
@@ -144,9 +120,6 @@ pub enum Listener {
     /// server process plus the Kariz-owned internal loopback listener it forwards to.
     #[cfg(all(feature = "helpers", unix))]
     Helper(helper::HelperListener),
-    /// Asymmetric transport: the send-link and receive-link listeners, whose connections are
-    /// paired in the background; `accept` yields already-combined streams.
-    Split(Box<split::SplitListener>),
 }
 
 impl Listener {
@@ -253,7 +226,6 @@ impl Listener {
                 let (s, peer) = l.accept().await?;
                 Ok((Incoming::Tcp(s), peer))
             }
-            Self::Split(l) => l.accept().await,
         }
     }
 
@@ -263,7 +235,6 @@ impl Listener {
             Self::Kcp(l) => l.local_addr(),
             #[cfg(all(feature = "helpers", unix))]
             Self::Helper(l) => l.local_addr(),
-            Self::Split(l) => l.local_addr(),
         }
     }
 }
@@ -271,9 +242,6 @@ impl Listener {
 /// An accepted connection whose transport handshake may still be pending.
 pub enum Incoming {
     Tcp(TcpStream),
-    /// An asymmetric tunnel's two links, already paired into one combined stream (the
-    /// correlation id has been read off the send link, so the handshake comes next).
-    Combined(TunnelStream),
     Ws {
         stream: TcpStream,
         config: Arc<ws::ServerConfig>,
@@ -293,8 +261,6 @@ impl Incoming {
         match self {
             Self::Tcp(s) => Ok(TunnelStream::Tcp(s)),
             Self::Kcp(s) => Ok(TunnelStream::Kcp(s)),
-            // Already established and paired by the split listener.
-            Self::Combined(stream) => Ok(stream),
             Self::Ws {
                 mut stream,
                 config,
@@ -333,9 +299,6 @@ pub enum Dialer {
     /// inbound Kariz dials through.
     #[cfg(all(feature = "helpers", unix))]
     Helper(helper::HelperDialer),
-    /// Asymmetric transport: two dialers (send link and receive link) joined into one
-    /// combined stream. [`crate::channel::connect`] drives it like any other dialer.
-    Split(Box<split::SplitDialer>),
 }
 
 /// WebSocket part of a [`Dialer`].
@@ -424,9 +387,6 @@ impl Dialer {
             }
             #[cfg(all(feature = "helpers", unix))]
             Self::Helper(d) => d.dial_with(first).await,
-            // Boxed to break the type-level async recursion (a split dialer's inner dialers
-            // are themselves never split).
-            Self::Split(d) => Box::pin(d.dial_with(first)).await,
             Self::Ws(d, ws) => {
                 let stream = d.dial().await?;
                 timeout(ws.timeout, ws.establish(stream, first))
@@ -527,18 +487,6 @@ pub enum TunnelStream {
     /// TLS state is shared by both directions, so its halves share a lock.
     Wss(Box<ws::WsStream<ReadHalf<TlsTcp>, WriteHalf<TlsTcp>>>),
     Kcp(kcp::KcpStream),
-    /// Asymmetric transport: writes go to one physical connection and reads come from a
-    /// second, so the two tunnel directions can ride different transports. Built by
-    /// [`crate::channel::connect_split`] / [`crate::channel::accept_split`] from two already
-    /// established links; the handshake and everything above it run over it unchanged. The
-    /// two *unused* halves (this connection's read side on the send link, its write side on
-    /// the receive link) are dropped — safe for the stream transports (`tcp`, `ws`, `wss`),
-    /// which only close the idle direction; KCP-based links are not allowed here (they would
-    /// half-close prematurely).
-    Combined {
-        reader: TunnelReader,
-        writer: TunnelWriter,
-    },
 }
 
 impl TunnelStream {
@@ -546,7 +494,7 @@ impl TunnelStream {
     pub fn datagrams(&self) -> Option<kcp::KcpDatagrams> {
         match self {
             Self::Kcp(s) => s.datagrams(),
-            Self::Tcp(_) | Self::Ws(_) | Self::Wss(_) | Self::Combined { .. } => None,
+            Self::Tcp(_) | Self::Ws(_) | Self::Wss(_) => None,
         }
     }
 
@@ -554,8 +502,7 @@ impl TunnelStream {
     /// case the caller checks that first (see [`Self::reject_upgrade`]).
     async fn answer_upgrade(&mut self) -> io::Result<()> {
         let early = match self {
-            // The combined stream is built after each link's upgrade is already finished.
-            Self::Tcp(_) | Self::Kcp(_) | Self::Combined { .. } => return Ok(()),
+            Self::Tcp(_) | Self::Kcp(_) => return Ok(()),
             Self::Ws(s) => s.reader().has_early(),
             Self::Wss(s) => s.reader().has_early(),
         };
@@ -570,7 +517,7 @@ impl TunnelStream {
     /// else, false: the connection has to be dealt with some other way.
     pub fn reject_upgrade(&mut self) -> bool {
         match self {
-            Self::Tcp(_) | Self::Kcp(_) | Self::Combined { .. } => false,
+            Self::Tcp(_) | Self::Kcp(_) => false,
             Self::Ws(s) => s.reject_upgrade(),
             Self::Wss(s) => s.reject_upgrade(),
         }
@@ -599,14 +546,6 @@ impl TunnelStream {
                     .poll_read(&mut Context::from_waker(&waker), &mut buf)
                     .is_pending()
             }
-            // Probe the receive link the same way (pending means idle and open).
-            Self::Combined { reader, .. } => {
-                let waker = Waker::from(Arc::new(NoopWaker));
-                let mut buf = ReadBuf::new(&mut probe);
-                Pin::new(reader)
-                    .poll_read(&mut Context::from_waker(&waker), &mut buf)
-                    .is_pending()
-            }
         }
     }
 }
@@ -628,7 +567,6 @@ impl AsyncRead for TunnelStream {
             Self::Ws(s) => Pin::new(s).poll_read(cx, buf),
             Self::Wss(s) => Pin::new(&mut **s).poll_read(cx, buf),
             Self::Kcp(s) => Pin::new(s).poll_read(cx, buf),
-            Self::Combined { reader, .. } => Pin::new(reader).poll_read(cx, buf),
         }
     }
 }
@@ -644,7 +582,6 @@ impl AsyncWrite for TunnelStream {
             Self::Ws(s) => Pin::new(s).poll_write(cx, buf),
             Self::Wss(s) => Pin::new(&mut **s).poll_write(cx, buf),
             Self::Kcp(s) => Pin::new(s).poll_write(cx, buf),
-            Self::Combined { writer, .. } => Pin::new(writer).poll_write(cx, buf),
         }
     }
 
@@ -658,7 +595,6 @@ impl AsyncWrite for TunnelStream {
             Self::Ws(s) => Pin::new(s).poll_write_vectored(cx, bufs),
             Self::Wss(s) => Pin::new(&mut **s).poll_write_vectored(cx, bufs),
             Self::Kcp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
-            Self::Combined { writer, .. } => Pin::new(writer).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -668,7 +604,6 @@ impl AsyncWrite for TunnelStream {
             Self::Ws(s) => s.is_write_vectored(),
             Self::Wss(s) => s.is_write_vectored(),
             Self::Kcp(_) => false,
-            Self::Combined { writer, .. } => writer.is_write_vectored(),
         }
     }
 
@@ -678,7 +613,6 @@ impl AsyncWrite for TunnelStream {
             Self::Ws(s) => Pin::new(s).poll_flush(cx),
             Self::Wss(s) => Pin::new(&mut **s).poll_flush(cx),
             Self::Kcp(s) => Pin::new(s).poll_flush(cx),
-            Self::Combined { writer, .. } => Pin::new(writer).poll_flush(cx),
         }
     }
 
@@ -688,7 +622,6 @@ impl AsyncWrite for TunnelStream {
             Self::Ws(s) => Pin::new(s).poll_shutdown(cx),
             Self::Wss(s) => Pin::new(&mut **s).poll_shutdown(cx),
             Self::Kcp(s) => Pin::new(s).poll_shutdown(cx),
-            Self::Combined { writer, .. } => Pin::new(writer).poll_shutdown(cx),
         }
     }
 }
@@ -718,8 +651,6 @@ impl TunnelStream {
                 let (r, w) = s.into_split();
                 (TunnelReader::Kcp(r), TunnelWriter::Kcp(w))
             }
-            // Already a reader from one link and a writer from the other.
-            Self::Combined { reader, writer } => (reader, writer),
         }
     }
 }

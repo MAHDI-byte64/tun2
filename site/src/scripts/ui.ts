@@ -219,11 +219,6 @@ if (prose) {
   for (const t of $$<HTMLTableElement>("table", prose)) {
     const w = document.createElement("div");
     w.className = "tablewrap";
-    // A wide table scrolls sideways; make that region reachable by keyboard (axe
-    // scrollable-region-focusable), with a name so a screen reader announces it.
-    w.tabIndex = 0;
-    w.setAttribute("role", "group");
-    w.setAttribute("aria-label", t.caption?.textContent?.trim() || "Table");
     t.replaceWith(w);
     w.append(t);
   }

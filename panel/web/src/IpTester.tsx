@@ -202,41 +202,30 @@ export function IpTesterPage({ servers, loaded }: { servers: ServerInfo[]; loade
           {report.results.length === 0 ? (
             <Empty icon="iptester" title={t("ipt.none")} text={t("ipt.noneHelp")} />
           ) : (
-            <>
-              <div className="ipt-stats">
-                <div className="ipt-stat ok">
-                  <span className="n">{num(report.usable)}</span>
-                  <span className="l">{t("ipt.stat.usable")}</span>
-                </div>
-                <div className="ipt-stat">
-                  <span className="n">{num(report.seen)}</span>
-                  <span className="l">{t("ipt.stat.seen")}</span>
-                </div>
-                <div className="ipt-stat">
-                  <span className="n">{num(report.results.length)}</span>
-                  <span className="l">{t("ipt.stat.total")}</span>
-                </div>
-              </div>
-              <ul className="ipt-list">
-                {report.results.map((r) => {
-                  const pct = report.expect > 0 ? Math.min(100, Math.round((r.received / report.expect) * 100)) : 0;
-                  return (
-                    <li key={r.ip} className={`ipt-row ${r.ok ? "ok" : "bad"}`}>
-                      <span className="ipt-ip mono" dir="ltr">
-                        {r.ip}
-                      </span>
-                      <span className="ipt-meter" title={`${num(r.received)}/${num(report.expect)}`}>
-                        <span className="ipt-bar" style={{ width: `${pct}%` }} />
-                      </span>
-                      <span className="ipt-rate mono">
-                        {num(r.received)}/{num(report.expect)}
-                      </span>
+            <table className="plain-table">
+              <thead>
+                <tr>
+                  <th>{t("ipt.col.ip")}</th>
+                  <th>{t("ipt.col.arrival")}</th>
+                  <th>{t("ipt.col.status")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.results.map((r) => (
+                  <tr key={r.ip}>
+                    <td className="mono" dir="ltr">
+                      {r.ip}
+                    </td>
+                    <td className="mono">
+                      {num(r.received)}/{num(report.expect)}
+                    </td>
+                    <td>
                       <span className={`badge ${r.ok ? "water" : "danger"}`}>{r.ok ? t("ipt.ok") : t("ipt.fail")}</span>
-                    </li>
-                  );
-                })}
-              </ul>
-            </>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           )}
           {when && (
             <p className="help" style={{ marginTop: "var(--sp-3)" }}>

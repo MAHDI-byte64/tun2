@@ -260,20 +260,11 @@ fn get(url: &str, limit: u64, local: bool) -> Result<Vec<u8>> {
     if !(url.starts_with("https://") || (local && url.starts_with("http://127.0.0.1"))) {
         bail!("bad_url");
     }
-    let mut builder = ureq::AgentBuilder::new()
+    let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
-        .redirects(5);
-    // When the panel's proxy is set to cover its own internet, releases are fetched through
-    // it (a local `http://127.0.0.1` fetch, used by the tests, always goes direct).
-    if !local {
-        if let Some(url) = crate::proxy::internet_proxy() {
-            if let Ok(proxy) = ureq::Proxy::new(&url) {
-                builder = builder.proxy(proxy);
-            }
-        }
-    }
-    let agent = builder.build();
+        .redirects(5)
+        .build();
     let response = agent
         .get(url)
         .set(

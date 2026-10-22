@@ -53,15 +53,8 @@ impl TcpTransportDialer {
     }
 }
 
-/// Connects to `addr` (resolved on every call) within the configured dial timeout. When the
-/// process has a link proxy set (the panel, for its agent connections), the connection is made
-/// through that SOCKS5 proxy instead; everywhere else this is a direct dial.
+/// Connects to `addr` (resolved on every call) within the configured dial timeout.
 pub async fn connect(addr: &str, tuning: &Tuning) -> io::Result<TcpStream> {
-    if let Some(proxy) = super::proxy::link_proxy() {
-        let stream = proxy.connect(addr, tuning.dial_timeout).await?;
-        stream.set_nodelay(tuning.nodelay)?;
-        return Ok(stream);
-    }
     let stream = timeout(tuning.dial_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| {
