@@ -443,33 +443,72 @@ fn date(unix: i64) -> String {
         .unwrap_or_default()
 }
 
-/// A line chart of a rate series, as inline SVG; a note when there is nothing to draw.
-fn chart(points: &[(i64, f64)], empty: &str) -> String {
+/// A line chart of a rate series, as inline SVG: a soft gradient area, a 2px line, a faint
+/// baseline and gridlines, and the peak marked; a note when there is nothing to draw. `id`
+/// keeps each chart's gradient unique on the page.
+fn chart(points: &[(i64, f64)], empty: &str, peak: &str, id: &str) -> String {
     const W: f64 = 600.0;
-    const H: f64 = 140.0;
-    const PAD: f64 = 8.0;
+    const H: f64 = 150.0;
+    const PT: f64 = 20.0; // top: room for the peak label
+    const PB: f64 = 12.0; // bottom: the baseline
+    const PX: f64 = 10.0; // sides
     if points.len() < 2 {
-        return format!("<p class=\"muted\">{}</p>", esc(empty));
+        return format!("<p class=\"empty\">{}</p>", esc(empty));
     }
     let (t0, t1) = (points[0].0, points[points.len() - 1].0);
     let span = (t1 - t0).max(1) as f64;
     let max = points.iter().map(|p| p.1).fold(0.0_f64, f64::max).max(0.01);
+    let right = PX + (W - 2.0 * PX);
+    let bottom = H - PB;
+    let x = |t: i64| PX + (t - t0) as f64 / span * (W - 2.0 * PX);
+    let y = |v: f64| H - PB - (v / max).clamp(0.0, 1.0) * (H - PT - PB);
     let mut line = String::new();
+    let (mut peak_x, mut peak_y) = (right, y(max));
     for (t, v) in points {
-        let x = PAD + (*t - t0) as f64 / span * (W - 2.0 * PAD);
-        let y = H - PAD - (v / max) * (H - 2.0 * PAD);
-        let _ = write!(line, "{x:.1},{y:.1} ");
+        let (cx, cy) = (x(*t), y(*v));
+        let _ = write!(line, "{cx:.1},{cy:.1} ");
+        if *v >= max {
+            peak_x = cx;
+            peak_y = cy;
+        }
     }
-    let area = format!(
-        "{PAD:.1},{bottom:.1} {line}{right:.1},{bottom:.1}",
-        bottom = H - PAD,
-        right = PAD + (W - 2.0 * PAD)
-    );
+    let area = format!("{PX:.1},{bottom:.1} {line}{right:.1},{bottom:.1}");
+    let g1 = y(max * 2.0 / 3.0);
+    let g2 = y(max / 3.0);
     format!(
-        "<svg viewBox=\"0 0 {W} {H}\" role=\"img\" aria-label=\"chart\" preserveAspectRatio=\"none\">\
-         <polygon class=\"area\" points=\"{area}\"/>\
-         <polyline class=\"line\" fill=\"none\" points=\"{line}\"/>\
-         <text x=\"{PAD}\" y=\"16\" class=\"max\">{max:.1} Mbit/s</text></svg>"
+        "<svg class=\"chart\" viewBox=\"0 0 {W:.0} {H:.0}\" role=\"img\" \
+         aria-label=\"{peak} {max:.1} Mbit/s\" preserveAspectRatio=\"none\">\
+         <defs><linearGradient id=\"a{id}\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">\
+         <stop class=\"g0\" offset=\"0\"/><stop class=\"g1\" offset=\"1\"/></linearGradient></defs>\
+         <line class=\"grid\" x1=\"{PX}\" x2=\"{right:.1}\" y1=\"{g1:.1}\" y2=\"{g1:.1}\"/>\
+         <line class=\"grid\" x1=\"{PX}\" x2=\"{right:.1}\" y1=\"{g2:.1}\" y2=\"{g2:.1}\"/>\
+         <line class=\"axis\" x1=\"{PX}\" x2=\"{right:.1}\" y1=\"{bottom:.1}\" y2=\"{bottom:.1}\"/>\
+         <polygon class=\"area\" points=\"{area}\" fill=\"url(#a{id})\"/>\
+         <polyline class=\"line\" points=\"{line}\"/>\
+         <line class=\"peakline\" x1=\"{peak_x:.1}\" x2=\"{peak_x:.1}\" y1=\"{peak_y:.1}\" y2=\"{bottom:.1}\"/>\
+         <text x=\"{PX}\" y=\"13\" class=\"max\">{peak} {max:.1} Mbit/s</text></svg>"
+    )
+}
+
+/// A radial usage ring (percent of the volume limit), as inline SVG. The surrounding markup
+/// overlays the figure in the middle.
+fn gauge(pct: f64, over: bool) -> String {
+    const R: f64 = 54.0;
+    let circ = 2.0 * std::f64::consts::PI * R;
+    let p = pct.clamp(0.0, 100.0);
+    let dash = p / 100.0 * circ;
+    let cls = if over {
+        "bad"
+    } else if p >= 90.0 {
+        "warn"
+    } else {
+        "ok"
+    };
+    format!(
+        "<svg class=\"gauge\" viewBox=\"0 0 128 128\" aria-hidden=\"true\">\
+         <circle class=\"g-track\" cx=\"64\" cy=\"64\" r=\"{R}\"/>\
+         <circle class=\"g-arc s-{cls}\" cx=\"64\" cy=\"64\" r=\"{R}\" \
+         stroke-dasharray=\"{dash:.2} {circ:.2}\" transform=\"rotate(-90 64 64)\"/></svg>"
     )
 }
 
@@ -477,7 +516,6 @@ struct Words {
     used: &'static str,
     of: &'static str,
     volume_only_time: &'static str,
-    time: &'static str,
     days_left: &'static str,
     ends: &'static str,
     no_end: &'static str,
@@ -492,6 +530,7 @@ struct Words {
     last_day: &'static str,
     last_week: &'static str,
     no_data: &'static str,
+    peak: &'static str,
     refresh: &'static str,
 }
 
@@ -499,7 +538,6 @@ const EN: Words = Words {
     used: "Usage",
     of: "of",
     volume_only_time: "No volume limit: this tunnel is limited by time.",
-    time: "Time",
     days_left: "days left",
     ends: "ends on",
     no_end: "No end date.",
@@ -519,6 +557,7 @@ const EN: Words = Words {
     last_day: "Last 24 hours",
     last_week: "Last 7 days",
     no_data: "No data yet.",
+    peak: "peak",
     refresh: "This page refreshes every 30 seconds.",
 };
 
@@ -526,7 +565,6 @@ const FA: Words = Words {
     used: "مصرف",
     of: "از",
     volume_only_time: "سقف حجمی ندارد: این تانل با زمان محدود است.",
-    time: "زمان",
     days_left: "روز مانده",
     ends: "پایان در",
     no_end: "تاریخ پایان ندارد.",
@@ -546,22 +584,71 @@ const FA: Words = Words {
     last_day: "۲۴ ساعت گذشته",
     last_week: "۷ روز گذشته",
     no_data: "هنوز داده‌ای نیست.",
+    peak: "اوج",
     refresh: "این صفحه هر ۳۰ ثانیه تازه می‌شود.",
 };
 
 const STYLE: &str = "\
-:root{color-scheme:light dark;--bg:#0f1420;--card:#171e2e;--text:#e8edf5;--muted:#8a94a8;--line:#2a3348;--ok:#3ec98a;--warn:#f0b35a;--bad:#f06565;--accent:#5aa9ff}\
-@media (prefers-color-scheme:light){:root{--bg:#f4f6fa;--card:#fff;--text:#172033;--muted:#5d6980;--line:#dde3ee}}\
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}\
-main{max-width:640px;margin:0 auto;padding:24px 16px 48px}h1{font-size:1.4rem;margin:0 0 4px}h2{font-size:.85rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:0 0 8px}\
-section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:12px 0}\
-.state{display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;margin:0 0 8px;background:var(--line)}\
-.s-running{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}.s-limit,.s-expired{background:color-mix(in srgb,var(--bad) 20%,transparent);color:var(--bad)}.s-stopped{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}\
-.bar{height:10px;border-radius:999px;background:var(--line);overflow:hidden;margin:8px 0}.bar i{display:block;height:100%;background:var(--accent)}.bar.over i{background:var(--bad)}\
-.big{font-size:1.3rem;font-weight:600}.muted{color:var(--muted);margin:4px 0 0}\
-svg{width:100%;height:140px;display:block}.area{fill:color-mix(in srgb,var(--accent) 18%,transparent)}.line{stroke:var(--accent);stroke-width:2}.max{fill:var(--muted);font-size:12px}\
-button{font:inherit;font-weight:600;padding:10px 18px;border-radius:10px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer}button[disabled]{opacity:.5;cursor:default}\
-.msg{margin:8px 0 0}footer{color:var(--muted);font-size:.85rem;text-align:center;margin-top:24px}";
+:root{\
+--plane1:#e9eff8;--plane2:#f6f8fc;--card:#fff;--ink:#131a2b;--muted:#5f6a81;--line:#e6eaf2;\
+--accent:#2a78d6;--ok:#0ca30c;--warn:#fab219;--bad:#d03b3b;--ok-ink:#0a7d0a;--warn-ink:#8a5d00;--bad-ink:#b3302f;\
+--shadow:0 1px 2px rgba(19,26,43,.06),0 10px 30px rgba(19,26,43,.07)}\
+@media (prefers-color-scheme:dark){:root{\
+--plane1:#0a0e16;--plane2:#0f1521;--card:#141b2a;--ink:#e8edf5;--muted:#95a1b9;--line:#263047;\
+--accent:#4f9bff;--ok:#38c98a;--warn:#f0b35a;--bad:#f06b6b;--ok-ink:#38c98a;--warn-ink:#f0b35a;--bad-ink:#f06b6b;--shadow:none}}\
+*{box-sizing:border-box}html{color-scheme:light dark}\
+body{margin:0;color:var(--ink);background:var(--plane2);\
+background-image:radial-gradient(1100px 420px at 50% -220px,color-mix(in srgb,var(--accent) 15%,transparent),transparent),linear-gradient(180deg,var(--plane1),var(--plane2) 300px);\
+background-attachment:fixed;font:16px/1.55 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;-webkit-text-size-adjust:100%}\
+main{max-width:560px;margin:0 auto;padding:28px 16px 56px}\
+.hero{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 16px}\
+h1{font-size:1.5rem;line-height:1.2;margin:0;font-weight:700;letter-spacing:-.01em;word-break:break-word}\
+h2{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;font-weight:700;margin:0 0 14px}\
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px;margin:14px 0;box-shadow:var(--shadow)}\
+.state{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:999px;font-weight:600;font-size:.9rem;background:color-mix(in srgb,var(--muted) 16%,transparent);color:var(--muted)}\
+.state .dot{width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 0 4px color-mix(in srgb,currentColor 22%,transparent)}\
+.s-running{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok-ink)}\
+.s-stopped{background:color-mix(in srgb,var(--warn) 17%,transparent);color:var(--warn-ink)}\
+.s-limit,.s-expired{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad-ink)}\
+.usage{display:flex;align-items:center;gap:22px;flex-wrap:wrap}\
+.gauge-wrap{position:relative;width:148px;height:148px;flex:0 0 auto;margin:0 auto}\
+.gauge{width:100%;height:100%;display:block}\
+.g-track{fill:none;stroke:var(--line);stroke-width:12}\
+.g-arc{fill:none;stroke-width:12;stroke-linecap:round}\
+.g-arc.s-ok{stroke:var(--ok)}.g-arc.s-warn{stroke:var(--warn)}.g-arc.s-bad{stroke:var(--bad)}\
+.gauge-label{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}\
+.gauge-label .pct{font-size:2.1rem;font-weight:700;line-height:1;letter-spacing:-.02em}\
+.usage-main{display:flex;flex-direction:column;align-items:center;gap:9px;flex:0 0 auto;margin:0 auto}\
+.cap{margin:0;font-size:.85rem;color:var(--muted);text-align:center;font-variant-numeric:tabular-nums}\
+.usage-side{flex:1 1 150px;min-width:140px;display:flex;flex-direction:column;gap:10px}\
+.hero-num{flex:1 1 100%}\
+.big{font-size:1.9rem;font-weight:700;line-height:1.1;letter-spacing:-.01em}\
+.hero-num .muted{margin:6px 0 0}\
+.muted{color:var(--muted)}\
+.chip{background:color-mix(in srgb,var(--muted) 7%,transparent);border:1px solid var(--line);border-radius:12px;padding:11px 13px}\
+.chip .v{display:block;font-size:1.05rem;font-weight:700}\
+.chip .l{display:block;font-size:.8rem;color:var(--muted);margin-top:2px}\
+.chart{width:100%;height:150px;display:block;direction:ltr}\
+.chart .area{stroke:none}\
+.chart .g0{stop-color:var(--accent);stop-opacity:.26}.chart .g1{stop-color:var(--accent);stop-opacity:0}\
+.chart .line{fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}\
+.chart .grid{stroke:var(--line);stroke-width:1;vector-effect:non-scaling-stroke}\
+.chart .axis{stroke:var(--line);stroke-width:1.5;vector-effect:non-scaling-stroke}\
+.chart .peakline{stroke:var(--accent);stroke-width:1;stroke-dasharray:2 3;opacity:.5;vector-effect:non-scaling-stroke}\
+.chart .max{fill:var(--muted);font-size:11px;font-weight:600}\
+.empty{color:var(--muted);text-align:center;padding:42px 0;margin:0}\
+form{margin:0}\
+button{display:block;width:100%;font:inherit;font-weight:600;font-size:1rem;padding:13px 18px;border-radius:12px;border:0;background:var(--accent);color:#fff;cursor:pointer;transition:filter .15s,transform .05s}\
+button:hover{filter:brightness(1.06)}button:active{transform:translateY(1px)}\
+button[disabled]{background:color-mix(in srgb,var(--muted) 24%,transparent);color:var(--muted);cursor:not-allowed}\
+.wait{color:var(--muted);font-size:.86rem;text-align:center;margin:10px 0 0}\
+.banner{margin:12px 0 0;padding:11px 14px;border-radius:12px;font-size:.9rem;border:1px solid transparent}\
+.banner.ok{background:color-mix(in srgb,var(--ok) 13%,transparent);color:var(--ok-ink);border-color:color-mix(in srgb,var(--ok) 30%,transparent)}\
+.banner.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn-ink);border-color:color-mix(in srgb,var(--warn) 32%,transparent)}\
+.banner.bad{background:color-mix(in srgb,var(--bad) 13%,transparent);color:var(--bad-ink);border-color:color-mix(in srgb,var(--bad) 30%,transparent)}\
+footer{color:var(--muted);font-size:.82rem;text-align:center;margin-top:22px}\
+@media (prefers-reduced-motion:reduce){button{transition:none}}\
+";
 
 fn render(d: &PageData, token: &str, fa: bool, msg: &str) -> String {
     let w = if fa { &FA } else { &EN };
@@ -572,45 +659,50 @@ fn render(d: &PageData, token: &str, fa: bool, msg: &str) -> String {
         "limit" => w.state[2],
         _ => w.state[3],
     };
-    let volume = if d.limit_bytes > 0 {
+    let usage_main = if d.limit_bytes > 0 {
         format!(
-            "<div class=\"bar{}\"><i style=\"width:{:.1}%\"></i></div><p class=\"big\">{} {} {}</p><p class=\"muted\">{:.0}%</p>",
-            if d.used >= d.limit_bytes { " over" } else { "" },
-            d.pct.clamp(0.5, 100.0),
-            human(d.used),
-            w.of,
-            human(d.limit_bytes),
-            d.pct
+            "<div class=\"usage-main\"><div class=\"gauge-wrap\">{gauge}\
+             <div class=\"gauge-label\"><span class=\"pct\">{pct:.0}%</span></div></div>\
+             <p class=\"cap\">{used} {of} {limit}</p></div>",
+            gauge = gauge(d.pct, d.used >= d.limit_bytes),
+            pct = d.pct,
+            used = human(d.used),
+            of = w.of,
+            limit = human(d.limit_bytes),
         )
     } else {
         format!(
-            "<p class=\"big\">{}</p><p class=\"muted\">{}</p>",
+            "<div class=\"hero-num\"><div class=\"big\">{}</div><p class=\"muted\">{}</p></div>",
             human(d.used),
-            w.volume_only_time
+            esc(w.volume_only_time)
         )
     };
-    let time = match d.days_left {
+    let time_chip = match d.days_left {
         Some(days) => format!(
-            "<p class=\"big\">{days} {}</p><p class=\"muted\">{} {}</p>",
-            w.days_left,
-            w.ends,
-            date(d.expires_at)
+            "<div class=\"chip\"><span class=\"v\">{days} {dl}</span><span class=\"l\">{ends} {date}</span></div>",
+            dl = w.days_left,
+            ends = w.ends,
+            date = date(d.expires_at),
         ),
-        None => format!("<p class=\"muted\">{}</p>", w.no_end),
+        None => format!(
+            "<div class=\"chip\"><span class=\"v\">\u{221e}</span><span class=\"l\">{}</span></div>",
+            esc(w.no_end)
+        ),
     };
-    let note = match msg {
-        "restarting" => w.msg_restarting,
-        "wait" => w.msg_wait,
-        "limit" => w.msg_limit,
-        "expired" => w.msg_expired,
-        "failed" => w.msg_failed,
-        _ => "",
+    let banner = match msg {
+        "restarting" => format!("<p class=\"banner ok\">{}</p>", esc(w.msg_restarting)),
+        "wait" => format!("<p class=\"banner warn\">{}</p>", esc(w.msg_wait)),
+        "limit" => format!("<p class=\"banner bad\">{}</p>", esc(w.msg_limit)),
+        "expired" => format!("<p class=\"banner bad\">{}</p>", esc(w.msg_expired)),
+        "failed" => format!("<p class=\"banner bad\">{}</p>", esc(w.msg_failed)),
+        _ => String::new(),
     };
     let wait = if d.restart_wait > 0 && matches!(d.state, "running" | "stopped") {
         format!(
-            "<p class=\"muted\">{}</p>",
-            w.wait
-                .replace("{m}", &((d.restart_wait + 59) / 60).to_string())
+            "<p class=\"wait\">{}</p>",
+            esc(&w
+                .wait
+                .replace("{m}", &((d.restart_wait + 59) / 60).to_string()))
         )
     } else {
         String::new()
@@ -620,25 +712,24 @@ fn render(d: &PageData, token: &str, fa: bool, msg: &str) -> String {
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta http-equiv=\"refresh\" content=\"30\"><meta name=\"robots\" content=\"noindex\">\
          <title>{title}</title><style>{STYLE}</style></head><body><main>\
-         <h1>{title}</h1><p class=\"state s-{state}\">{state_text}</p>\
-         <section><h2>{used}</h2>{volume}</section>\
-         <section><h2>{time_h}</h2>{time}</section>\
-         <section><h2>{last_day}</h2>{chart_day}</section>\
-         <section><h2>{last_week}</h2>{chart_week}</section>\
-         <section><form method=\"post\" action=\"/s/{token}/restart\"><button type=\"submit\"{disabled}>{restart}</button></form>{wait}\
-         <p class=\"msg\">{note}</p></section>\
+         <header class=\"hero\"><h1>{title}</h1>\
+         <span class=\"state s-{state}\"><i class=\"dot\"></i>{state_text}</span></header>\
+         <section class=\"card\"><h2>{used}</h2>\
+         <div class=\"usage\">{usage_main}<div class=\"usage-side\">{time_chip}</div></div></section>\
+         <section class=\"card\"><h2>{last_day}</h2>{chart_day}</section>\
+         <section class=\"card\"><h2>{last_week}</h2>{chart_week}</section>\
+         <section class=\"card\"><form method=\"post\" action=\"/s/{token}/restart\">\
+         <button type=\"submit\"{disabled}>{restart}</button></form>{wait}{banner}</section>\
          <footer>{refresh}</footer></main></body></html>",
         title = esc(&d.title),
         state = d.state,
         used = w.used,
-        time_h = w.time,
         last_day = w.last_day,
         last_week = w.last_week,
-        chart_day = chart(&d.rate_24h, w.no_data),
-        chart_week = chart(&d.rate_7d, w.no_data),
+        chart_day = chart(&d.rate_24h, w.no_data, w.peak, "d"),
+        chart_week = chart(&d.rate_7d, w.no_data, w.peak, "w"),
         disabled = if d.can_restart { "" } else { " disabled" },
         restart = w.restart,
-        note = esc(note),
         refresh = w.refresh,
     )
 }
