@@ -429,6 +429,8 @@ export interface PairRequest {
   encryption?: string;
   /** quic: seal every UDP packet with a key from the token (`[tunnel.quic] obfs`). */
   quic_obfs?: boolean;
+  /** quic: a fixed send rate in Mbit/s (`[tunnel.quic] congestion = "fixed"`). */
+  quic_bandwidth?: number;
   /** The entry side's limit of open connections per client address; left out or 0: none. */
   max_conns_per_ip?: number;
   /** The entry side's UDP flows (clients) per port; left out: the default (4096). */
@@ -548,6 +550,7 @@ export interface Spec {
   tls_key?: string;
   encryption?: string;
   quic_obfs?: boolean;
+  quic_bandwidth?: number;
   max_conns_per_ip?: number;
   udp_max_flows?: number;
   proxy_protocol?: string;

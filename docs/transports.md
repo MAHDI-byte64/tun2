@@ -107,7 +107,14 @@ QUIC (quinn), over UDP:
 - Both sides prove the token with mutual TLS 1.3 using keys derived from it: no
   certificate files.
 - Congestion control: `cubic` (default), `bbr` (keeps its speed under random loss, but
-  fills queues; experimental in quinn) or `newreno`.
+  fills queues; experimental in quinn), `newreno`, or `fixed`.
+- `fixed` (with `bandwidth_mbps`) sends at a set rate and treats loss as noise, so a lossy
+  path keeps its speed where Cubic collapses to a trickle. It is sender-side only (an older
+  peer needs no change), and set per side (where the download leaves: the exit in reverse
+  mode, the entry in direct mode). It is deliberately **unfair** to other traffic, so use it
+  only on a path you control, with the rate set to what that path can actually carry; set
+  too high it just adds loss. Each QUIC connection holds the rate and `[tunnel.mux]` runs
+  a few at once, so the total can be higher.
 - The handshake reads as HTTP/3 (ALPN `h3`, SNI of the remote host), unless `obfs` is on.
 
 Some networks throttle or block UDP, and UDP on port 443 in particular. Treat `quic` as

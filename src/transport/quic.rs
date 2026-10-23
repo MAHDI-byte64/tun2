@@ -240,6 +240,21 @@ impl QuicSettings {
             Congestion::NewReno => transport.congestion_controller_factory(Arc::new(
                 quinn::congestion::NewRenoConfig::default(),
             )),
+            Congestion::Fixed => {
+                // `bandwidth_mbps` is required with `fixed` (checked in config validation).
+                let cfg = crate::transport::quic_fixed::FixedConfig::from_mbps(
+                    quic.bandwidth_mbps.unwrap_or(0),
+                );
+                // The connection's flow-control window must not cap the chosen rate before the
+                // controller can: give it two seconds of the rate, within sane bounds. (The
+                // peer's advertised stream window still applies, so a high rate on a long path
+                // also wants a large `[tunnel.mux]` stream window / the throughput profile.)
+                let window = (cfg.bytes_per_sec() * 2.0) as u64;
+                let window = window.clamp(10 * 1024 * 1024, 256 * 1024 * 1024);
+                transport
+                    .congestion_controller_factory(Arc::new(cfg))
+                    .send_window(window)
+            }
         };
         let identity = Identity::from_psk(psk)?;
         Ok(Self {
@@ -683,9 +698,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn every_congestion_controller_connects() {
-        for congestion in [Congestion::Cubic, Congestion::Bbr, Congestion::NewReno] {
+        for congestion in [
+            Congestion::Cubic,
+            Congestion::Bbr,
+            Congestion::NewReno,
+            Congestion::Fixed,
+        ] {
             let quic = QuicConfig {
                 congestion,
+                bandwidth_mbps: (congestion == Congestion::Fixed).then_some(50),
                 ..QuicConfig::default()
             };
             let (client, server) = pair(&quic).await;

@@ -957,6 +957,11 @@ pub struct QuicConfig {
     /// agree; costs 28 bytes a packet and some CPU.
     #[serde(default)]
     pub obfs: bool,
+    /// Only with `congestion = "fixed"`: the rate, in Mbit/s, the sender holds. Applies to
+    /// the sending side (set it where the download leaves: the exit in reverse mode, the
+    /// entry in direct mode). Each QUIC connection holds this rate, and `[tunnel.mux]
+    /// connections` of them run at once, so the total can be that many times higher.
+    pub bandwidth_mbps: Option<u32>,
 }
 
 fn default_alpn() -> String {
@@ -971,6 +976,7 @@ impl Default for QuicConfig {
             sni: None,
             alpn: default_alpn(),
             obfs: false,
+            bandwidth_mbps: None,
         }
     }
 }
@@ -984,6 +990,9 @@ pub enum Congestion {
     /// Copes much better with random loss; experimental in quinn.
     Bbr,
     NewReno,
+    /// Sends at a set rate (`bandwidth_mbps`) and treats loss as noise, so a lossy path keeps
+    /// its speed. Sender only; unfair to other flows, for a path you control.
+    Fixed,
 }
 
 impl Congestion {
@@ -992,6 +1001,7 @@ impl Congestion {
             Self::Cubic => "cubic",
             Self::Bbr => "bbr",
             Self::NewReno => "newreno",
+            Self::Fixed => "fixed",
         }
     }
 }
@@ -1470,6 +1480,8 @@ const KCP_MAX_RESEND: u32 = 10;
 const KCP_SEND_WINDOW: std::ops::RangeInclusive<u16> = 16..=32768;
 /// `tuning.udp_socket_buffer` and `tuning.tcp_buffer`, in bytes.
 const SOCKET_BUFFER: std::ops::RangeInclusive<usize> = 64 * 1024..=64 * 1024 * 1024;
+/// `tunnel.quic.bandwidth_mbps` with `congestion = "fixed"`.
+const QUIC_BANDWIDTH_MBPS: std::ops::RangeInclusive<u32> = 1..=100_000;
 /// KCP needs 128 to receive its largest messages.
 const KCP_RECV_WINDOW: std::ops::RangeInclusive<u16> = 128..=32768;
 /// The upper bound keeps the UDP packet (29 bytes of protection added) within 1472 bytes,
@@ -1684,6 +1696,17 @@ impl Config {
             .is_some_and(|q| q.congestion == Congestion::Bbr)
         {
             warnings.push("tunnel.quic.congestion = \"bbr\": quinn marks its BBR as experimental");
+        }
+        if self
+            .tunnel
+            .quic
+            .as_ref()
+            .is_some_and(|q| q.congestion == Congestion::Fixed)
+        {
+            warnings.push(
+                "tunnel.quic.congestion = \"fixed\": sends at a set rate and ignores loss; \
+                 it is unfair to other traffic, so use it only on a path you control",
+            );
         }
         if self.tunnel.tls.as_ref().is_some_and(|t| t.insecure) {
             warnings.push(
@@ -2018,6 +2041,20 @@ impl Config {
             .is_some_and(|s| s.is_empty() || !is_visible_ascii(s) || s.contains('/'))
         {
             bail!("tunnel.quic.sni must be a host name");
+        }
+        match (q.congestion == Congestion::Fixed, q.bandwidth_mbps) {
+            (true, None) => {
+                bail!("tunnel.quic.bandwidth_mbps is required with congestion = \"fixed\"")
+            }
+            (false, Some(_)) => {
+                bail!("tunnel.quic.bandwidth_mbps is only used with congestion = \"fixed\"")
+            }
+            (true, Some(mbps)) if !(QUIC_BANDWIDTH_MBPS).contains(&mbps) => bail!(
+                "tunnel.quic.bandwidth_mbps must be between {} and {} Mbit/s",
+                QUIC_BANDWIDTH_MBPS.start(),
+                QUIC_BANDWIDTH_MBPS.end()
+            ),
+            _ => {}
         }
         Ok(())
     }
@@ -3630,6 +3667,17 @@ keepalive_secs = 1
             ("entry", "sni = \"a.example/x\"", "tunnel.quic.sni"),
             ("exit", "sni = \"a.example\"", "dialing side"),
             ("entry", "congestion = \"vegas\"", "congestion"),
+            (
+                "entry",
+                "congestion = \"fixed\"",
+                "bandwidth_mbps is required",
+            ),
+            ("entry", "bandwidth_mbps = 50", "only used with congestion"),
+            (
+                "entry",
+                "congestion = \"fixed\"\nbandwidth_mbps = 0",
+                "between 1 and 100000",
+            ),
         ] {
             let err = parse_err(&with_transport(
                 role,
@@ -3638,6 +3686,17 @@ keepalive_secs = 1
             ));
             assert!(err.contains(expect), "{extra}: {err}");
         }
+        // A fixed rate in range parses, and warns that it is unfair.
+        let c = Config::parse(&with_transport(
+            "entry",
+            "quic",
+            "[tunnel.quic]\ncongestion = \"fixed\"\nbandwidth_mbps = 200",
+        ))
+        .unwrap();
+        let q = c.tunnel.quic.as_ref().unwrap();
+        assert_eq!(q.congestion, Congestion::Fixed);
+        assert_eq!(q.bandwidth_mbps, Some(200));
+        assert!(c.warnings().iter().any(|w| w.contains("set rate")));
     }
 
     #[cfg(feature = "kcp")]

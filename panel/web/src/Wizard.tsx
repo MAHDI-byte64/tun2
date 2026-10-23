@@ -12,7 +12,7 @@ import { GreChoice, linkBetween } from "./GreChoice";
 import { MuxFields, MuxToggle, emptyMux, muxSpecOf, muxToSpec } from "./MuxFields";
 import { TlsChoice, emptyTls, tlsReady } from "./TlsChoice";
 import { EncryptionChoice, cipherOf, cipherReady } from "./EncryptionChoice";
-import { QuicObfs, obfsOf } from "./QuicObfs";
+import { QuicObfs, obfsOf, bandwidthOf } from "./QuicObfs";
 import { PerIpLimit, perIpOf } from "./PerIpLimit";
 import { UdpFlows, udpFlowsOf } from "./UdpFlows";
 import { ProxyProtocol, proxyOf } from "./ProxyProtocol";
@@ -139,6 +139,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   const [encAck, setEncAck] = useState(false);
   // Sealed QUIC (obfs) is on unless it is turned off: it is what makes QUIC work where it is filtered.
   const [obfs, setObfs] = useState(true);
+  const [quicRate, setQuicRate] = useState("");
   const [stealthS, setStealthS] = useState(emptyStealth());
   const [faketcpS, setFaketcpS] = useState(emptyFaketcp());
   const [icmpS, setIcmpS] = useState(emptyIcmp());
@@ -247,6 +248,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     mux: muxSpecOf(mux, tp, muxOn),
     encryption: cipherOf(enc, tp),
     quic_obfs: obfsOf(obfs, transport),
+    quic_bandwidth: bandwidthOf(quicRate, transport),
     max_conns_per_ip: perIpOf(perIp).value,
     udp_max_flows: protocol.includes("udp") ? udpFlowsOf(udpFlows).value : undefined,
     proxy_protocol: proxyOf(proxy, protocol),
@@ -515,7 +517,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                 </div>
                 {!spoof && transport === "quic" && (
                   <div style={{ marginTop: "var(--sp-5)" }}>
-                    <QuicObfs value={obfs} onChange={setObfs} />
+                    <QuicObfs obfs={obfs} onObfs={setObfs} rate={quicRate} onRate={setQuicRate} />
                   </div>
                 )}
                 {rootOnly && <RootWarning />}

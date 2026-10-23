@@ -63,9 +63,15 @@ pub fn render(spec: &Spec, token: &str, cert_files: Option<(&Path, &Path)>) -> R
     if let Some(cipher) = spec.encryption.as_deref().filter(|c| *c != "auto") {
         tunnel.insert("encryption".into(), text(cipher));
     }
-    if spec.quic_obfs && spec.transport == "quic" {
+    if spec.transport == "quic" && (spec.quic_obfs || spec.quic_bandwidth.is_some()) {
         let mut quic = Table::new();
-        quic.insert("obfs".into(), Value::Boolean(true));
+        if spec.quic_obfs {
+            quic.insert("obfs".into(), Value::Boolean(true));
+        }
+        if let Some(mbps) = spec.quic_bandwidth {
+            quic.insert("congestion".into(), text("fixed"));
+            quic.insert("bandwidth_mbps".into(), Value::Integer(i64::from(mbps)));
+        }
         tunnel.insert("quic".into(), Value::Table(quic));
     }
     if let Some(s) = spec.stealth.as_ref().filter(|s| !s.is_empty()) {
@@ -612,6 +618,7 @@ pub fn get(dir: &Path, name: &str) -> Result<Spec> {
         encryption: (c.tunnel.encryption != kariz::config::Encryption::Auto)
             .then(|| c.tunnel.encryption.name().to_owned()),
         quic_obfs: c.tunnel.quic.as_ref().is_some_and(|q| q.obfs),
+        quic_bandwidth: c.tunnel.quic.as_ref().and_then(|q| q.bandwidth_mbps),
         max_conns_per_ip: c.tuning.max_conns_per_ip.filter(|v| *v > 0),
         udp_max_flows: c.tuning.udp_max_flows.and_then(|v| u32::try_from(v).ok()),
         // The panel writes the same one on every TCP rule.
@@ -2030,6 +2037,29 @@ mod tests {
         // A spec without it reads as before: the field is left out of what is sent.
         let json = serde_json::to_string(&get(&d.0, "tcp-sealed").unwrap()).unwrap();
         assert!(!json.contains("quic_obfs"), "{json}");
+    }
+
+    #[test]
+    fn a_fixed_quic_rate_is_written_and_read_back() {
+        let d = Dir::new();
+        let mut s = spec("rated");
+        s.transport = "quic".into();
+        s.quic_bandwidth = Some(80);
+        put(&d.0, &s).unwrap();
+        let text = std::fs::read_to_string(d.0.join("rated.toml")).unwrap();
+        assert!(
+            text.contains("[tunnel.quic]")
+                && text.contains("congestion = \"fixed\"")
+                && text.contains("bandwidth_mbps = 80"),
+            "{text}"
+        );
+        assert_eq!(get(&d.0, "rated").unwrap().quic_bandwidth, Some(80));
+        // Cleared: the table goes, and the field is left out of what is sent.
+        s.quic_bandwidth = None;
+        put(&d.0, &s).unwrap();
+        assert_eq!(get(&d.0, "rated").unwrap().quic_bandwidth, None);
+        let json = serde_json::to_string(&get(&d.0, "rated").unwrap()).unwrap();
+        assert!(!json.contains("quic_bandwidth"), "{json}");
     }
 
     #[test]

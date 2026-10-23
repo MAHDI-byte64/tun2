@@ -124,6 +124,8 @@ struct Setup {
     mux_connections: usize,
     /// `tunnel.quic.congestion`; empty keeps the default.
     congestion: &'static str,
+    /// `tunnel.quic.bandwidth_mbps` (with `congestion = "fixed"`); 0 leaves it out.
+    bandwidth_mbps: u32,
     /// `tunnel.quic.obfs`.
     obfs: bool,
     /// `tunnel.mux.stream_window`; 0 keeps the default.
@@ -168,6 +170,7 @@ impl Setup {
             udp_max_flows: 0,
             mux_connections: 0,
             congestion: "",
+            bandwidth_mbps: 0,
             obfs: false,
             stream_window: 0,
             fec: (0, 0),
@@ -259,6 +262,15 @@ impl Setup {
 
     const fn congestion(self, congestion: &'static str) -> Self {
         Self { congestion, ..self }
+    }
+
+    /// Fixed-rate QUIC: `congestion = "fixed"` with this bandwidth.
+    const fn bandwidth_mbps(self, bandwidth_mbps: u32) -> Self {
+        Self {
+            congestion: "fixed",
+            bandwidth_mbps,
+            ..self
+        }
     }
 
     const fn stream_window(self, stream_window: usize) -> Self {
@@ -460,6 +472,9 @@ impl Setup {
             options += "[tunnel.quic]\n";
             if !self.congestion.is_empty() {
                 options += &format!("congestion = \"{}\"\n", self.congestion);
+            }
+            if self.bandwidth_mbps > 0 {
+                options += &format!("bandwidth_mbps = {}\n", self.bandwidth_mbps);
             }
             if self.obfs {
                 options += "obfs = true\n";
@@ -975,6 +990,8 @@ tunnel_tests! {
     quic_direct: Setup::quic("direct");
     quic_reverse_obfs: Setup::quic("reverse").obfs();
     quic_direct_obfs: Setup::quic("direct").obfs();
+    quic_direct_fixed: Setup::quic("direct").bandwidth_mbps(50);
+    quic_reverse_fixed: Setup::quic("reverse").bandwidth_mbps(50);
     kcp_reverse: Setup::kcp("reverse");
     kcp_direct: Setup::kcp("direct");
     kcp_reverse_no_mux: Setup::kcp("reverse").no_mux();
@@ -2056,6 +2073,12 @@ async fn lossy_link() {
             "quic bbr",
             Setup::quic("direct")
                 .congestion("bbr")
+                .stream_window(WINDOW),
+        ),
+        (
+            "quic fixed 50",
+            Setup::quic("direct")
+                .bandwidth_mbps(50)
                 .stream_window(WINDOW),
         ),
         ("kcp fast2", Setup::kcp("direct").stream_window(WINDOW)),

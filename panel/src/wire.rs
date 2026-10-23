@@ -333,6 +333,11 @@ pub struct Spec {
     /// reads it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quic_obfs: bool,
+    /// A `quic` tunnel's fixed send rate in Mbit/s (`[tunnel.quic] congestion = "fixed"` with
+    /// `bandwidth_mbps`): the sender holds this rate and treats loss as noise. Left out: the
+    /// default congestion control. Only an agent of 2.11 or newer reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_bandwidth: Option<u32>,
     /// Entry side: `[tuning] max_conns_per_ip`. Left out: no limit. Only an agent of 2.4
     /// or newer reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

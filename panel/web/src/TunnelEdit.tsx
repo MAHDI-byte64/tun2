@@ -9,7 +9,7 @@ import { Checklist, opError, useOp } from "./ops";
 import { MuxFields, MuxToggle, muxFromSpec, muxSpecOf, muxToSpec } from "./MuxFields";
 import { TlsChoice, emptyTls, tlsReady } from "./TlsChoice";
 import { EncryptionChoice, cipherOf, cipherReady } from "./EncryptionChoice";
-import { QuicObfs, obfsOf } from "./QuicObfs";
+import { QuicObfs, obfsOf, bandwidthOf } from "./QuicObfs";
 import { PerIpLimit, perIpOf } from "./PerIpLimit";
 import { UdpFlows, udpFlowsOf } from "./UdpFlows";
 import { ProxyProtocol, proxyFromSpec, proxyOf } from "./ProxyProtocol";
@@ -79,6 +79,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
   const [enc, setEnc] = useState("auto");
   const [encAck, setEncAck] = useState(false);
   const [obfs, setObfs] = useState(false);
+  const [quicRate, setQuicRate] = useState("");
   const [stealthS, setStealthS] = useState(emptyStealth());
   const [faketcpS, setFaketcpS] = useState(emptyFaketcp());
   const [icmpS, setIcmpS] = useState(emptyIcmp());
@@ -167,6 +168,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
         setMux(muxFromSpec(a.mux ?? b.mux));
         setEnc(a.encryption ?? "auto");
         setObfs(!!(a.quic_obfs ?? b.quic_obfs));
+        setQuicRate((a.quic_bandwidth ?? b.quic_bandwidth)?.toString() ?? "");
         setStealthS(stealthFrom(a.stealth ?? b.stealth));
         setFaketcpS(faketcpFrom(a.faketcp ?? b.faketcp));
         setIcmpS(icmpFrom(a.icmp ?? b.icmp));
@@ -227,6 +229,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
     mux: muxSpecOf(mux, tp, muxOn),
     encryption: cipherOf(enc, tp),
     quic_obfs: obfsOf(obfs, transport),
+    quic_bandwidth: bandwidthOf(quicRate, transport),
     max_conns_per_ip: perIpOf(perIp).value,
     udp_max_flows: protocol.includes("udp") ? udpFlowsOf(udpFlows).value : undefined,
     proxy_protocol: proxyOf(proxy, protocol),
@@ -388,7 +391,7 @@ export function TunnelEdit({ tunnel, servers, preset, onBack }: { tunnel: Tunnel
               {choose(PROFILES, profile, setProfile, (x) => [t(`wz.pf.${x}`), t(`wz.pf.${x}.d`)])}
             </div>
             <EncryptionChoice value={enc} onChange={setEnc} transport={tp} ack={encAck} onAck={setEncAck} />
-            {!spoof && transport === "quic" && <QuicObfs value={obfs} onChange={setObfs} />}
+            {!spoof && transport === "quic" && <QuicObfs obfs={obfs} onObfs={setObfs} rate={quicRate} onRate={setQuicRate} />}
             {rootOnly && <RootWarning />}
             {spoof && <SpoofOptions value={spoofS} onChange={setSpoofS} entryName={serverName(entry)} exitName={serverName(exit)} />}
             {!spoof && transport === "stealth" && <StealthOptions value={stealthS} onChange={setStealthS} />}

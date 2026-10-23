@@ -16,6 +16,8 @@ pub mod proxy;
 #[cfg(feature = "quic")]
 pub mod quic;
 #[cfg(feature = "quic")]
+mod quic_fixed;
+#[cfg(feature = "quic")]
 mod quic_obfs;
 pub mod tcp;
 pub mod tls;

@@ -73,7 +73,8 @@ root certificates.
 
 | Key | Default | Notes |
 |---|---|---|
-| `congestion` | `cubic` | `cubic`, `bbr` or `newreno`. BBR keeps its speed under random loss but is experimental in quinn and fills queues (warned). |
+| `congestion` | `cubic` | `cubic`, `bbr`, `newreno` or `fixed`. BBR keeps its speed under random loss but is experimental in quinn and fills queues (warned). `fixed` needs `bandwidth_mbps`. |
+| `bandwidth_mbps` | | With `congestion = "fixed"`, the rate in Mbit/s the sender holds (1-100000), ignoring loss. Sender side only. Unfair to other traffic — for a path you control, set to what it carries. Per connection; `[tunnel.mux]` runs a few. 2.11.0 or newer. |
 | `sni` | the host in `remote` (none for an IP) | Dialer only. |
 | `alpn` | `h3` | Must match on both sides. |
 | `obfs` | `false` | Seal every UDP packet with a key derived from the token, so the traffic does not look like QUIC (see [Transports](transports.md#obfs)). Must be the same on both sides. Costs 28 bytes a packet, and some CPU. |

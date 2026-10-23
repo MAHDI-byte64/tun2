@@ -50,6 +50,10 @@ pub struct PairRequest {
     /// on both sides. Ignored for other transports.
     #[serde(default)]
     pub quic_obfs: bool,
+    /// quic: a fixed send rate in Mbit/s (`[tunnel.quic] congestion = "fixed"`), applied to
+    /// both sides so each caps its own sending direction. Left out: default congestion control.
+    #[serde(default)]
+    pub quic_bandwidth: Option<u32>,
     /// The entry side's `tuning.max_conns_per_ip`; left out or 0: no limit.
     #[serde(default)]
     pub max_conns_per_ip: Option<u32>,
@@ -144,6 +148,9 @@ impl PairRequest {
             mux: self.mux.clone().filter(|m| !m.is_empty()),
             encryption: self.chosen_encryption().map(str::to_owned),
             quic_obfs: self.sealed(),
+            quic_bandwidth: (self.transport == "quic")
+                .then_some(self.quic_bandwidth)
+                .flatten(),
             max_conns_per_ip: (role == "entry").then(|| self.per_ip_limit()).flatten(),
             udp_max_flows: (role == "entry").then(|| self.udp_flows()).flatten(),
             // Only the entry side has forward rules; the exit side needs nothing written.
@@ -289,6 +296,7 @@ impl PairRequest {
             mux: entry.mux.clone().or_else(|| exit.mux.clone()),
             encryption: entry.encryption.clone(),
             quic_obfs: entry.quic_obfs || exit.quic_obfs,
+            quic_bandwidth: entry.quic_bandwidth.or(exit.quic_bandwidth),
             max_conns_per_ip: entry.max_conns_per_ip,
             udp_max_flows: entry.udp_max_flows,
             proxy_protocol: entry.proxy_protocol.clone(),
@@ -520,7 +528,8 @@ impl PairRequest {
             || self.proxy_version().is_some()
             || self.udp_flows().is_some()
             || self.needs_2_7_transport()
-            || self.needs_spoof_transport();
+            || self.needs_spoof_transport()
+            || self.quic_bandwidth.is_some();
         if !anything_new {
             return Ok(());
         }
@@ -569,6 +578,11 @@ impl PairRequest {
         // The source-spoofing transport arrived with 2.9: an older agent refuses the config.
         if self.needs_spoof_transport() && !release_at_least(version, SPOOF_SINCE) {
             bail!("old_agent_transport:{id}:{version}");
+        }
+        // Fixed-rate QUIC congestion came with 2.11: an older agent does not know the
+        // congestion name and refuses the whole config.
+        if self.quic_bandwidth.is_some() && !release_at_least(version, QUIC_FIXED_SINCE) {
+            bail!("old_agent_quicrate:{id}:{version}");
         }
         // The panel writes the UDP flow limit from 2.6.0-beta.4 (the core had it before; an
         // older agent refuses the field). Only the entry side has UDP rules.
@@ -674,6 +688,7 @@ const TRANSPORTS_SINCE: &str = "2.7.0";
 /// The first release whose agent knows the source-spoofing transport (`spoof`) and the IP
 /// spoof tester.
 const SPOOF_SINCE: &str = "2.9.0";
+const QUIC_FIXED_SINCE: &str = "2.11.0";
 
 /// The first release whose daemon counts an l3 tunnel's bytes, so it can have a limit.
 pub const L3_COUNTS_SINCE: &str = "2.10.0";
