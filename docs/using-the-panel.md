@@ -52,6 +52,10 @@ Not sure what to pick? The default (reverse, `tcpmux`, `balanced`) is right for 
 **If anything fails, both servers are put back as they were**, and the wizard tells you which
 step failed and why. You cannot end with half a tunnel.
 
+If one server is offline, pick it anyway: the wizard writes the reachable side and hands you
+the other side's config file and the commands to apply it over SSH (its token is shown once).
+The tunnel then waits, listed as *waiting for its manual side*, until that server comes up.
+
 ## 4. See what is happening
 
 - **Map:** the overview. The key numbers (throughput, with a line of the last minutes),

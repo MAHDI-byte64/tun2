@@ -407,6 +407,8 @@ export interface MuxSpec {
 export interface PairRequest {
   /** A traffic limit for the new tunnel (the wizard): bytes, and the day of the month the usage resets on (0: by hand). */
   quota?: { limit_bytes: number; reset_day: number; days?: number };
+  /** A server (entry or exit) the panel cannot reach: write the other side and hand over this one's config. */
+  manual?: string;
   name: string;
   entry: string;
   exit: string;
@@ -605,6 +607,29 @@ export interface Op {
   undone: boolean | null;
   /** Servers that could not be reached and were left out. */
   offline?: string[];
+  /** A side to set up by hand (shown once, carries the token). */
+  bundle?: ManualBundle;
+}
+
+/** Everything to bring up a tunnel side by hand, on a server the panel could not reach. */
+export interface ManualBundle {
+  server: string;
+  role: "entry" | "exit";
+  /** The file to write as `/etc/kariz/NAME.toml` (its token is inside). */
+  config: string;
+  /** A self-signed wss side also needs these, as NAME.crt and NAME.key. */
+  cert?: string;
+  key?: string;
+  /** The shell commands to write the files and start the service. */
+  commands: string;
+}
+
+/** One tunnel waiting for a side set up by hand. */
+export interface ManualPending {
+  name: string;
+  role: "entry" | "exit";
+  server: string;
+  created: number;
 }
 
 /** The panel's copy of a tunnel's settings (kept at each create or edit, or read back from the servers). */
@@ -808,6 +833,7 @@ export const api = {
   controlTunnel: (name: string, action: "start" | "stop" | "restart") => call<{ op: string }>("POST", "tunnels/control", { name, action }),
   deleteTunnel: (name: string) => call<{ op: string }>("POST", "tunnels/delete", { name }),
   tunnelCopies: () => call<{ specs: TunnelCopy[] }>("GET", "tunnels/specs"),
+  tunnelManual: () => call<{ pending: ManualPending[] }>("GET", "tunnels/manual"),
   recreateTunnel: (body: { name: string; entry?: string; exit?: string }) => call<{ op: string }>("POST", "tunnels/recreate", body),
   forgetTunnelCopy: (name: string) => call<{ ok?: boolean }>("POST", "tunnels/specs/delete", { name }),
   tunnelSpec: (server: string, name: string) =>

@@ -466,6 +466,15 @@ async fn alert_loop(hub: Arc<Hub>) {
             }
         };
         let mut notices = alerter.step(&views, at, s.rules());
+        // A tunnel still waiting for a side set up by hand reports one side down; that is the
+        // setup, not a fault, so it is not announced.
+        if let Ok(waiting) = crate::manual::list(&hub.db) {
+            if !waiting.is_empty() {
+                let names: std::collections::HashSet<&str> =
+                    waiting.iter().map(|p| p.name.as_str()).collect();
+                notices.retain(|n| !matches!(n, crate::alerts::Notice::TunnelDown { name, .. } if names.contains(name.as_str())));
+            }
+        }
         // What the tunnels' traffic limits have to say (always, like a server going down).
         notices.extend(hub.take_notices());
         let speaking = s.ready()
@@ -874,6 +883,20 @@ pub mod text {
                         let _ = write!(
                             out,
                             "🛑 Tunnel <b>{name}</b> was stopped: its time is up. Extend it in the panel."
+                        );
+                    }
+                }
+                Notice::ManualSideUp { name } => {
+                    let name = esc(name);
+                    if fa {
+                        let _ = write!(
+                            out,
+                            "✅ سمت دستی تانل <b>{name}</b> بالا آمد؛ دیگر منتظر نیست."
+                        );
+                    } else {
+                        let _ = write!(
+                            out,
+                            "✅ Tunnel <b>{name}</b>: its hand-applied side came up; it is no longer waiting."
                         );
                     }
                 }

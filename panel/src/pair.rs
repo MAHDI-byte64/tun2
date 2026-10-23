@@ -126,6 +126,11 @@ pub struct PairRequest {
     /// an edit: the limit lives on the tunnel's page.
     #[serde(default)]
     pub quota: Option<crate::quota::QuotaSpec>,
+    /// A server (the `entry` or the `exit`) the panel cannot reach: the panel writes the other
+    /// side and hands the operator this side's config to apply by hand. Left out: both sides
+    /// online, as usual. Not kept in the tunnel's copy.
+    #[serde(default, skip_serializing)]
+    pub manual: Option<String>,
 }
 
 impl PairRequest {
@@ -317,6 +322,7 @@ impl PairRequest {
             l3_gre_key: l3.and_then(|l| l.gre_key),
             l3_mtu: l3.and_then(|l| l.mtu),
             quota: None,
+            manual: None,
         })
     }
 
@@ -326,6 +332,29 @@ impl PairRequest {
             [&self.entry, &self.exit]
         } else {
             [&self.exit, &self.entry]
+        }
+    }
+
+    /// The role that accepts the tunnel's connections: the entry in reverse mode, the exit in
+    /// direct mode.
+    fn acceptor_role(&self) -> &'static str {
+        if self.mode == "reverse" {
+            "entry"
+        } else {
+            "exit"
+        }
+    }
+
+    /// When a side is set up by hand (`manual` names one of the two servers): the manual
+    /// server and its role, and the reachable server and its role.
+    fn manual_side(&self) -> Option<(&str, &'static str, &str, &'static str)> {
+        let m = self.manual.as_deref()?;
+        if m == self.entry {
+            Some((&self.entry, "entry", &self.exit, "exit"))
+        } else if m == self.exit {
+            Some((&self.exit, "exit", &self.entry, "entry"))
+        } else {
+            None
         }
     }
 
@@ -766,6 +795,28 @@ pub struct Op {
     /// Servers that could not be reached, and so were left out: a delete is kept for when
     /// they connect again, a start, stop or restart did not touch them.
     pub offline: Vec<String>,
+    /// A side the panel could not reach, to set up by hand: the config file, the commands,
+    /// and the token (shown only here, once). Lives only while this op is in memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ManualBundle>,
+}
+
+/// Everything the operator needs to bring up a tunnel side by hand, on a server the panel
+/// could not reach. Carried on the create op and shown once; never stored.
+#[derive(Debug, Clone, Serialize)]
+pub struct ManualBundle {
+    /// The server to set up (id) and the side it is (`entry` or `exit`).
+    pub server: String,
+    pub role: String,
+    /// The file to write as `/etc/kariz/NAME.toml` (its token is inside).
+    pub config: String,
+    /// A self-signed `wss` side also needs these, as `NAME.crt` and `NAME.key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The shell commands that write the files and start the service.
+    pub commands: String,
 }
 
 /// The recent operations, for the browser to follow.
@@ -796,6 +847,7 @@ impl Ops {
             error: None,
             undone: None,
             offline: Vec::new(),
+            bundle: None,
         });
         Ok(id)
     }
@@ -820,6 +872,11 @@ impl Ops {
     /// A server could not be reached and was left out.
     pub(crate) fn left_out(&self, id: &str, server: &str) {
         self.with(id, |op| op.offline.push(server.to_owned()));
+    }
+
+    /// Attaches the bundle for a side to be set up by hand.
+    pub(crate) fn set_bundle(&self, id: &str, bundle: ManualBundle) {
+        self.with(id, |op| op.bundle = Some(bundle));
     }
 
     /// The last step ends.
@@ -1020,14 +1077,38 @@ pub fn create(hub: &Arc<Hub>, req: PairRequest) -> Result<String> {
             bail!("bad_input");
         }
     }
-    req.require_new_enough(hub)?;
+    if req.manual.is_some() {
+        // A side set up by hand: the manual server must be one of the two, and the things that
+        // need that server online are refused.
+        let Some((_, manual_role, reachable_server, _)) = req.manual_side() else {
+            bail!("bad_manual");
+        };
+        if req.network.is_some() {
+            bail!("manual_no_network");
+        }
+        if manual_role == req.acceptor_role() && req.tls_cert.is_some() {
+            bail!("manual_no_real_cert");
+        }
+        // Only the reachable side can be version-checked; the operator installs the other.
+        for server in hub.snapshot()? {
+            if server.id == reachable_server {
+                req.require_version(&server.id, &server.version)?;
+            }
+        }
+    } else {
+        req.require_new_enough(hub)?;
+    }
     let id = hub.ops.begin("create", &req.name)?;
     let hub = hub.clone();
     let op = id.clone();
     tokio::spawn(async move {
         // A link made for this tunnel goes again if the tunnel cannot be made.
         let mut made_link = None;
-        let outcome = run_create(&hub, &op, &req, &mut made_link).await;
+        let outcome = if req.manual.is_some() {
+            run_create_manual(&hub, &op, &req).await
+        } else {
+            run_create(&hub, &op, &req, &mut made_link).await
+        };
         match outcome {
             Ok(()) => {
                 keep_copy(&hub, &req);
@@ -1202,6 +1283,209 @@ async fn run_create(
             Err((step_fail(ops, e), undone))
         }
     }
+}
+
+/// Makes a tunnel with one side set up by hand. The reachable side is written and started;
+/// the other side's config, certificate and the commands to apply it go into the op's bundle
+/// (shown once), and the tunnel waits (`crate::manual`) until that server reports it.
+async fn run_create_manual(hub: &Hub, op: &str, req: &PairRequest) -> Result<(), (String, bool)> {
+    let ops = &hub.ops;
+    let step_fail = |ops: &Ops, e: String| {
+        ops.end(op, false, Some(e.clone()));
+        e
+    };
+    let (manual_server, manual_role, reachable_server, reachable_role) =
+        req.manual_side().expect("a manual side, checked in create");
+
+    // Nothing of that name is on the reachable side (the manual side is offline, so its own
+    // clashes are the operator's to see when applying the file).
+    ops.run(op, "look");
+    if hub.delete_pending_for(&req.name) {
+        return Err((step_fail(ops, "name_pending".into()), true));
+    }
+    match place(hub, &req.name) {
+        Ok(p) if p.sides.is_empty() => ops.end(op, true, None),
+        Ok(_) => return Err((step_fail(ops, "name_taken".into()), true)),
+        Err(e) => return Err((step_fail(ops, format!("{e:#}")), true)),
+    }
+
+    // For spoof, the accepting side needs the dialer's real address; fill it from the hub.
+    let spoofed = req.with_spoof_peer(hub);
+    let req = &*spoofed;
+
+    // Both sides valid: the reachable one on its server, the manual one locally.
+    let (entry_check, exit_check) = req.specs(None, None);
+    let (manual_check, reachable_check) = if manual_role == "entry" {
+        (entry_check, exit_check)
+    } else {
+        (exit_check, entry_check)
+    };
+    ops.run(op, &format!("check_{reachable_role}"));
+    match hub
+        .ask_as::<CheckReply>(
+            reachable_server,
+            &Request::TunnelCheck {
+                spec: reachable_check,
+            },
+        )
+        .await
+    {
+        Ok(c) if c.ok => ops.end(op, true, None),
+        Ok(c) => return Err((step_fail(ops, describe(&c)), true)),
+        Err(e) => return Err((step_fail(ops, format!("{e:#}")), true)),
+    }
+    ops.run(op, &format!("check_{manual_role}"));
+    let mut probe = manual_check;
+    probe.token = Some("0".repeat(48));
+    if let Err(e) = crate::manage::validate_text(std::path::Path::new("/etc/kariz"), &probe) {
+        return Err((step_fail(ops, format!("{e:#}")), true));
+    }
+    ops.end(op, true, None);
+
+    let token = match random_hex(24) {
+        Ok(t) => t,
+        Err(e) => return Err((step_fail(ops, format!("{e:#}")), true)),
+    };
+
+    // Only a self-signed wss acceptor needs a pin on the dialer. If the manual side is that
+    // acceptor, the panel makes the certificate so the reachable dialer can be pinned.
+    let needs_pin = req.transport == "wss" && req.tls_cert.is_none();
+    let manual_is_acceptor = manual_role == req.acceptor_role();
+    let mut gen_cert: Option<(String, String)> = None;
+    let pin: Option<String>;
+
+    if reachable_role == req.acceptor_role() {
+        // The reachable side accepts: writing it gives the pin.
+        let (entry_spec, exit_spec) = req.specs(Some(&token), None);
+        let spec = if reachable_role == "entry" {
+            entry_spec
+        } else {
+            exit_spec
+        };
+        ops.run(op, &format!("write_{reachable_role}"));
+        match put(hub, reachable_server, spec).await {
+            Ok(p) => {
+                pin = p;
+                ops.end(op, true, None);
+            }
+            Err(e) => return Err((step_fail(ops, e), true)),
+        }
+    } else {
+        // The reachable side dials: it needs the acceptor's pin, which the offline manual
+        // acceptor cannot give, so the panel makes the certificate here (wss only).
+        if needs_pin && manual_is_acceptor {
+            match crate::cert::make() {
+                Ok((c, k, p)) => {
+                    gen_cert = Some((c, k));
+                    pin = Some(p);
+                }
+                Err(e) => return Err((step_fail(ops, format!("{e:#}")), true)),
+            }
+        } else {
+            pin = None;
+        }
+        let (entry_spec, exit_spec) = req.specs(Some(&token), pin.as_deref());
+        let spec = if reachable_role == "entry" {
+            entry_spec
+        } else {
+            exit_spec
+        };
+        ops.run(op, &format!("write_{reachable_role}"));
+        match put(hub, reachable_server, spec).await {
+            Ok(_) => ops.end(op, true, None),
+            Err(e) => return Err((step_fail(ops, e), true)),
+        }
+    }
+
+    let written = [reachable_server];
+    ops.run(op, &format!("start_{reachable_role}"));
+    if let Err(e) = ctl(hub, reachable_server, &req.name, "enable").await {
+        let undone = undo(hub, &written, &req.name).await;
+        return Err((step_fail(ops, e), undone));
+    }
+    ops.end(op, true, None);
+
+    // Build the manual side's bundle: its config (with the token), any certificate, and the
+    // commands to apply it.
+    let cert_files = gen_cert.as_ref().map(|_| {
+        (
+            std::path::PathBuf::from(format!("/etc/kariz/{}.crt", req.name)),
+            std::path::PathBuf::from(format!("/etc/kariz/{}.key", req.name)),
+        )
+    });
+    let (entry_spec, exit_spec) = req.specs(Some(&token), pin.as_deref());
+    let manual_spec = if manual_role == "entry" {
+        entry_spec
+    } else {
+        exit_spec
+    };
+    let config = match crate::manage::render(
+        &manual_spec,
+        &token,
+        cert_files.as_ref().map(|(c, k)| (c.as_path(), k.as_path())),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            let undone = undo(hub, &written, &req.name).await;
+            return Err((step_fail(ops, format!("{e:#}")), undone));
+        }
+    };
+    let (cert, key) = match gen_cert {
+        Some((c, k)) => (Some(c), Some(k)),
+        None => (None, None),
+    };
+    let commands = manual_commands(&req.name, cert.is_some());
+
+    ops.run(op, "bundle");
+    if let Err(e) = crate::manual::set(&hub.db, &req.name, manual_role, manual_server) {
+        tracing::warn!(tunnel = %req.name, error = %format!("{e:#}"), "could not record the manual-side wait");
+    }
+    ops.set_bundle(
+        op,
+        ManualBundle {
+            server: manual_server.to_owned(),
+            role: manual_role.to_owned(),
+            config,
+            cert,
+            key,
+            commands,
+        },
+    );
+    ops.left_out(op, manual_server);
+    ops.end(op, true, None);
+
+    // The limit the wizard asked for, from the first byte.
+    if let Some(q) = &req.quota {
+        if let Err(e) = crate::quota::write(
+            &hub.db,
+            &req.name,
+            q.limit_bytes,
+            q.reset_day,
+            q.expires_at(),
+        ) {
+            tracing::warn!(tunnel = %req.name, error = %format!("{e:#}"), "the new tunnel's traffic limit could not be set");
+        }
+    }
+    Ok(())
+}
+
+/// The commands the operator runs on the manual side after writing the files.
+fn manual_commands(name: &str, has_cert: bool) -> String {
+    let mut s = String::from("sudo install -d -m 700 /etc/kariz\n");
+    if has_cert {
+        s.push_str(&format!(
+            "sudo chmod 600 /etc/kariz/{name}.toml /etc/kariz/{name}.key\n\
+             sudo chmod 644 /etc/kariz/{name}.crt\n"
+        ));
+    } else {
+        s.push_str(&format!("sudo chmod 600 /etc/kariz/{name}.toml\n"));
+    }
+    s.push_str(&format!(
+        "sudo kariz check -c /etc/kariz/{name}.toml\n\
+         sudo systemctl enable --now kariz@{name}\n\
+         # no systemd? run: sudo touch /etc/kariz/{name}.enabled && restart the Kariz agent\n"
+    ));
+    s
 }
 
 /// Removes what a failed operation made; whether all of it went.
@@ -1687,6 +1971,7 @@ async fn run_delete(hub: &Hub, op: &str, name: &str) -> Result<(), String> {
         );
         crate::quota::forget(&hub.db, name);
         let _ = crate::specs::forget(&hub.db, name);
+        let _ = crate::manual::clear(&hub.db, name);
     }
     failed.map_or(Ok(()), Err)
 }

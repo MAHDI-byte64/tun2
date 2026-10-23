@@ -18,6 +18,7 @@ pub mod hub;
 pub mod iptest;
 pub mod join;
 pub mod manage;
+pub mod manual;
 pub mod metrics;
 pub mod net;
 pub mod netops;

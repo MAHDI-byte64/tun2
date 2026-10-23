@@ -25,6 +25,17 @@ pub fn fingerprint(cert: &Path) -> Result<String> {
     Ok(kariz::transport::tls::pin_of_file(cert)?)
 }
 
+/// Makes a self-signed certificate and key in memory and returns them as PEM together with
+/// the certificate's SHA-256 pin. Used for a `wss` tunnel side the panel cannot reach: the
+/// panel pins the certificate on the reachable dialer and hands these files to the operator
+/// to write on the manual side.
+pub fn make() -> Result<(String, String, String)> {
+    let made = rcgen::generate_simple_self_signed(vec!["kariz-panel".to_owned()])
+        .context("failed to make the certificate")?;
+    let pin = kariz::transport::tls::cert_sha256(made.cert.der().as_ref());
+    Ok((made.cert.pem(), made.signing_key.serialize_pem(), pin))
+}
+
 /// Writes a file only its owner can read.
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     #[cfg(unix)]

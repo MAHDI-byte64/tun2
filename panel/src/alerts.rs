@@ -125,6 +125,10 @@ pub enum Notice {
     QuotaExpired {
         name: String,
     },
+    /// A tunnel's hand-applied side has come up: it is no longer waiting.
+    ManualSideUp {
+        name: String,
+    },
 }
 
 /// A subject that is down, since when, and whether the user was told.

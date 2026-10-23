@@ -305,6 +305,12 @@ fn helper_table(h: &crate::wire::HelperSpec, text: impl Fn(&str) -> toml::Value)
 
 /// Renders and validates a spec (the token of an existing file is kept when the spec has
 /// none). The text and the parsed config come back.
+/// Checks a spec would make a valid config, without a server: renders it (with `token`) and
+/// parses it, as a `TunnelCheck` would on an agent. For a side the panel cannot reach.
+pub fn validate_text(dir: &Path, spec: &Spec) -> Result<()> {
+    build(dir, spec, false).map(|_| ())
+}
+
 fn build(dir: &Path, spec: &Spec, for_check: bool) -> Result<(String, Config)> {
     let path = config_path(dir, &spec.name)?;
     let token = match (&spec.token, existing_token(&path)) {

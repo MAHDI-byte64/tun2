@@ -715,6 +715,22 @@ export function TunnelsPage({
       clearInterval(id);
     };
   }, []);
+  // Tunnels waiting for a side set up by hand.
+  const [waiting, setWaiting] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let alive = true;
+    const read = () =>
+      api
+        .tunnelManual()
+        .then((r) => alive && setWaiting(new Set(r.pending.map((p) => p.name))))
+        .catch(() => {});
+    read();
+    const id = setInterval(read, 15_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
   const [wizard, setWizard] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   // A benchmark's choice the edit page opens with.
@@ -853,7 +869,7 @@ export function TunnelsPage({
           <input type="search" placeholder={t("tl.search")} aria-label={t("tl.search")} value={query} onChange={(e) => setQuery(e.target.value)} />
         </label>
         <div className="grow" />
-        <button className="btn btn-primary btn-sm" type="button" disabled={online.length < 2} title={online.length < 2 ? t("tun.needTwo") : undefined} onClick={() => setWizard(true)}>
+        <button className="btn btn-primary btn-sm" type="button" disabled={servers.length < 2 || online.length < 1} title={servers.length < 2 || online.length < 1 ? t("tun.needTwo") : undefined} onClick={() => setWizard(true)}>
           <span className="shine" />
           <Icon name="plus" size={18} />
           {t("tun.new")}
@@ -868,9 +884,9 @@ export function TunnelsPage({
           <Empty
             icon="tunnels"
             title={t("t.emptyTitle")}
-            text={online.length < 2 ? t("tun.needTwo") : t("tun.empty")}
+            text={servers.length < 2 || online.length < 1 ? t("tun.needTwo") : t("tun.empty")}
             action={
-              online.length >= 2 && (
+              servers.length >= 2 && online.length >= 1 && (
                 <button className="btn btn-primary btn-sm" type="button" onClick={() => setWizard(true)}>
                   <Icon name="plus" size={18} />
                   {t("tun.new")}
@@ -924,6 +940,10 @@ export function TunnelsPage({
                                   <Icon name="arrow" size={14} />
                                   <span>{x.exit!.server.name}</span>
                                 </>
+                              ) : waiting.has(x.name) ? (
+                                <span>
+                                  {(x.entry ?? x.exit)!.server.name} · {t("td.waitingManual")}
+                                </span>
                               ) : (
                                 <span>
                                   {(x.entry ?? x.exit)!.server.name} · {t("t.oneSide")}

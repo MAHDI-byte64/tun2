@@ -301,3 +301,85 @@ async fn a_pair_is_made_edited_stopped_deleted_and_a_failure_leaves_nothing() {
     assert!(files(&local_dir).is_empty(), "{:?}", files(&local_dir));
     assert!(files(&agent_dir).is_empty(), "{:?}", files(&agent_dir));
 }
+
+/// A tunnel with one side set up by hand: the reachable side (the panel's own server) is
+/// written and started, and the other side's config and the commands to apply it come back
+/// on the op's bundle. The tunnel waits until that server reports it.
+#[tokio::test]
+async fn a_manual_side_is_handed_over_and_the_reachable_side_is_written() {
+    let Some(binary) = kariz_binary() else {
+        eprintln!("skipped: build the kariz program first (cargo build -p kariz)");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let local_dir = root.path().join("local");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let hub = Hub::with_options(
+        Db::in_memory().unwrap(),
+        local_dir.clone(),
+        Arc::new(Processes::new(&local_dir, &binary)),
+        Duration::from_secs(8),
+        None,
+        None,
+    );
+    tokio::spawn(hub.clone().run_local());
+    // Let the local server come online.
+    for _ in 0..50 {
+        if hub.snapshot().unwrap().iter().any(|s| s.local && s.online) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let target = echo_server().await;
+    let listen = free_port();
+    let front = free_port();
+    let req = PairRequest {
+        name: "manual-1".into(),
+        entry: LOCAL.into(),
+        exit: "faraway".into(),
+        mode: "reverse".into(),
+        transport: "tcpmux".into(),
+        listen: format!("127.0.0.1:{listen}"),
+        dial: format!("127.0.0.1:{listen}"),
+        forwards: vec![ForwardInfo {
+            listen: format!("127.0.0.1:{front}"),
+            target: format!("127.0.0.1:{target}"),
+            protocol: "tcp".into(),
+        }],
+        manual: Some("faraway".into()),
+        ..Default::default()
+    };
+    let id = pair::create(&hub, req).unwrap();
+    let op = finished(&hub, &id).await;
+    assert_eq!(op.state, "done", "{:?}", op.error);
+    let bundle = op.bundle.expect("a bundle for the manual side");
+    assert_eq!(
+        (bundle.role.as_str(), bundle.server.as_str()),
+        ("exit", "faraway")
+    );
+    assert!(
+        bundle.config.contains("role = \"exit\"") && bundle.config.contains("token ="),
+        "{}",
+        bundle.config
+    );
+    assert!(bundle.cert.is_none(), "tcpmux needs no certificate");
+    assert!(
+        bundle
+            .commands
+            .contains("systemctl enable --now kariz@manual-1"),
+        "{}",
+        bundle.commands
+    );
+    // The bundle's config is valid on its own.
+    assert!(kariz::config::Config::parse(&bundle.config).is_ok());
+    // The reachable side (the panel's server) was written and the tunnel is waiting.
+    assert!(files(&local_dir).iter().any(|f| f == "manual-1.toml"));
+    let pending = kariz_panel::manual::get(hub.db(), "manual-1")
+        .unwrap()
+        .expect("the tunnel is waiting for its manual side");
+    assert_eq!(
+        (pending.role.as_str(), pending.server.as_str()),
+        ("exit", "faraway")
+    );
+}

@@ -71,6 +71,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/tunnels/delete", post(tunnel_delete))
         .route("/api/tunnels/specs", get(tunnel_specs))
         .route("/api/tunnels/specs/delete", post(tunnel_spec_forget))
+        .route("/api/tunnels/manual", get(tunnel_manual))
         .route("/api/tunnels/recreate", post(tunnel_recreate))
         .route("/api/op", get(op_status))
         .route("/api/ports", get(server_ports))
@@ -1470,6 +1471,9 @@ fn pair_error(e: anyhow::Error) -> Response {
         | "bad_udp_flows"
         | "bad_l3_carrier"
         | "bad_l3_layer"
+        | "bad_manual"
+        | "manual_no_network"
+        | "manual_no_real_cert"
         | "encryption_required" => error(StatusCode::BAD_REQUEST, &code),
         "busy" => error(StatusCode::CONFLICT, "busy"),
         // `old_agent:`, and the ones that name what needs the newer version
@@ -1618,6 +1622,17 @@ async fn tunnel_specs(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
     match crate::specs::list(&state.hub) {
         Ok(specs) => reply(StatusCode::OK, json!({ "specs": specs })),
+        Err(e) => internal(e),
+    }
+}
+
+/// The tunnels waiting for a side set up by hand.
+async fn tunnel_manual(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&state, &headers, false) {
+        return r;
+    }
+    match crate::manual::list(&state.db) {
+        Ok(pending) => reply(StatusCode::OK, json!({ "pending": pending })),
         Err(e) => internal(e),
     }
 }

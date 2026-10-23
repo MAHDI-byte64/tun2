@@ -1474,3 +1474,6 @@ label.sp-opt { display: inline-flex; align-items: center; gap: var(--sp-2); min-
 
 .quic-obfs .qrate-label { margin-top: var(--sp-4); }
 .quic-obfs input.qrate { max-width: 160px; }
+
+.manual-bundle { margin-top: var(--sp-4); }
+.manual-bundle .manual-h { margin: var(--sp-4) 0 6px; font-size: var(--fs-sm); color: var(--muted); font-weight: 600; }

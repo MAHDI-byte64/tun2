@@ -1788,9 +1788,27 @@ impl Hub {
             }
         }
         entry.health = health;
+        // A tunnel waiting for a side set up by hand is no longer waiting once this server
+        // reports it.
+        let waiting = crate::manual::list(&self.db).unwrap_or_default();
         entry.tunnels = tunnels
             .into_iter()
             .map(|info| {
+                if !waiting.is_empty()
+                    && waiting
+                        .iter()
+                        .any(|p| p.name == info.name && p.server == id)
+                    && crate::manual::clear(&self.db, &info.name).unwrap_or(false)
+                {
+                    self.history.event(
+                        "tunnel_manual_up",
+                        &info.name,
+                        &format!("{id} {}", info.role),
+                    );
+                    self.push_notice(crate::alerts::Notice::ManualSideUp {
+                        name: info.name.clone(),
+                    });
+                }
                 let bytes = info
                     .status
                     .as_ref()

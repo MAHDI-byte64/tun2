@@ -205,6 +205,14 @@ const MIGRATIONS: &[&str] = &[
          views INTEGER NOT NULL DEFAULT 0,
          last_restart INTEGER NOT NULL DEFAULT 0 -- the last restart asked from the page
      );",
+    // 22: a tunnel can wait for a side set up by hand on a server the panel could not reach
+    // (`crate::manual`). No token is kept — the bundle that carries it is shown once.
+    "CREATE TABLE pending_manual (
+         name TEXT PRIMARY KEY,       -- the tunnel
+         role TEXT NOT NULL,          -- the side done by hand: 'entry' or 'exit'
+         server TEXT NOT NULL,        -- the server it is on (id)
+         created INTEGER NOT NULL
+     );",
 ];
 
 /// A shared handle to the database. SQLite calls are short, so one connection behind a

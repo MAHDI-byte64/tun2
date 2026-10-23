@@ -18,6 +18,7 @@ import { UdpFlows, udpFlowsOf } from "./UdpFlows";
 import { ProxyProtocol, proxyOf } from "./ProxyProtocol";
 import type { ProxyChoice } from "./ProxyProtocol";
 import { BenchPanel, benchLabel, isV6 } from "./Benchmark";
+import { ManualBundle } from "./ManualBundle";
 import type { BenchChoice } from "./Benchmark";
 import { MUX_OPTIONAL, ROOT_ONLY, SPOOF_SHAPES, TRANSPORTS, joinTransport, transportLabel } from "./transport";
 import {
@@ -95,7 +96,6 @@ export { hostOf, portOf };
 
 export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: () => void }) {
   const { t, num, lang, toast } = useApp();
-  const online = servers.filter((s) => s.online);
   const [on, setOn] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   useFocusTrap(box);
@@ -197,6 +197,10 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
   };
   const acceptor = mode === "reverse" ? entry : exit;
   const dialer = mode === "reverse" ? exit : entry;
+  const isOffline = (id: string) => !!id && !servers.find((s) => s.id === id)?.online;
+  const bothOffline = isOffline(entry) && isOffline(exit);
+  // A side the panel cannot reach: write the other, hand the operator this one's config.
+  const manualServer = isOffline(entry) ? entry : isOffline(exit) ? exit : undefined;
   const parsed = useMemo(() => parsePorts(ports, protocol, target.trim() || "127.0.0.1"), [ports, protocol, target]);
   const greLink = netId ? linkBetween(links, netId, entry, exit) : undefined;
   // The tunnel listens on the private address of the server that accepts it, in either mode.
@@ -276,6 +280,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     if (s === 0) {
       if (!entry || !exit) return t("wz.pickBoth");
       if (entry === exit) return t("wz.samePick");
+      if (bothOffline) return t("wz.bothOffline");
       if (!name) return t("wz.nameEmpty");
       if (!NAME.test(name)) return t("wz.nameBad");
       if (takenNames.has(name)) return t("wz.nameTaken");
@@ -312,7 +317,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
     }
     setBack(to < step);
     setStep(to);
-    if (to === 4 && !opId) {
+    if (to === 4 && !opId && !manualServer) {
       setChecking(true);
       setCheck(null);
       try {
@@ -412,7 +417,13 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                   </div>
                   <Picker label={t("wz.exit")} servers={servers} value={exit} other={entry} locked={false} onPick={setExit} />
                 </div>
-                {online.length < 2 && <p className="err small">{t("tun.needTwo")}</p>}
+                {servers.length < 2 && <p className="err small">{t("tun.needTwo")}</p>}
+                {bothOffline && <p className="err small">{t("wz.bothOffline")}</p>}
+                {manualServer && !bothOffline && (
+                  <p className="muted small">
+                    <Icon name="info" size={14} /> {t("wz.manualNote", { server: serverName(manualServer) })}
+                  </p>
+                )}
                 {errAt === "servers" && (
                   <p className="err small" role="alert">
                     {error}
@@ -775,6 +786,7 @@ export function Wizard({ servers, onClose }: { servers: ServerInfo[]; onClose: (
                 ))}
                 <Checklist op={op} />
                 {op?.state === "done" && <p className="ok small">{t("tun.done")}</p>}
+                {op?.bundle && <ManualBundle bundle={op.bundle} serverName={serverName} />}
                 {op?.state === "failed" && (
                   <>
                     <p className="err small">{t("tun.failed", { why: opError(t, op.error, new Map(servers.map((x) => [x.id, x.name]))) })}</p>
@@ -834,7 +846,7 @@ function Picker({ label, servers, value, other, locked, onPick }: { label: strin
       <span className="label">{label}</span>
       <div className="pick-list" role="radiogroup" aria-label={label}>
         {servers.map((s) => {
-          const disabled = locked || !s.online || s.id === other;
+          const disabled = locked || s.id === other;
           return (
             <button key={s.id} type="button" role="radio" aria-checked={value === s.id} aria-disabled={disabled} className="pick" onClick={() => !disabled && onPick(s.id)}>
               <span className="radio" />

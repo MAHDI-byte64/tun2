@@ -332,6 +332,18 @@ in backups. API: `GET /api/tunnels/specs`, `POST /api/tunnels/recreate {name, en
 The panel never keeps a tunnel's token: it makes one, sends it to the two servers over the link
 and forgets it. So *a new token* cannot be undone if it fails half way; run it again.
 
+**Setting up a side by hand.** If one of the two servers is offline when you make the tunnel,
+pick it anyway and the wizard offers to set it up by hand: it writes the reachable side as
+usual and hands you the offline side's complete config file, its certificate if the transport
+needs one, and the commands to apply it over SSH (write the files under `/etc/kariz`, then
+`sudo systemctl enable --now kariz@NAME`; on a host without systemd, `touch
+/etc/kariz/NAME.enabled` and restart the agent). The tunnel is then listed as *waiting for its
+manual side* until that server's agent reports it, at which point it stops waiting on its own
+(and a Telegram notice, if set up, says so). The token is in that file and is **shown only
+once** — save it; to see it again you re-create the tunnel. A real (Let's Encrypt) certificate
+on the manual side and a private (GRE) network both need that server reachable, so they are
+refused for a manual side.
+
 ### Benchmark: which transport gets through best
 
 Not sure which transport (or which direction) to use between two servers? The **Kind** step of
@@ -433,7 +445,9 @@ have one, and keep the panel's password and login links as safe as the servers t
   arguments and a checked name. The [terminal](#terminal) is the one exception, and only on a
   server whose own settings say `terminal = true`; it is audited.
 - A tunnel's token is made by the panel, sent once to its two servers inside the encrypted
-  link, and written there with mode 0600. The panel does not keep it and never shows it.
+  link, and written there with mode 0600. The panel does not keep it and never shows it — the
+  one exception is a side set up by hand, where the config file (token inside) is shown once,
+  in the browser, and still not stored.
 - The database (`/var/lib/kariz-panel`, root only) holds the agents' keys, because the
   panel needs them to check the proofs. Guard it like the tunnel configs.
 
